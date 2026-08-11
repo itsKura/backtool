@@ -1,0 +1,13 @@
+# Normalise line endings: LF in the repository, native in the working tree.
+# Keeps diffs clean when the project is touched from both Windows and Linux.
+* text=auto
+
+*.py   text eol=lf
+*.md   text eol=lf
+*.toml text eol=lf
+*.csv  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+*.parquet binary
+*.png     binary

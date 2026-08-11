@@ -1,0 +1,38 @@
+# --- Secrets: never commit these ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+
+# --- Local market-data cache (regenerable, potentially large) ---
+# A leading slash anchors this to the repository root. Without it, the pattern
+# would also match src/backtool/events/data/, silently excluding the FOMC
+# calendar from version control. Ignore the *contents*, not the directory
+# itself, so the .gitkeep exception below can take effect.
+/data/*
+!/data/.gitkeep
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# --- Tooling ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
