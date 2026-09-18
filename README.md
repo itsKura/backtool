@@ -74,6 +74,7 @@ candle, so it cannot invent a number that looks like one.
 | [SQLite, not Parquet](docs/decisions/004-sqlite-over-parquet.md) | pyarrow is blocked by Application Control on the dev machine — but SQLite is better anyway: stdlib, and candles + fetch-coverage commit in one transaction, closing an atomicity hole the file-based design had. |
 | [Anchor = last close at or before `T`](docs/decisions/002-event-anchoring.md) | The obvious alternatives leak post-event prices into pre-event windows, which is how event studies produce impressive fiction. |
 | [UTC internally, local time only at edges](docs/decisions/003-utc-internal-time-standard.md) | 2 PM ET is 19:00 UTC in winter and 18:00 UTC in summer. Getting this wrong shifts every window by an hour and looks completely fine. |
+| [Anthropic API over HTTP, not the SDK](docs/decisions/005-anthropic-over-http.md) | The SDK's `jiter` dependency is blocked by Application Control on the dev machine — the fourth native binary to be. The project now has no compiled dependencies at all. |
 
 ## Stack
 
@@ -129,6 +130,19 @@ Run a study and write a shareable HTML report with charts:
 backtool analyse -n 20 --interval 5m --as-of 2026-09-18 --html reports/fomc-20.html
 ```
 
+Ask in plain language — the AI plans the study, the engine runs it, the AI
+explains the result:
+
+```bash
+backtool analyse --ask "How does BTC behave in the hour after FOMC?" --html reports/ask.html --open
+```
+
+Interpret a hand-specified study without letting AI choose the parameters:
+
+```bash
+backtool analyse -n 20 --explain
+```
+
 Custom windows, repeatable:
 
 ```bash
@@ -144,6 +158,38 @@ backtool cache
 Pin `--as-of` for a reproducible run; without it the event selection changes as
 new meetings happen. Every report prints its assumptions and a spec fingerprint,
 so a set of numbers can always be traced back to the question that produced it.
+
+## The AI layer
+
+Two roles, both optional — the engine works fully without an API key.
+
+**Planner** turns a question into a `ResearchSpec`. It resolves every ambiguous
+term into an explicit rule and shows them *before* running, so a wrong
+definition can be rejected rather than silently inherited:
+
+```
+Ambiguous terms resolved:
+  immediate reaction = 0h to +1h after the announcement
+  recent             = the last 20 FOMC announcements
+```
+
+**Interpreter** explains the computed statistics. It is given aggregates and
+per-event returns — never candles — and instructed that every number it cites
+must appear verbatim in its input.
+
+Set `ANTHROPIC_API_KEY` in `.env` to enable both.
+
+### The constraint that makes this trustworthy
+
+**`backtool.ai` may never import `backtool.data`.** The model emits
+specifications and consumes computed results; no code path exists from a model
+response to a price series, so it cannot fabricate a number that looks like one.
+
+This is enforced by [`test_ai_boundary.py`](tests/unit/test_ai_boundary.py),
+which checks the import graph both statically (AST) and at runtime (no
+`backtool.data` module loads when `backtool.ai` is imported). It has already
+caught two real violations — a type import that dragged in the data layer, and
+a package `__init__` that did the same transitively.
 
 ## Testing
 
@@ -204,7 +250,7 @@ Known limits:
 | **2** | Many events; explicit coverage reporting | ✅ Done |
 | **3** | Cross-event aggregation (mean, median, hit rate, percentiles) | ✅ Done |
 | **4** | Charts and a self-contained HTML report | ✅ Done |
-| **5** | AI planner (NL → specification) and interpreter (results → prose) | Next |
+| **5** | AI planner (NL → specification) and interpreter (results → prose) | ✅ Done |
 
 Beyond V1: more assets, more event types, funding/open-interest data, and
 exploratory pattern discovery — the last of which needs careful handling of

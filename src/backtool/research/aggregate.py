@@ -15,7 +15,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict
 
 from backtool.research.metrics import Direction
-from backtool.research.runner import StudyResult
+from backtool.research.results import StudyResult
 
 #: Below this many observations, a summary statistic is too noisy to lead with.
 #: Not a hard cut -- the aggregate is still produced, but flagged.
