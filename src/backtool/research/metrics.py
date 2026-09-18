@@ -31,10 +31,10 @@ from enum import StrEnum
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
+from backtool.core.time import expected_candle_count
 from backtool.core.types import Interval
-from backtool.data.candles import expected_candle_count
 from backtool.research.anchoring import anchor_at
 from backtool.research.windows import ResolvedWindow
 
@@ -98,6 +98,38 @@ class WindowMetrics(BaseModel):
     expected_candles: int = 0
     coverage_pct: float | None = None
 
+    @model_validator(mode="after")
+    def _ok_implies_metrics(self) -> WindowMetrics:
+        """An ``OK`` window must actually carry its numbers.
+
+        Without this, a hand-built or partially-populated result could claim
+        success while holding ``None`` where a statistic belongs -- which does
+        not fail here, but crashes aggregation several layers away with a
+        numpy type error that says nothing about the real cause.
+        """
+        if self.status is not WindowStatus.OK:
+            return self
+
+        required = {
+            "start_price": self.start_price,
+            "end_price": self.end_price,
+            "return_pct": self.return_pct,
+            "abs_move_pct": self.abs_move_pct,
+            "direction": self.direction,
+            "high": self.high,
+            "low": self.low,
+            "mfe_pct": self.mfe_pct,
+            "mae_pct": self.mae_pct,
+            "range_pct": self.range_pct,
+        }
+        missing = sorted(name for name, value in required.items() if value is None)
+        if missing:
+            raise ValueError(
+                f"Window {self.name!r} has status OK but is missing: {missing}. "
+                "Either populate them or use INSUFFICIENT_DATA."
+            )
+        return self
+
     @property
     def is_usable(self) -> bool:
         return self.status is WindowStatus.OK
@@ -129,7 +161,7 @@ def compute_window_metrics(
         * The window is shorter than one candle -- no candle closes inside it,
           so ``INSUFFICIENT_DATA``.
     """
-    expected = expected_candle_count(window.start, window.end, interval)
+    expected = expected_candle_count(window.start, window.end, interval.duration)
 
     start_anchor = anchor_at(candles, window.start)
     end_anchor = anchor_at(candles, window.end)

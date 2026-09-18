@@ -69,16 +69,17 @@ def _cmd_events(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 
-def _build_spec(args: argparse.Namespace) -> ResearchSpec:
+def _parse_as_of(text: str | None) -> dt.datetime | None:
+    if not text:
+        return None
+    parsed = dt.datetime.fromisoformat(text)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.UTC)
+
+
+def _build_spec(args: argparse.Namespace, as_of: dt.datetime | None) -> ResearchSpec:
     windows = DEFAULT_WINDOWS
     if args.window:
         windows = tuple(_parse_window(text) for text in args.window)
-
-    as_of: dt.datetime | None = None
-    if args.as_of:
-        as_of = dt.datetime.fromisoformat(args.as_of)
-        if as_of.tzinfo is None:
-            as_of = as_of.replace(tzinfo=dt.UTC)
 
     return ResearchSpec(
         symbol=args.symbol,
@@ -102,7 +103,23 @@ def _parse_window(text: str) -> WindowSpec:
 
 def _cmd_analyse(args: argparse.Namespace) -> int:
     settings = Settings.from_env()
-    spec = _build_spec(args)
+    as_of = _parse_as_of(args.as_of)
+    plan = None
+
+    if args.ask:
+        from backtool.ai import AIError, plan_study, render_plan
+
+        try:
+            plan, spec = plan_study(args.ask, as_of=as_of)
+        except AIError as exc:
+            print(f"Planning failed: {exc}", file=sys.stderr)
+            return 2
+        print("\nRESEARCH PLAN")
+        print("-" * 78)
+        for line in render_plan(plan, spec):
+            print(f"  {line}")
+    else:
+        spec = _build_spec(args, as_of)
 
     with MarketDataService.from_settings(settings) as service:
         study = run_study(spec, service, load_fomc_events())
@@ -111,8 +128,22 @@ def _cmd_analyse(args: argparse.Namespace) -> int:
     _print_per_event(study, args.window_focus)
     _print_aggregates(study)
 
+    interpretation = None
+    if args.ask or args.explain:
+        from backtool.ai import AIError, interpret_study, render_interpretation
+
+        try:
+            interpretation = interpret_study(study, question=args.ask)
+        except AIError as exc:
+            print(f"\nInterpretation unavailable: {exc}", file=sys.stderr)
+        else:
+            print("\nINTERPRETATION")
+            print("-" * 78)
+            for line in render_interpretation(interpretation):
+                print(f"  {line}")
+
     if args.html:
-        path = Path(write_report(study, args.html))
+        path = Path(write_report(study, args.html, interpretation=interpretation))
         print(f"\nHTML report written to {path}")
         if args.open:
             webbrowser.open(path.as_uri())
@@ -264,6 +295,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--as-of",
         metavar="ISO8601",
         help="analysis cutoff, e.g. 2026-01-01. Pin this for a reproducible run.",
+    )
+    analyse.add_argument(
+        "--ask",
+        metavar="QUESTION",
+        help=(
+            "describe the study in plain language; the AI planner builds the "
+            "spec and explains the results. Needs ANTHROPIC_API_KEY."
+        ),
+    )
+    analyse.add_argument(
+        "--explain",
+        action="store_true",
+        help="interpret the results with AI without using it to plan",
     )
     analyse.add_argument(
         "--html",

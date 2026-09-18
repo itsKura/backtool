@@ -142,6 +142,26 @@ def floor_to_interval(instant: dt.datetime, interval: dt.timedelta) -> dt.dateti
     return dt.datetime.fromtimestamp(seconds - (seconds % step), tz=UTC)
 
 
+def expected_candle_count(
+    start: dt.datetime, end: dt.datetime, interval: dt.timedelta
+) -> int:
+    """How many candles a gap-free feed would produce in ``(start, end]``.
+
+    Pure time arithmetic with no I/O, which is why it lives in ``core`` rather
+    than beside the candle loader: the research layer needs it, and routing that
+    need through ``backtool.data`` would give the AI layer a transitive path to
+    the market-data code it is forbidden to reach.
+
+    Used to report coverage. A window with 288 expected and 251 actual candles
+    still yields numbers, but the caller deserves to know they rest on 87% of
+    the data.
+    """
+    span = end - start
+    if span <= dt.timedelta(0):
+        return 0
+    return int(span / interval)
+
+
 def utc_ms(instant: dt.datetime) -> int:
     """Return ``instant`` as integer milliseconds since the Unix epoch.
 

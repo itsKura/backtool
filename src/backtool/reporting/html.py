@@ -11,11 +11,12 @@ distrusts a number can always scroll to the evidence that produced it.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from xml.sax.saxutils import escape
 
 from backtool.reporting.charts import BarItem, diverging_bar_chart
 from backtool.research.aggregate import WindowAggregate, aggregate_study
-from backtool.research.runner import StudyResult
+from backtool.research.results import StudyResult
 
 # Palette: the data-viz reference instance's diverging pair, used unchanged.
 # Blue/red rather than green/red -- see charts.py for why.
@@ -124,11 +125,26 @@ td.na { color: var(--text-muted); }
 .chart .bar-group:hover .row-label { fill: var(--text-primary); }
 footer { color: var(--text-muted); font-size: 12px; margin-top: 40px;
          border-top: 1px solid var(--grid); padding-top: 14px; }
+.card.ai { border-left: 3px solid var(--accent); }
+.ai-badge { color: var(--text-muted); font-size: 12px; margin: 0 0 12px;
+            text-transform: none; letter-spacing: 0.01em; }
+.ai-headline { font-size: 17px; font-weight: 600; margin: 0 0 16px;
+               letter-spacing: -0.01em; }
+.ai-label { color: var(--text-muted); font-size: 12px; margin: 14px 0 4px; }
+.card.ai ul { margin: 0; padding-left: 20px; }
+.card.ai li { margin-bottom: 5px; color: var(--text-secondary); }
 """
 
 
-def render_report(study: StudyResult) -> str:
-    """Render a complete study as a standalone HTML document."""
+def render_report(study: StudyResult, interpretation: Any | None = None) -> str:
+    """Render a complete study as a standalone HTML document.
+
+    Args:
+        study: The finished run.
+        interpretation: Optional AI reading of the results. Typed loosely so the
+            reporting layer does not import ``backtool.ai`` -- reports must
+            render identically with or without it, and the AI layer is optional.
+    """
     aggregates = aggregate_study(study)
     spec = study.spec
 
@@ -137,6 +153,8 @@ def render_report(study: StudyResult) -> str:
         _assumptions(study),
         _coverage(study),
     ]
+    if interpretation is not None:
+        sections.append(_interpretation(interpretation))
     for window_spec in spec.windows:
         sections.append(_window_section(study, aggregates[window_spec.name]))
     sections.append(_evidence_table(study))
@@ -177,6 +195,33 @@ def _assumptions(study: StudyResult) -> str:
 
 def _coverage(study: StudyResult) -> str:
     return f'<div class="card"><strong>Coverage.</strong> {escape(study.coverage_note())}.</div>'
+
+
+def _interpretation(interpretation: Any) -> str:
+    """Render the AI reading, clearly marked as interpretation not measurement.
+
+    Placed after the assumptions and before the charts, and visually distinct,
+    so a reader is never in doubt about which parts of the page were computed
+    and which were written.
+    """
+
+    def block(title: str, items: list[str]) -> str:
+        if not items:
+            return ""
+        entries = "".join(f"<li>{escape(item)}</li>" for item in items)
+        return f"<p class='ai-label'>{escape(title)}</p><ul>{entries}</ul>"
+
+    return (
+        "<h2>Interpretation</h2>"
+        '<div class="card ai">'
+        '<p class="ai-badge">Written by a language model from the statistics '
+        "below. It computed none of them.</p>"
+        f'<p class="ai-headline">{escape(interpretation.headline)}</p>'
+        f"{block('Findings', list(interpretation.findings))}"
+        f"{block('Caveats', list(interpretation.caveats))}"
+        f"{block('Worth running next', list(interpretation.suggested_followups))}"
+        "</div>"
+    )
 
 
 def _window_section(study: StudyResult, agg: WindowAggregate) -> str:
@@ -301,11 +346,13 @@ def _tooltip(event_id: str, metrics: object) -> str:
     return " · ".join(parts)
 
 
-def write_report(study: StudyResult, path: str | Path) -> str:
+def write_report(
+    study: StudyResult, path: str | Path, *, interpretation: Any | None = None
+) -> str:
     """Write the report to ``path`` and return the absolute path written."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(render_report(study), encoding="utf-8")
+    target.write_text(render_report(study, interpretation), encoding="utf-8")
     return str(target.resolve())
 
 

@@ -24,6 +24,7 @@ from typing import Final
 
 import pandas as pd
 
+from backtool.core.time import expected_candle_count as _expected_candle_count
 from backtool.core.types import Interval
 
 #: The one timestamp representation used throughout the system.
@@ -173,13 +174,5 @@ def empty_candles(interval: Interval) -> pd.DataFrame:
 def expected_candle_count(
     start: dt.datetime, end: dt.datetime, interval: Interval
 ) -> int:
-    """How many candles a gap-free feed would produce in ``(start, end]``.
-
-    Used to report coverage. A window with 288 expected and 251 actual candles
-    still yields numbers, but the caller deserves to know they rest on 87% of
-    the data.
-    """
-    span = end - start
-    if span <= dt.timedelta(0):
-        return 0
-    return int(span / interval.duration)
+    """Interval-typed wrapper over :func:`backtool.core.time.expected_candle_count`."""
+    return _expected_candle_count(start, end, interval.duration)
