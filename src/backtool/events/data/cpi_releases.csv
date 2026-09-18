@@ -1,0 +1,35 @@
+event_id,event_type,local_date,local_time,timezone,is_scheduled,notes
+CPI-2024-02-13,CPI,2024-02-13,08:30,America/New_York,true,January 2024 reference month
+CPI-2024-03-12,CPI,2024-03-12,08:30,America/New_York,true,February 2024 reference month
+CPI-2024-04-10,CPI,2024-04-10,08:30,America/New_York,true,March 2024 reference month
+CPI-2024-05-15,CPI,2024-05-15,08:30,America/New_York,true,April 2024 reference month
+CPI-2024-06-12,CPI,2024-06-12,08:30,America/New_York,true,May 2024 reference month
+CPI-2024-07-11,CPI,2024-07-11,08:30,America/New_York,true,June 2024 reference month
+CPI-2024-08-14,CPI,2024-08-14,08:30,America/New_York,true,July 2024 reference month
+CPI-2024-09-11,CPI,2024-09-11,08:30,America/New_York,true,August 2024 reference month
+CPI-2024-10-10,CPI,2024-10-10,08:30,America/New_York,true,September 2024 reference month
+CPI-2024-11-13,CPI,2024-11-13,08:30,America/New_York,true,October 2024 reference month
+CPI-2024-12-11,CPI,2024-12-11,08:30,America/New_York,true,November 2024 reference month
+CPI-2025-01-15,CPI,2025-01-15,08:30,America/New_York,true,December 2024 reference month
+CPI-2025-02-12,CPI,2025-02-12,08:30,America/New_York,true,January 2025 reference month
+CPI-2025-03-12,CPI,2025-03-12,08:30,America/New_York,true,February 2025 reference month
+CPI-2025-04-10,CPI,2025-04-10,08:30,America/New_York,true,March 2025 reference month
+CPI-2025-05-13,CPI,2025-05-13,08:30,America/New_York,true,April 2025 reference month
+CPI-2025-06-11,CPI,2025-06-11,08:30,America/New_York,true,May 2025 reference month
+CPI-2025-07-15,CPI,2025-07-15,08:30,America/New_York,true,June 2025 reference month
+CPI-2025-08-12,CPI,2025-08-12,08:30,America/New_York,true,July 2025 reference month
+CPI-2025-09-11,CPI,2025-09-11,08:30,America/New_York,true,August 2025 reference month
+CPI-2025-10-24,CPI,2025-10-24,08:30,America/New_York,false,September 2025 reference month; delayed from ~15 Oct by the appropriations lapse
+CPI-2025-12-18,CPI,2025-12-18,08:30,America/New_York,false,November 2025 reference month; delayed from 10 Dec by the appropriations lapse. No October 2025 release exists - that data was never collected
+CPI-2026-01-13,CPI,2026-01-13,08:30,America/New_York,true,December 2025 reference month
+CPI-2026-02-13,CPI,2026-02-13,08:30,America/New_York,false,January 2026 reference month; delayed from 11 Feb by the appropriations lapse
+CPI-2026-03-11,CPI,2026-03-11,08:30,America/New_York,true,February 2026 reference month
+CPI-2026-04-10,CPI,2026-04-10,08:30,America/New_York,true,March 2026 reference month
+CPI-2026-05-12,CPI,2026-05-12,08:30,America/New_York,true,April 2026 reference month
+CPI-2026-06-10,CPI,2026-06-10,08:30,America/New_York,true,May 2026 reference month
+CPI-2026-07-14,CPI,2026-07-14,08:30,America/New_York,true,June 2026 reference month
+CPI-2026-08-12,CPI,2026-08-12,08:30,America/New_York,true,July 2026 reference month
+CPI-2026-09-11,CPI,2026-09-11,08:30,America/New_York,true,August 2026 reference month
+CPI-2026-10-14,CPI,2026-10-14,08:30,America/New_York,true,September 2026 reference month
+CPI-2026-11-10,CPI,2026-11-10,08:30,America/New_York,true,October 2026 reference month
+CPI-2026-12-10,CPI,2026-12-10,08:30,America/New_York,true,November 2026 reference month

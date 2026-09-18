@@ -245,6 +245,12 @@ Known limits:
 
 - BTCUSDT spot on Binance begins 2017-08-17. Earlier events have no price data
   and must be reported as `insufficient_data`, never silently dropped.
+- The CPI calendar covers 2024–2026 only (31 occurred releases). Earlier BLS
+  archives were unreachable, and dates are omitted rather than reconstructed —
+  a wrong release date does not fail, it silently measures the wrong hour.
+- The 2025 US government shutdown delayed three CPI releases and cancelled one
+  entirely (October 2025 was never published). See
+  [docs/data-sources.md](docs/data-sources.md).
 - The scheduled 17–18 March 2020 meeting was cancelled and replaced by the
   unscheduled 15 March Sunday action, so 2020 has seven scheduled meetings.
 - Non-rate-decision FOMC actions (framework votes, emergency facility
@@ -271,6 +277,11 @@ multiple-hypothesis testing before it is trustworthy.
 
 ## Scope
 
-V1 is deliberately narrow: **BTCUSDT**, **FOMC**, **5m/15m/1h**. Breadth is
-easy to add and easy to get wrong. Correctness on one asset and one event type
-comes first.
+Deliberately narrow: **BTCUSDT**, **FOMC and CPI**, **5m/15m/1h**. Breadth is
+easy to add and easy to get wrong, so correctness came first.
+
+CPI was the test of whether the architecture generalises. It is released at
+08:30 ET rather than 14:00, monthly rather than eight times a year — and adding
+it took a calendar file and one enum entry. Nothing in the time layer, the
+metrics, or the research engine changed, because an event is fully described by
+a local wall-clock time and an IANA zone.

@@ -59,6 +59,55 @@ Compare against the Fed calendar. Structural invariants
 non-midweek scheduled dates, wrong meetings-per-year — but cannot catch a date
 that is simply the wrong Wednesday. That requires the source above.
 
+## CPI calendar
+
+**File:** `src/backtool/events/data/cpi_releases.csv`
+**Source:** US Bureau of Labor Statistics —
+<https://www.bls.gov/schedule/news_release/cpi.htm>,
+<https://www.bls.gov/bls/news-release/cpi.htm>, and
+<https://www.bls.gov/bls/2025-lapse-revised-release-dates.htm>
+**Verified:** 2026-09-18 — every row checked against BLS publication records.
+
+### What the file records
+
+**The publication instant, not the reference month.** CPI for a given month is
+published weeks later, and it is the publication that moves markets. So
+`CPI-2024-02-13` is the release *on* 13 February 2024, which reported January
+2024 data; the reference month is recorded in the notes.
+
+Releases are at **08:30 America/New_York**, five and a half hours earlier than
+an FOMC statement. Anything phrased relative to the US session means something
+different for the two.
+
+### Coverage
+
+| Years | Status |
+| --- | --- |
+| 2024 – 2026 | Verified, 34 rows (31 occurred as of 2026-09-18) |
+| 2017 – 2023 | **Not included.** BLS archive pages for those years returned 404. |
+
+The earlier years are omitted rather than reconstructed. A calendar of 31
+verified releases is worth more than one of 100 where 70 are recalled, because
+a wrong date does not fail — it silently measures the wrong hour. Adding a year
+is a matter of appending verified rows.
+
+### The 2025 appropriations lapse
+
+The US government shutdown damaged this calendar in three distinct ways, none of
+which a "monthly, around the 12th" rule would capture:
+
+| Reference month | What happened |
+| --- | --- |
+| September 2025 | Published **24 October**, not ~15 October |
+| **October 2025** | **Never published.** The survey data could not be collected, and could not be collected retroactively. There is no event. |
+| November 2025 | Published **18 December**, not 10 December |
+| January 2026 | Published **13 February**, not 11 February |
+
+The three delayed releases are marked `is_scheduled=false` with the reason in
+their notes. `tests/unit/test_cpi_calendar.py` asserts both irregular gaps (43
+and 55 days) explicitly, so a regenerated calendar that smoothed them over
+would fail.
+
 ## Market data
 
 **Source:** Binance public REST API (`/api/v3/klines`), unauthenticated.

@@ -17,7 +17,7 @@ from backtool.config import Settings
 from backtool.core.time import NEW_YORK, utc_to_local
 from backtool.core.types import EventType, Interval
 from backtool.data.service import MarketDataService
-from backtool.events import load_fomc_events, select_last_n
+from backtool.events import load_events, select_last_n
 from backtool.reporting.html import write_report
 from backtool.research.aggregate import aggregate_study
 from backtool.research.runner import StudyResult, run_study
@@ -42,20 +42,21 @@ def _configure_logging(verbose: bool, settings: Settings) -> None:
 
 def _cmd_events(args: argparse.Namespace) -> int:
     """List calendar events for eyeball verification."""
-    events = load_fomc_events()
+    kind = EventType(args.type.upper()) if args.type else None
+    events = load_events(kind)
     selected = events if args.all else select_last_n(events, args.limit)
 
     print(f"{'event_id':<18} {'weekday':<10} {'local (ET)':<18} {'UTC':<18} kind")
     print("-" * 78)
     for event in selected:
         local = utc_to_local(event.timestamp_utc, NEW_YORK)
-        kind = "scheduled" if event.is_scheduled else "UNSCHEDULED"
+        status = "scheduled" if event.is_scheduled else "UNSCHEDULED"
         print(
             f"{event.event_id:<18} "
             f"{event.local_date.strftime('%A'):<10} "
             f"{local:%Y-%m-%d %H:%M}   "
             f"{event.timestamp_utc:%Y-%m-%d %H:%M}   "
-            f"{kind}"
+            f"{status}"
         )
         if event.notes:
             print(f"{'':<18} note: {event.notes}")
@@ -83,7 +84,7 @@ def _build_spec(args: argparse.Namespace, as_of: dt.datetime | None) -> Research
 
     return ResearchSpec(
         symbol=args.symbol,
-        event_type=EventType.FOMC,
+        event_type=EventType(args.type.upper()),
         event_count=args.count,
         interval=Interval(args.interval),
         windows=windows,
@@ -122,7 +123,7 @@ def _cmd_analyse(args: argparse.Namespace) -> int:
         spec = _build_spec(args, as_of)
 
     with MarketDataService.from_settings(settings) as service:
-        study = run_study(spec, service, load_fomc_events())
+        study = run_study(spec, service, load_events(spec.event_type))
 
     _print_assumptions(spec)
     _print_per_event(study, args.window_focus)
@@ -283,11 +284,22 @@ def build_parser() -> argparse.ArgumentParser:
     events = subparsers.add_parser("events", help="list events from the calendar")
     events.add_argument("-n", "--limit", type=int, default=20, help="how many to show")
     events.add_argument("--all", action="store_true", help="include future meetings")
+    events.add_argument(
+        "--type",
+        choices=[kind.value for kind in EventType],
+        help="filter to one event type (default: all)",
+    )
     events.set_defaults(func=_cmd_events)
 
     analyse = subparsers.add_parser("analyse", help="run an event study")
     analyse.add_argument("-n", "--count", type=int, default=20, help="events to analyse")
     analyse.add_argument("--symbol", default="BTCUSDT")
+    analyse.add_argument(
+        "--type",
+        default="FOMC",
+        choices=[kind.value for kind in EventType],
+        help="event type to analyse (default: FOMC)",
+    )
     analyse.add_argument(
         "--interval", default="5m", choices=[i.value for i in Interval]
     )
