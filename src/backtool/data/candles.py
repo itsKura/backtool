@@ -150,6 +150,26 @@ def _check_prices(frame: pd.DataFrame) -> None:
         raise CandleDataError("Found non-positive price(s); spot prices must be > 0")
 
 
+def empty_candles(interval: Interval) -> pd.DataFrame:
+    """An empty frame carrying the normalised candle schema and dtypes.
+
+    Returned instead of ``pd.DataFrame()`` so that callers can slice, filter and
+    concatenate a "no data" result without special-casing it, and so dtype
+    checks downstream still hold.
+    """
+    frame = pd.DataFrame(
+        {
+            "open_time": pd.Series(dtype=CANDLE_TIME_DTYPE),
+            "open": pd.Series(dtype="float64"),
+            "high": pd.Series(dtype="float64"),
+            "low": pd.Series(dtype="float64"),
+            "close": pd.Series(dtype="float64"),
+            "volume": pd.Series(dtype="float64"),
+        }
+    )
+    return normalise_candles(frame, interval)
+
+
 def expected_candle_count(
     start: dt.datetime, end: dt.datetime, interval: Interval
 ) -> int:

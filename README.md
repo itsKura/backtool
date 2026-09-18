@@ -3,9 +3,10 @@
 A deterministic event-study research engine for crypto markets, with an AI
 planning and interpretation layer on top.
 
-> **Status: early development.** Milestone 1a (time + event calendar) is
-> complete. The market-data layer and metrics engine are next. See
-> [Roadmap](#roadmap).
+> **Status: in development.** The deterministic engine works end to end on
+> real market data: it identifies FOMC events, fetches and caches Binance
+> candles, and computes pre/post-event metrics with a no-look-ahead guarantee.
+> Cross-event aggregation and the AI layer are next. See [Roadmap](#roadmap).
 
 ## The problem
 
@@ -50,7 +51,7 @@ Dependencies point in one direction only:
 ```
 core/        pure logic, zero I/O   (UTC standard, DST conversion, shared types)
    ↑
-data/  events/     the I/O boundary (Binance client, Parquet cache, event calendar)
+data/  events/     the I/O boundary (Binance client, SQLite cache, event calendar)
    ↑
 research/    specification → windows → per-event metrics → aggregation
    ↑
@@ -69,13 +70,14 @@ candle, so it cannot invent a number that looks like one.
 
 | Decision | Why |
 | --- | --- |
-| [Parquet, not PostgreSQL](docs/decisions/001-candle-storage.md) | ~50 MB of data. A database would buy nothing and cost Docker, migrations, and a test DB. Hidden behind a `CandleRepository` protocol so it can change. |
+| [No PostgreSQL](docs/decisions/001-candle-storage.md) | ~50 MB of data. A server database would buy nothing and cost Docker, migrations, and a test DB. Hidden behind a `CandleRepository` protocol so it can change. |
+| [SQLite, not Parquet](docs/decisions/004-sqlite-over-parquet.md) | pyarrow is blocked by Application Control on the dev machine — but SQLite is better anyway: stdlib, and candles + fetch-coverage commit in one transaction, closing an atomicity hole the file-based design had. |
 | [Anchor = last close at or before `T`](docs/decisions/002-event-anchoring.md) | The obvious alternatives leak post-event prices into pre-event windows, which is how event studies produce impressive fiction. |
 | [UTC internally, local time only at edges](docs/decisions/003-utc-internal-time-standard.md) | 2 PM ET is 19:00 UTC in winter and 18:00 UTC in summer. Getting this wrong shifts every window by an hour and looks completely fine. |
 
 ## Stack
 
-Python 3.12 · pandas · NumPy · pyarrow · Pydantic · httpx · pytest · ruff · mypy (strict)
+Python 3.12 · pandas · NumPy · Pydantic · httpx · SQLite (stdlib) · pytest · ruff · mypy (strict)
 
 FastAPI, a React front end, and Docker are deliberately **not** here yet. They
 arrive when there is a working research engine worth serving.
@@ -106,8 +108,14 @@ Copy the example configuration:
 cp .env.example .env
 ```
 
-No API keys are required for V1 — Binance's public kline endpoints are
+No API keys are required — Binance's public kline endpoints are
 unauthenticated.
+
+> **Note on the Binance endpoint.** `api.binance.com` returns HTTP 451 from a
+> number of jurisdictions. The default base URL is therefore
+> `https://data-api.binance.vision`, Binance's public market-data mirror, which
+> serves the identical `/api/v3/klines` contract without geo-restriction.
+> Override with `BINANCE_BASE_URL` if you need a different host.
 
 ## Testing
 
@@ -162,10 +170,10 @@ Known limits:
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | **1a** | UTC time standard, DST conversion, FOMC calendar | ✅ Done |
-| **1b** | Window resolution and per-event metrics, on synthetic candles | Next |
-| **1c** | Binance client, Parquet cache, gap detection | |
-| **1d** | End-to-end run on one real event | |
-| **2** | Many events; explicit coverage reporting | |
+| **1b** | Window resolution and per-event metrics, on synthetic candles | ✅ Done |
+| **1c** | Binance client, SQLite cache, gap detection | ✅ Done |
+| **1d** | End-to-end run on one real event | ✅ Done |
+| **2** | Many events; explicit coverage reporting | Next |
 | **3** | Cross-event aggregation (mean, median, hit rate, percentiles) | |
 | **4** | Charts and a CLI report | |
 | **5** | AI planner (NL → specification) and interpreter (results → prose) | |
