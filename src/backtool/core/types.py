@@ -43,8 +43,16 @@ _DURATIONS: dict[Interval, dt.timedelta] = {
 class EventType(StrEnum):
     """A category of scheduled market event.
 
-    V1 ships FOMC only. The enum exists now so that event identity is typed
-    rather than stringly-typed the moment CPI or NFP is added.
+    An event is fully described by a local wall-clock time and an IANA zone, so
+    adding a type needs a calendar file and an entry here -- nothing in the time
+    layer or research engine changes. CPI demonstrated that: released 08:30 ET
+    rather than 14:00, monthly rather than eight times a year, no code changes
+    above the data file.
     """
 
+    #: US Federal Reserve interest-rate decisions. Statement at 14:00 ET on the
+    #: second day of a two-day meeting.
     FOMC = "FOMC"
+    #: US Consumer Price Index, published by the Bureau of Labor Statistics at
+    #: 08:30 ET. The publication date is the event, not the reference month.
+    CPI = "CPI"

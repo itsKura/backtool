@@ -18,6 +18,7 @@ import logging
 from backtool.ai.client import AIClient, AIError
 from backtool.ai.models import PlannedStudy
 from backtool.ai.prompts import PLANNER_SYSTEM
+from backtool.core.types import EventType
 from backtool.research.spec import ResearchSpec
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,10 @@ MAX_WINDOWS = 8
 #: would happily return data for ETHUSDT, producing a study outside the scope
 #: the project actually validated.
 SUPPORTED_SYMBOLS = frozenset({"BTCUSDT"})
+
+#: Event types with a calendar behind them. Enforced for the same reason as
+#: symbols: structured outputs guarantee shape, not sense.
+SUPPORTED_EVENT_TYPES = frozenset(kind.value for kind in EventType)
 
 
 def plan_study(
@@ -92,6 +97,13 @@ def _validate(plan: PlannedStudy) -> None:
         raise ValueError(
             f"The planner chose symbol {symbol!r}, which is outside V1 scope. "
             f"Supported: {sorted(SUPPORTED_SYMBOLS)}"
+        )
+
+    kind = plan.event_type.strip().upper()
+    if kind not in SUPPORTED_EVENT_TYPES:
+        raise ValueError(
+            f"The planner chose event type {kind!r}, which has no calendar. "
+            f"Supported: {sorted(SUPPORTED_EVENT_TYPES)}"
         )
 
     if not plan.windows:

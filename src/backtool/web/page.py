@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from xml.sax.saxutils import escape
 
-from backtool.core.types import Interval
+from backtool.core.types import EventType, Interval
 from backtool.reporting.html import _STYLE as REPORT_STYLE
 
 _PAGE_STYLE = """
@@ -132,6 +132,11 @@ def render_page(*, ai_available: bool) -> str:
             feature the user can see and fix beats one that silently is not
             there.
     """
+    event_types = "".join(
+        f'<option value="{kind.value}"'
+        f'{" selected" if kind is EventType.FOMC else ""}>{kind.value}</option>'
+        for kind in EventType
+    )
     intervals = "".join(
         f'<option value="{interval.value}"'
         f'{" selected" if interval is Interval.M5 else ""}>{interval.value}</option>'
@@ -143,7 +148,7 @@ def render_page(*, ai_available: bool) -> str:
     # hidden, so with no API key the right tab was selected and showed nothing.
     initial_mode = "ask" if ai_available else "build"
     ask_panel = _ask_panel(ai_available, visible=initial_mode == "ask")
-    build_panel = _build_panel(intervals, visible=initial_mode == "build")
+    build_panel = _build_panel(intervals, event_types, visible=initial_mode == "build")
 
     return f"""<!doctype html>
 <html lang="en">
@@ -213,16 +218,14 @@ def _ask_panel(ai_available: bool, *, visible: bool) -> str:
     </div>"""
 
 
-def _build_panel(intervals: str, *, visible: bool) -> str:
+def _build_panel(intervals: str, event_types: str, *, visible: bool) -> str:
     hidden = "" if visible else " hidden"
     return f"""
     <div class="panel" data-mode="build"{hidden}>
       <div class="row">
         <div>
           <label for="event_type">Event type</label>
-          <select id="event_type" name="event_type">
-            <option value="FOMC" selected>FOMC</option>
-          </select>
+          <select id="event_type" name="event_type">{event_types}</select>
         </div>
         <div>
           <label for="count">Events</label>

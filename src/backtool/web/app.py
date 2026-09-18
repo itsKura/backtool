@@ -30,7 +30,7 @@ from backtool.config import Settings
 from backtool.core.time import UTC
 from backtool.core.types import EventType, Interval
 from backtool.data.service import MarketDataService
-from backtool.events import load_fomc_events
+from backtool.events import load_events
 from backtool.reporting.html import render_body
 from backtool.research.results import StudyResult
 from backtool.research.runner import run_study
@@ -148,7 +148,7 @@ def _run(
         spec = _build_spec(event_type, count, interval, windows, as_of)
 
     with MarketDataService.from_settings(settings) as service:
-        study = run_study(spec, service, load_fomc_events(), now=as_of)
+        study = run_study(spec, service, load_events(spec.event_type), now=as_of)
 
     interpretation = None
     if mode == "ask" or explain:
