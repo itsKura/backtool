@@ -117,6 +117,34 @@ unauthenticated.
 > serves the identical `/api/v3/klines` contract without geo-restriction.
 > Override with `BINANCE_BASE_URL` if you need a different host.
 
+## Usage
+
+```bash
+backtool events -n 25
+```
+
+Run a study and write a shareable HTML report with charts:
+
+```bash
+backtool analyse -n 20 --interval 5m --as-of 2026-09-18 --html reports/fomc-20.html
+```
+
+Custom windows, repeatable:
+
+```bash
+backtool analyse -n 30 --window "pre_2h:-2h:0h" --window "post_4h:0h:4h"
+```
+
+Inspect the local candle cache:
+
+```bash
+backtool cache
+```
+
+Pin `--as-of` for a reproducible run; without it the event selection changes as
+new meetings happen. Every report prints its assumptions and a spec fingerprint,
+so a set of numbers can always be traced back to the question that produced it.
+
 ## Testing
 
 ```bash
@@ -173,10 +201,10 @@ Known limits:
 | **1b** | Window resolution and per-event metrics, on synthetic candles | ✅ Done |
 | **1c** | Binance client, SQLite cache, gap detection | ✅ Done |
 | **1d** | End-to-end run on one real event | ✅ Done |
-| **2** | Many events; explicit coverage reporting | Next |
-| **3** | Cross-event aggregation (mean, median, hit rate, percentiles) | |
-| **4** | Charts and a CLI report | |
-| **5** | AI planner (NL → specification) and interpreter (results → prose) | |
+| **2** | Many events; explicit coverage reporting | ✅ Done |
+| **3** | Cross-event aggregation (mean, median, hit rate, percentiles) | ✅ Done |
+| **4** | Charts and a self-contained HTML report | ✅ Done |
+| **5** | AI planner (NL → specification) and interpreter (results → prose) | Next |
 
 Beyond V1: more assets, more event types, funding/open-interest data, and
 exploratory pattern discovery — the last of which needs careful handling of

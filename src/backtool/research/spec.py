@@ -78,27 +78,45 @@ class ResearchSpec(BaseModel):
         canonical = self.model_dump_json()
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
 
-    def describe(self) -> list[str]:
-        """Human-readable assumptions, for display above any result.
+    def describe_items(self) -> list[tuple[str, str]]:
+        """Assumptions as (label, value) pairs.
 
         The product promise is that no definition is ever applied silently, so
         every choice that affects the numbers is rendered here.
+
+        Returned as structured pairs rather than formatted lines so that each
+        renderer -- terminal, HTML, or anything later -- lays them out itself
+        instead of parsing strings apart again.
         """
         if self.as_of is not None:
             cutoff = f"before {self.as_of:%Y-%m-%d %H:%M UTC}"
         else:
             cutoff = "as of now (not reproducible - pin --as-of)"
 
-        lines = [
-            f"symbol           {self.symbol}",
-            f"event type       {self.event_type.value}",
-            f"events           last {self.event_count}, {cutoff}",
-            f"interval         {self.interval.value}",
-            "anchor rule      last candle closed at or before the boundary (no look-ahead)",
-            "MFE / MAE        relative to a long opened at the window start price",
-            "realized vol     root sum of squared log returns over the window, not annualised",
+        items = [
+            ("symbol", self.symbol),
+            ("event type", self.event_type.value),
+            ("events", f"last {self.event_count}, {cutoff}"),
+            ("interval", self.interval.value),
+            (
+                "anchor rule",
+                "last candle closed at or before the boundary (no look-ahead)",
+            ),
+            ("MFE / MAE", "relative to a long opened at the window start price"),
+            (
+                "realized vol",
+                "root sum of squared log returns over the window, not annualised",
+            ),
         ]
-        for window in self.windows:
-            lines.append(f"window           {window.name}: {window.start} -> {window.end}")
-        lines.append(f"spec fingerprint {self.fingerprint}")
-        return lines
+        items.extend(
+            (f"window {window.name}", f"{window.start} -> {window.end}")
+            for window in self.windows
+        )
+        items.append(("spec fingerprint", self.fingerprint))
+        return items
+
+    def describe(self) -> list[str]:
+        """Assumptions as aligned single lines, for terminal output."""
+        items = self.describe_items()
+        width = max(len(label) for label, _ in items)
+        return [f"{label:<{width}}  {value}" for label, value in items]
