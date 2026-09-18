@@ -136,8 +136,13 @@ footer { color: var(--text-muted); font-size: 12px; margin-top: 40px;
 """
 
 
-def render_report(study: StudyResult, interpretation: Any | None = None) -> str:
-    """Render a complete study as a standalone HTML document.
+def render_body(study: StudyResult, interpretation: Any | None = None) -> str:
+    """Render just the report sections, with no document wrapper.
+
+    Split out from :func:`render_report` so the identical markup can be written
+    to a standalone file or injected into a live page. The two must never drift:
+    a served result that differs from a saved one would make the saved file a
+    poor record of what was seen.
 
     Args:
         study: The finished run.
@@ -146,7 +151,6 @@ def render_report(study: StudyResult, interpretation: Any | None = None) -> str:
             render identically with or without it, and the AI layer is optional.
     """
     aggregates = aggregate_study(study)
-    spec = study.spec
 
     sections = [
         _header(study),
@@ -155,10 +159,17 @@ def render_report(study: StudyResult, interpretation: Any | None = None) -> str:
     ]
     if interpretation is not None:
         sections.append(_interpretation(interpretation))
-    for window_spec in spec.windows:
+    for window_spec in study.spec.windows:
         sections.append(_window_section(study, aggregates[window_spec.name]))
     sections.append(_evidence_table(study))
     sections.append(_footer(study))
+    return "".join(sections)
+
+
+def render_report(study: StudyResult, interpretation: Any | None = None) -> str:
+    """Render a complete study as a standalone HTML document."""
+    spec = study.spec
+    body = render_body(study, interpretation)
 
     return (
         "<!doctype html>\n"
@@ -166,7 +177,7 @@ def render_report(study: StudyResult, interpretation: Any | None = None) -> str:
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
         f"<title>{escape(spec.symbol)} around {escape(spec.event_type.value)}</title>\n"
         f"<style>{_STYLE}</style>\n</head>\n<body>\n"
-        f'<div class="wrap">\n{"".join(sections)}\n</div>\n</body>\n</html>\n'
+        f'<div class="wrap">\n{body}\n</div>\n</body>\n</html>\n'
     )
 
 
@@ -356,4 +367,4 @@ def write_report(
     return str(target.resolve())
 
 
-__all__ = ["render_report", "write_report"]
+__all__ = ["render_body", "render_report", "write_report"]
