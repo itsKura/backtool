@@ -120,6 +120,19 @@ unauthenticated.
 
 ## Usage
 
+### Web interface
+
+```bash
+backtool serve
+```
+
+Then open <http://127.0.0.1:8000>. Two modes: **Ask a question** in plain
+language (needs `ANTHROPIC_API_KEY`), or **Build a study** with explicit
+controls, which needs no key at all. Results render on the page — the same
+markup the file report uses, so a served result and a saved one are identical.
+
+### Command line
+
 ```bash
 backtool events -n 25
 ```

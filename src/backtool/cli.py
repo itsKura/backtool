@@ -263,6 +263,15 @@ def _cmd_cache(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 
+def _cmd_serve(args: argparse.Namespace) -> int:
+    """Start the web interface."""
+    from backtool.web import serve
+
+    print(f"backtool serving on http://{args.host}:{args.port}")
+    serve(host=args.host, port=args.port, reload=args.reload)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="backtool",
@@ -321,6 +330,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     cache = subparsers.add_parser("cache", help="show what is stored locally")
     cache.set_defaults(func=_cmd_cache)
+
+    serve = subparsers.add_parser("serve", help="run the web interface")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument("--reload", action="store_true", help="auto-reload on code changes")
+    serve.set_defaults(func=_cmd_serve)
 
     return parser
 

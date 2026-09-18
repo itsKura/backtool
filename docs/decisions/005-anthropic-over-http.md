@@ -74,17 +74,31 @@ the same guarantee.
 **Gained**
 
 - The AI layer runs at all in this environment.
-- One fewer dependency, and no native code in the whole project. Every runtime
-  dependency (`pandas`, `numpy`, `pydantic`, `httpx`, `python-dotenv`) is now
-  either pure Python or already proven to load here.
+- One fewer dependency. Every runtime dependency now either is pure Python
+  (`pydantic`, `httpx`, `python-dotenv`) or is compiled but verified to load on
+  this machine (`numpy`, `pandas`). Note that Application Control is selective,
+  not blanket: numpy and pandas load, while pyarrow, jiter, scipy, and
+  matplotlib do not.
 - The request body is visible in one place, which makes the structured-output
   contract easy to inspect and test.
 
 ## Standing implication
 
-**Prefer pure-Python dependencies for this project.** Where a package with
-compiled extensions is genuinely necessary, verify it imports on the target
-machine before building on it — four times is a pattern, not bad luck.
+**Prefer pure-Python dependencies for this project, and verify any compiled one
+imports before building on it.** Four times is a pattern, not bad luck.
+
+Measured on 2026-09-18, the split is:
+
+| Loads | Blocked |
+| --- | --- |
+| `numpy`, `pandas`, `sqlite3`, `httpx`, `pydantic` | `pyarrow`, `jiter`, `scipy`, `matplotlib` |
+
+The most consequential of these is **`scipy`**, since significance testing is
+the obvious next requirement. It is not a blocker: the tests this project
+actually needs for small-sample event studies — binomial, bootstrap, and
+permutation — are tens of lines of numpy each, and writing them explicitly suits
+a system whose premise is auditable statistics better than importing a black
+box.
 
 ## Revisit when
 
