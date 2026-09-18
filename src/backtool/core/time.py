@@ -120,6 +120,28 @@ def utc_to_local(instant: dt.datetime, timezone: ZoneInfo) -> dt.datetime:
     return ensure_utc(instant).astimezone(timezone)
 
 
+def floor_to_interval(instant: dt.datetime, interval: dt.timedelta) -> dt.datetime:
+    """Round ``instant`` down to the nearest interval boundary measured from the epoch.
+
+    Used to find the most recent *closed* candle boundary. Binance aligns
+    candles to the Unix epoch, so flooring the same way gives the instant at
+    which the last complete candle closed.
+
+    Args:
+        instant: Timezone-aware instant.
+        interval: Grid spacing, e.g. five minutes.
+
+    Returns:
+        The largest interval boundary less than or equal to ``instant``.
+    """
+    aware = ensure_utc(instant)
+    step = interval.total_seconds()
+    if step <= 0:
+        raise ValueError(f"interval must be positive, got {interval}")
+    seconds = aware.timestamp()
+    return dt.datetime.fromtimestamp(seconds - (seconds % step), tz=UTC)
+
+
 def utc_ms(instant: dt.datetime) -> int:
     """Return ``instant`` as integer milliseconds since the Unix epoch.
 
