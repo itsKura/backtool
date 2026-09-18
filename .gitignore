@@ -36,3 +36,6 @@ htmlcov/
 .idea/
 Thumbs.db
 desktop.ini
+
+# --- Generated reports (regenerable from a spec fingerprint) ---
+/reports/

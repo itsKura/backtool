@@ -10,12 +10,15 @@ import argparse
 import datetime as dt
 import logging
 import sys
+import webbrowser
+from pathlib import Path
 
 from backtool.config import Settings
 from backtool.core.time import NEW_YORK, utc_to_local
 from backtool.core.types import EventType, Interval
 from backtool.data.service import MarketDataService
 from backtool.events import load_fomc_events, select_last_n
+from backtool.reporting.html import write_report
 from backtool.research.aggregate import aggregate_study
 from backtool.research.runner import StudyResult, run_study
 from backtool.research.spec import ResearchSpec
@@ -107,6 +110,12 @@ def _cmd_analyse(args: argparse.Namespace) -> int:
     _print_assumptions(spec)
     _print_per_event(study, args.window_focus)
     _print_aggregates(study)
+
+    if args.html:
+        path = Path(write_report(study, args.html))
+        print(f"\nHTML report written to {path}")
+        if args.open:
+            webbrowser.open(path.as_uri())
     return 0
 
 
@@ -255,6 +264,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--as-of",
         metavar="ISO8601",
         help="analysis cutoff, e.g. 2026-01-01. Pin this for a reproducible run.",
+    )
+    analyse.add_argument(
+        "--html",
+        metavar="PATH",
+        help="also write a self-contained HTML report with charts",
+    )
+    analyse.add_argument(
+        "--open", action="store_true", help="open the HTML report in a browser"
     )
     analyse.set_defaults(func=_cmd_analyse)
 
