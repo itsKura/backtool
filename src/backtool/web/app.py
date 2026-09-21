@@ -31,18 +31,32 @@ from backtool.core.time import UTC
 from backtool.core.types import EventType, Interval
 from backtool.data.service import MarketDataService
 from backtool.events import load_events
+from backtool.events.models import MarketEvent
 from backtool.reporting.html import render_body
 from backtool.research.results import StudyResult
 from backtool.research.runner import run_study
 from backtool.research.spec import ResearchSpec
 from backtool.research.windows import DEFAULT_WINDOWS, WindowSpec
-from backtool.web.page import render_error, render_page
+from backtool.web.calendar_page import render_calendar
+from backtool.web.event_page import (
+    render_event_header,
+    render_outcome_placeholder,
+    render_upcoming_notice,
+)
+from backtool.web.page import render_error, render_page, shell
 
 logger = logging.getLogger(__name__)
 
 #: A study fetches candles for each event, so a cold run over many events is
 #: slow. Capped so one request cannot tie up the server indefinitely.
 MAX_EVENTS = 60
+
+#: Symbols offered on an event page. Both list on Binance from 2017-08-17, so
+#: neither truncates the history relative to the other.
+SYMBOLS: tuple[str, ...] = ("BTCUSDT", "ETHUSDT")
+
+#: How many past occurrences an event page summarises by default.
+DEFAULT_HISTORY_EVENTS = 20
 
 app = FastAPI(
     title="backtool",
@@ -63,9 +77,121 @@ def _ai_available() -> bool:
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index() -> HTMLResponse:
-    """The single page: controls, and an empty results area."""
+async def calendar() -> HTMLResponse:
+    """The front door: what is coming up, and what just happened."""
+    now = dt.datetime.now(tz=UTC)
+    body = (
+        '<div class="masthead"><h1>Calendar</h1>'
+        "<p>Scheduled macroeconomic events, and what crypto did around them "
+        "last time. Click any event for its history.</p></div>"
+        + render_calendar(load_events(), now=now)
+    )
+    return HTMLResponse(shell("backtool - calendar", body, active="calendar"))
+
+
+@app.get("/study", response_class=HTMLResponse)
+async def study_form() -> HTMLResponse:
+    """Advanced mode: full control over the specification."""
     return HTMLResponse(render_page(ai_available=_ai_available()))
+
+
+@app.get("/event/{event_id}", response_class=HTMLResponse)
+async def event_detail(event_id: str, symbol: str = "BTCUSDT") -> HTMLResponse:
+    """One event: what it is, and how the last occurrences behaved.
+
+    The history is loaded asynchronously rather than inline. A cold cache means
+    fetching candles for twenty events, and a reader should get the explanation
+    immediately rather than staring at a blank tab.
+    """
+    event = _find_event(event_id)
+    chosen = symbol.upper() if symbol.upper() in SYMBOLS else SYMBOLS[0]
+    now = dt.datetime.now(tz=UTC)
+
+    tabs = "".join(
+        f'<a class="symbol-tab" href="/event/{event.event_id}?symbol={candidate}" '
+        f'aria-selected="{str(candidate == chosen).lower()}">{candidate}</a>'
+        for candidate in SYMBOLS
+    )
+
+    upcoming = event.timestamp_utc > now
+    body = (
+        render_event_header(event, now=now)
+        + (render_upcoming_notice(event) if upcoming else "")
+        + render_outcome_placeholder()
+        + "<h2>Historical reaction</h2>"
+        + f'<div class="symbol-tabs">{tabs}</div>'
+        + '<div id="history"><p class="status"><span class="spinner"></span>'
+        + "Loading the last "
+        + str(DEFAULT_HISTORY_EVENTS)
+        + " occurrences&hellip;</p></div>"
+    )
+
+    script = (
+        "fetch('/api/event/"
+        + event.event_id
+        + "/history?symbol="
+        + chosen
+        + "')"
+        ".then(r => r.text())"
+        ".then(html => { document.getElementById('history').innerHTML = html; })"
+        ".catch(e => { document.getElementById('history').innerHTML = "
+        "'<div class=\"error\"><h3>Could not load history</h3><p>' + e + '</p></div>'; });"
+    )
+    return HTMLResponse(
+        shell(f"backtool - {event.event_id}", body, active="calendar", script=script)
+    )
+
+
+@app.get("/api/event/{event_id}/history", response_class=HTMLResponse)
+async def event_history(
+    event_id: str, symbol: str = "BTCUSDT", interval: str = "5m"
+) -> HTMLResponse:
+    """The study body for one event type, as an HTML fragment."""
+    event = _find_event(event_id)
+    chosen = symbol.upper() if symbol.upper() in SYMBOLS else SYMBOLS[0]
+
+    try:
+        html = await asyncio.to_thread(
+            _event_history, event=event, symbol=chosen, interval=interval
+        )
+    except ValueError as exc:
+        return HTMLResponse(render_error(str(exc)), status_code=400)
+    except Exception as exc:  # noqa: BLE001 - the page must show something
+        logger.exception("Event history failed")
+        return HTMLResponse(render_error(f"{type(exc).__name__}: {exc}"), status_code=500)
+
+    return HTMLResponse(html)
+
+
+def _find_event(event_id: str) -> MarketEvent:
+    for event in load_events():
+        if event.event_id == event_id:
+            return event
+    raise HTTPException(status_code=404, detail=f"No event {event_id!r} in the calendar")
+
+
+def _event_history(*, event: MarketEvent, symbol: str, interval: str) -> str:
+    """Run the standard study for this event's type and render it.
+
+    The cutoff is the event itself for a past occurrence, so its own outcome is
+    excluded -- a page about one release must not quietly include that release
+    in the history it presents as prior context.
+    """
+    now = dt.datetime.now(tz=UTC)
+    as_of = min(event.timestamp_utc, now)
+
+    spec = ResearchSpec(
+        symbol=symbol,
+        event_type=event.event_type,
+        event_count=DEFAULT_HISTORY_EVENTS,
+        interval=Interval(interval.lower()),
+        windows=DEFAULT_WINDOWS,
+        as_of=as_of,
+    )
+    with MarketDataService.from_settings(Settings.from_env()) as service:
+        study = run_study(spec, service, load_events(spec.event_type), now=now)
+
+    return render_body(study)
 
 
 @app.get("/api/health")

@@ -126,10 +126,31 @@ unauthenticated.
 backtool serve
 ```
 
-Then open <http://127.0.0.1:8000>. Two modes: **Ask a question** in plain
-language (needs `ANTHROPIC_API_KEY`), or **Build a study** with explicit
-controls, which needs no key at all. Results render on the page — the same
-markup the file report uses, so a served result and a saved one are identical.
+Then open <http://127.0.0.1:8000>.
+
+**Calendar** is the front door: upcoming and recent FOMC and CPI releases with
+date, time, and importance. Click any event for a page explaining what it is,
+why markets care, and what BTC or ETH did around the last 20 occurrences.
+
+**Build a study** (`/study`) is advanced mode — full control over the
+specification, either by asking in plain language (needs `ANTHROPIC_API_KEY`) or
+by setting windows directly, which needs no key.
+
+Results render with the same markup the file report uses, so a served result and
+a saved one are identical.
+
+#### What the event page does not claim
+
+An event page about a *past* release excludes that release from the history it
+shows — otherwise the event's own outcome leaks into its own background. A page
+about an *upcoming* release says plainly that it has not happened yet, and that
+everything below is a record rather than a forecast.
+
+Consensus **forecast** figures are shown as unavailable rather than substituted.
+Actual and previous values come from the publishing agency and are planned;
+consensus comes from Bloomberg/Reuters surveys with no free licence-clean feed,
+and labelling something else "forecast" is the silent redefinition this project
+exists to avoid.
 
 ### Command line
 
@@ -277,7 +298,7 @@ multiple-hypothesis testing before it is trustworthy.
 
 ## Scope
 
-Deliberately narrow: **BTCUSDT**, **FOMC and CPI**, **5m/15m/1h**. Breadth is
+Deliberately narrow: **BTCUSDT and ETHUSDT**, **FOMC and CPI**, **5m/15m/1h**. Breadth is
 easy to add and easy to get wrong, so correctness came first.
 
 CPI was the test of whether the architecture generalises. It is released at

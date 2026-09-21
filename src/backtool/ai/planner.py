@@ -29,7 +29,7 @@ MAX_WINDOWS = 8
 #: this enforces it -- a model can emit any alphanumeric string, and Binance
 #: would happily return data for ETHUSDT, producing a study outside the scope
 #: the project actually validated.
-SUPPORTED_SYMBOLS = frozenset({"BTCUSDT"})
+SUPPORTED_SYMBOLS = frozenset({"BTCUSDT", "ETHUSDT"})
 
 #: Event types with a calendar behind them. Enforced for the same reason as
 #: symbols: structured outputs guarantee shape, not sense.

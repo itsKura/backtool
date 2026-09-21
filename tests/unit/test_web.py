@@ -23,10 +23,16 @@ def client() -> TestClient:
 
 
 class TestPage:
-    def test_serves_the_page(self, client: TestClient) -> None:
+    def test_calendar_is_the_home_page(self, client: TestClient) -> None:
+        """The front door answers "what is coming up", not "specify a study"."""
         response = client.get("/")
         assert response.status_code == 200
-        assert "backtool" in response.text
+        assert "Upcoming" in response.text
+        assert "event-card" in response.text
+
+    def test_study_form_moved_to_its_own_route(self, client: TestClient) -> None:
+        response = client.get("/study")
+        assert response.status_code == 200
         assert 'id="study-form"' in response.text
 
     def test_exactly_one_panel_is_visible_with_ai(self) -> None:

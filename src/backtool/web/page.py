@@ -15,6 +15,8 @@ from xml.sax.saxutils import escape
 
 from backtool.core.types import EventType, Interval
 from backtool.reporting.html import _STYLE as REPORT_STYLE
+from backtool.web.calendar_page import CALENDAR_STYLE
+from backtool.web.event_page import EVENT_STYLE
 
 _PAGE_STYLE = """
 .masthead { margin-bottom: 8px; }
@@ -123,6 +125,50 @@ form.addEventListener('submit', async (event) => {
 """
 
 
+_NAV = """
+.nav { display: flex; gap: 20px; align-items: baseline; margin-bottom: 22px;
+       padding-bottom: 14px; border-bottom: 1px solid var(--grid); }
+.nav a { color: var(--text-secondary); text-decoration: none; font-size: 14px; }
+.nav a:hover { color: var(--text-primary); }
+.nav a[aria-current="page"] { color: var(--text-primary); font-weight: 500; }
+.nav .brand { font-size: 17px; font-weight: 600; color: var(--text-primary);
+              margin-right: 6px; }
+"""
+
+
+def shell(title: str, body: str, *, active: str = "", script: str = "") -> str:
+    """Wrap page content in the shared document, styling and navigation.
+
+    One shell for every page so the calendar, an event, and the study form are
+    visibly one product, and so report styling is defined exactly once.
+    """
+    def nav_link(href: str, label: str, key: str) -> str:
+        current = ' aria-current="page"' if key == active else ""
+        return f'<a href="{href}"{current}>{label}</a>'
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{escape(title)}</title>
+<style>{REPORT_STYLE}{_PAGE_STYLE}{CALENDAR_STYLE}{EVENT_STYLE}{_NAV}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="nav">
+    <span class="brand">backtool</span>
+    {nav_link("/", "Calendar", "calendar")}
+    {nav_link("/study", "Build a study", "study")}
+  </nav>
+  {body}
+</div>
+{f"<script>{script}</script>" if script else ""}
+</body>
+</html>
+"""
+
+
 def render_page(*, ai_available: bool) -> str:
     """Render the full page.
 
@@ -150,20 +196,11 @@ def render_page(*, ai_available: bool) -> str:
     ask_panel = _ask_panel(ai_available, visible=initial_mode == "ask")
     build_panel = _build_panel(intervals, event_types, visible=initial_mode == "build")
 
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>backtool &mdash; event study research</title>
-<style>{REPORT_STYLE}{_PAGE_STYLE}</style>
-</head>
-<body>
-<div class="wrap">
+    body = f"""
   <div class="masthead">
-    <h1>backtool</h1>
-    <p>Deterministic event-study research. Every number is computed from
-       exchange candles; the AI plans and explains, and calculates nothing.</p>
+    <h1>Build a study</h1>
+    <p>Full control over the specification. For a guided view of what is coming
+       up, use the <a href="/">calendar</a>.</p>
   </div>
 
   <form id="study-form">
@@ -185,11 +222,8 @@ def render_page(*, ai_available: bool) -> str:
   </form>
 
   <div id="results"></div>
-</div>
-<script>{_SCRIPT}</script>
-</body>
-</html>
 """
+    return shell("backtool - build a study", body, active="study", script=_SCRIPT)
 
 
 def _ask_panel(ai_available: bool, *, visible: bool) -> str:
