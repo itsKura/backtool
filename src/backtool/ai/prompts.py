@@ -38,7 +38,7 @@ goes in `assumptions`, not `interpretation`.
 
 ## What the engine supports
 
-- symbol: BTCUSDT only.
+- symbol: BTCUSDT or ETHUSDT. Both list on Binance from 2017-08-17.
 - event_type: FOMC only. These are US Federal Reserve interest-rate \
 announcements, released at 14:00 America/New_York on the second day of a \
 two-day meeting.
