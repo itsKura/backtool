@@ -203,12 +203,23 @@ class TestHtmlReport:
         assert "not a trading signal" in html.lower()
         assert "multiple comparisons" in html
 
-    def test_defines_dark_mode_under_both_scopes(self, study) -> None:  # type: ignore[no-untyped-def]
+    def test_dark_is_the_default_theme(self, study) -> None:  # type: ignore[no-untyped-def]
+        """Dark is unconditional, not OS-conditional -- the page should not
+        change appearance based on a system setting the reader did not choose
+        for this app."""
         from backtool.reporting.html import render_report
 
         html = render_report(study)
-        assert "@media (prefers-color-scheme: dark)" in html
-        assert ':root[data-theme="dark"]' in html
+        base = html[html.index(":root {") : html.index("* { box-sizing")]
+        assert "color-scheme: dark" in base
+        assert "@media (prefers-color-scheme" not in html
+
+    def test_light_remains_available_as_an_opt_in(self, study) -> None:  # type: ignore[no-untyped-def]
+        """A reader who needs light (print, bright room, low vision) is not
+        locked out."""
+        from backtool.reporting.html import render_report
+
+        assert ':root[data-theme="light"]' in render_report(study)
 
     def test_is_self_contained(self, study) -> None:  # type: ignore[no-untyped-def]
         """No network requests, no external assets -- the file must work

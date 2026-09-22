@@ -132,17 +132,12 @@ CALENDAR_STYLE = """
 .event-countdown { color: var(--text-secondary); font-size: 13px; }
 .badge { font-size: 11px; padding: 2px 8px; border-radius: 99px;
          text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
-.badge-high { background: #fde8e7; color: #a2302f; }
-.badge-medium { background: #fdf0d8; color: #8a5d00; }
-.badge-low { background: #e6edf6; color: #2a5490; }
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .badge-high { background: #4a1f1f; color: #f3a9a8; }
-  :root:not([data-theme="light"]) .badge-medium { background: #43341a; color: #e9c274; }
-  :root:not([data-theme="light"]) .badge-low { background: #1e3350; color: #9cc0ea; }
-}
-:root[data-theme="dark"] .badge-high { background: #4a1f1f; color: #f3a9a8; }
-:root[data-theme="dark"] .badge-medium { background: #43341a; color: #e9c274; }
-:root[data-theme="dark"] .badge-low { background: #1e3350; color: #9cc0ea; }
+.badge-high { background: #4a1f1f; color: #f3a9a8; }
+.badge-medium { background: #43341a; color: #e9c274; }
+.badge-low { background: #1e3350; color: #9cc0ea; }
+:root[data-theme="light"] .badge-high { background: #fde8e7; color: #a2302f; }
+:root[data-theme="light"] .badge-medium { background: #fdf0d8; color: #8a5d00; }
+:root[data-theme="light"] .badge-low { background: #e6edf6; color: #2a5490; }
 @media (max-width: 640px) {
   .event-card { grid-template-columns: 1fr; gap: 6px; }
   .event-meta { justify-content: flex-start; }
