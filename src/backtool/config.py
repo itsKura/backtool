@@ -3,6 +3,9 @@
 Nothing in the codebase reads ``os.environ`` directly; everything goes through
 :class:`Settings`. That keeps configuration greppable and makes tests able to
 construct a Settings object without touching the process environment.
+
+``.env`` is loaded in :mod:`backtool` itself, not here -- see that module for
+why.
 """
 
 from __future__ import annotations
@@ -10,10 +13,6 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-
-from dotenv import load_dotenv
-
-load_dotenv()
 
 #: Binance's public market-data mirror.
 #:

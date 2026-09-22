@@ -94,15 +94,37 @@ def _inline(node: Any, definitions: dict[str, Any]) -> Any:
     return node
 
 
+#: JSON Schema keywords the structured-outputs validator rejects.
+#:
+#: `default` is meaningless once every field is required. The numeric range
+#: keywords are refused outright -- a schema carrying them returns
+#: "For 'integer' type, properties maximum, minimum are not supported".
+#: Pydantic emits them from `Field(ge=..., le=...)`, so they have to be
+#: stripped rather than avoided at the model.
+#:
+#: Dropping them does not drop the constraint: the response is still validated
+#: with `Model.model_validate()`, which enforces the original bounds. The schema
+#: stops *describing* the limit, so each bounded field states it in its
+#: description instead -- otherwise the model has no way to know.
+_UNSUPPORTED_KEYWORDS = frozenset(
+    {
+        "default",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+    }
+)
+
+
 def _harden(node: Any) -> Any:
-    """Require every property and forbid extras, recursively."""
+    """Require every property, forbid extras, and drop rejected keywords."""
     if isinstance(node, dict):
         result = {
             key: _harden(value)
             for key, value in node.items()
-            # `default` is meaningless once every field is required, and some
-            # schema validators reject the combination.
-            if key != "default"
+            if key not in _UNSUPPORTED_KEYWORDS
         }
         if result.get("type") == "object" and "properties" in result:
             result["additionalProperties"] = False

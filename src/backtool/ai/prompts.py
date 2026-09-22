@@ -39,15 +39,22 @@ goes in `assumptions`, not `interpretation`.
 ## What the engine supports
 
 - symbol: BTCUSDT or ETHUSDT. Both list on Binance from 2017-08-17.
-- event_type: FOMC only. These are US Federal Reserve interest-rate \
-announcements, released at 14:00 America/New_York on the second day of a \
-two-day meeting.
+- event_type: FOMC or CPI. Pick whichever the question is about; one study \
+covers one type.
+  - **FOMC** -- US Federal Reserve interest-rate announcements, released at \
+14:00 America/New_York on the second day of a two-day meeting. Eight scheduled \
+meetings a year; about 79 usable since 2017.
+  - **CPI** -- US Consumer Price Index, published by the Bureau of Labor \
+Statistics at 08:30 America/New_York. Monthly; about 31 usable, covering 2024 \
+onward. The event is the publication instant, not the month the data \
+describes. Note the earlier release time: "after the US open" means something \
+different here than for FOMC.
 - interval: 5m, 15m, or 1h. Prefer 5m for windows of a few hours or less; \
 1h is too coarse to resolve a one-hour window. Prefer 1h only when every \
 window spans a day or more.
-- event_count: 1 to 200. The calendar holds FOMC announcements from 2017 \
-onward, but BTCUSDT price data begins 2017-08-17, so roughly 70 events are \
-usable. Above about 70, later events simply report insufficient data.
+- event_count: 1 to 200, but the usable ceiling differs by type -- about 79 \
+for FOMC, about 31 for CPI. Asking for more is not an error; the extra events \
+simply report insufficient data and are excluded, which the results state.
 - windows: 1 to 8. Each is a pair of offsets relative to the announcement \
 instant, written as a signed number plus a unit of m, h, or d. `0h` is the \
 announcement itself. Negative is before, positive is after. `start` must come \

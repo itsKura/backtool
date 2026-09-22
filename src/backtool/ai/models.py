@@ -48,9 +48,17 @@ class PlannedStudy(BaseModel):
     restated_question: str = Field(
         description="The question as the planner understood it, in one sentence"
     )
-    symbol: str = Field(description="Exchange symbol; only BTCUSDT is supported")
-    event_type: str = Field(description="Event type; only FOMC is supported")
-    event_count: int = Field(ge=1, le=200, description="How many recent events to analyse")
+    symbol: str = Field(description="Exchange symbol: BTCUSDT or ETHUSDT")
+    event_type: str = Field(description="Event type: FOMC or CPI")
+    event_count: int = Field(
+        ge=1,
+        le=200,
+        description=(
+            "How many recent events to analyse. Must be between 1 and 200 -- the "
+            "bound is enforced on validation but cannot be expressed in the "
+            "schema, so respect it here."
+        ),
+    )
     interval: str = Field(description="Candle interval: 5m, 15m, or 1h")
     windows: list[PlannedWindow] = Field(
         description="Windows to measure, 1-8 of them, each anchored to the event"

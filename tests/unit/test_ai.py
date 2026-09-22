@@ -113,6 +113,42 @@ class TestStrictSchema:
 
         assert "default" not in json.dumps(strict_json_schema(WithDefault))
 
+    def test_strips_numeric_range_keywords(self) -> None:
+        """Regression: the live API rejects these outright --
+        "For 'integer' type, properties maximum, minimum are not supported".
+        Pydantic emits them from Field(ge=..., le=...), so they must be removed
+        from the schema rather than avoided at the model.
+        """
+        from pydantic import Field
+
+        class Bounded(BaseModel):
+            count: int = Field(ge=1, le=200)
+            ratio: float = Field(gt=0.0, lt=1.0)
+
+        text = json.dumps(strict_json_schema(Bounded))
+        for keyword in (
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "multipleOf",
+        ):
+            assert f'"{keyword}"' not in text, f"{keyword} would be rejected by the API"
+
+    def test_bounds_are_still_enforced_on_validation(self) -> None:
+        """Dropping the keyword drops the schema's *description* of the limit,
+        not the limit. The response is still validated with model_validate."""
+        payload = valid_plan_payload(event_count=9999)
+        client = mock_client(payload)
+        with pytest.raises(AIError, match="did not match"):
+            client.structured(system="s", user="u", schema=PlannedStudy)
+
+    def test_bounded_fields_state_their_limit_in_the_description(self) -> None:
+        """Since the schema can no longer carry the bound, the model has no way
+        to know it unless the description says so."""
+        schema = strict_json_schema(PlannedStudy)
+        assert "200" in schema["properties"]["event_count"]["description"]
+
 
 class TestConfiguration:
     def test_missing_key_raises_a_distinct_error(
@@ -302,3 +338,43 @@ class TestPlannedStudyConversion:
         spec = plan.to_spec()
         assert spec.symbol == "BTCUSDT"
         assert spec.interval is Interval.H1
+
+
+class TestEnvironmentLoading:
+    """Regression: `.env` was loaded in backtool.config, so anything reading an
+    environment variable without importing Settings saw an unloaded
+    environment. `backtool.ai` reported "no API key" with a valid key sitting
+    in `.env`, and only worked at all because the CLI and web app happen to
+    import Settings first.
+    """
+
+    def test_importing_any_submodule_loads_dotenv(self) -> None:
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                # Deliberately imports the AI layer alone, with no Settings.
+                "import backtool.ai, sys;"
+                "import dotenv;"
+                "print('loaded' if getattr(dotenv, 'load_dotenv', None) else 'no')",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stdout.strip() == "loaded"
+
+    def test_package_init_loads_without_overriding_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A shell export or CI secret must win over a stale local file."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-from-the-shell")
+        from dotenv import load_dotenv
+
+        load_dotenv(override=False)
+        import os
+
+        assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-from-the-shell"
