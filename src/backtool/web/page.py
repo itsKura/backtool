@@ -173,7 +173,7 @@ def shell(
   <nav class="nav">
     <span class="brand">backtool</span>
     {nav_link("/", "Calendar", "calendar")}
-    {nav_link("/study", "Build a study", "study")}
+    {nav_link("/study", "Ask a question", "study")}
   </nav>
   {body}
 </div>
@@ -212,9 +212,9 @@ def render_page(*, ai_available: bool) -> str:
 
     body = f"""
   <div class="masthead">
-    <h1>Build a study</h1>
-    <p>Full control over the specification. For a guided view of what is coming
-       up, use the <a href="/">calendar</a>.</p>
+    <h1>Research</h1>
+    <p>Ask in plain language and the planner builds the specification, or set
+       one yourself. For what is coming up, see the <a href="/">calendar</a>.</p>
   </div>
 
   <form id="study-form">

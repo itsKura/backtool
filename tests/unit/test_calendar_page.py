@@ -304,3 +304,86 @@ class TestCandlesEndpoint:
 
     def test_unknown_event_is_a_404(self, client: TestClient) -> None:
         assert client.get("/api/event/NOPE/candles").status_code == 404
+
+
+class TestAiSummary:
+    """The AI summary is on-demand, and never pretends to be a measurement."""
+
+    def test_button_is_offered_when_configured(self) -> None:
+        from unittest.mock import patch
+
+        with patch("backtool.web.app._ai_available", return_value=True):
+            html = TestClient(app).get("/event/FOMC-2026-09-16").text
+        assert 'id="explain-btn"' in html
+        assert "Explain these results" in html
+
+    def test_it_is_not_automatic(self) -> None:
+        """Each summary is a paid call taking tens of seconds. A reader who came
+        for the chart should not be billed for prose they did not ask for."""
+        from unittest.mock import patch
+
+        with patch("backtool.web.app._ai_available", return_value=True):
+            html = TestClient(app).get("/event/FOMC-2026-09-16").text
+        # The container exists but starts empty; nothing fires on load.
+        assert 'id="explain-out"></div>' in html
+        assert "addEventListener('click'" in html
+
+    def test_absent_key_explains_rather_than_hiding(self) -> None:
+        from unittest.mock import patch
+
+        with patch("backtool.web.app._ai_available", return_value=False):
+            html = TestClient(app).get("/event/FOMC-2026-09-16").text
+        assert "ANTHROPIC_API_KEY" in html
+        assert 'id="explain-btn"' not in html
+
+    def test_summary_is_labelled_as_written_not_computed(self) -> None:
+        """A reader must be able to tell at a glance which parts of the page
+        were measured and which were written."""
+        from unittest.mock import patch
+
+        with patch("backtool.web.app._ai_available", return_value=True):
+            html = TestClient(app).get("/event/FOMC-2026-09-16").text
+        assert "computes nothing" in html
+
+    def test_endpoint_refuses_without_a_key(self) -> None:
+        from unittest.mock import patch
+
+        with patch("backtool.web.app._ai_available", return_value=False):
+            response = TestClient(app).get("/api/event/FOMC-2026-09-16/explain")
+        assert response.status_code == 503
+        assert "ANTHROPIC_API_KEY" in response.text
+
+    def test_endpoint_renders_the_shared_interpretation_card(self) -> None:
+        """Identical markup to a saved report -- the same words should not look
+        like two different things depending on where they are read."""
+        from unittest.mock import patch
+
+        from backtool.ai.models import Interpretation
+
+        fake = Interpretation(
+            headline="A headline with 1.234% in it.",
+            findings=["A finding."],
+            caveats=["A caveat."],
+            suggested_followups=["A follow-up."],
+        )
+        with patch("backtool.web.app._ai_available", return_value=True), patch(
+            "backtool.web.app.run_study", return_value=object()
+        ), patch("backtool.ai.interpret_study", return_value=fake):
+            response = TestClient(app).get("/api/event/FOMC-2026-09-16/explain")
+
+        assert response.status_code == 200
+        assert "A headline with 1.234% in it." in response.text
+        assert 'class="card ai"' in response.text
+
+    def test_failure_is_reported_not_swallowed(self) -> None:
+        from unittest.mock import patch
+
+        from backtool.ai import AIError
+
+        with patch("backtool.web.app._ai_available", return_value=True), patch(
+            "backtool.web.app.run_study", return_value=object()
+        ), patch("backtool.ai.interpret_study", side_effect=AIError("model down")):
+            response = TestClient(app).get("/api/event/FOMC-2026-09-16/explain")
+
+        assert response.status_code == 502
+        assert "model down" in response.text

@@ -41,7 +41,9 @@ from backtool.web.calendar_page import render_calendar
 from backtool.web.event_page import (
     CHART_SPAN,
     LIGHTWEIGHT_CHARTS_CDN,
+    ai_summary_script,
     price_chart_script,
+    render_ai_summary,
     render_event_explainer,
     render_event_header,
     render_outcome_placeholder,
@@ -132,6 +134,7 @@ async def event_detail(event_id: str, symbol: str = "BTCUSDT") -> HTMLResponse:
         + "Loading the last "
         + str(DEFAULT_HISTORY_EVENTS)
         + " occurrences&hellip;</p></div>"
+        + render_ai_summary(available=_ai_available(), has_history=True)
         + render_outcome_placeholder()
         + render_event_explainer(event)
     )
@@ -147,8 +150,10 @@ async def event_detail(event_id: str, symbol: str = "BTCUSDT") -> HTMLResponse:
         ".catch(e => { document.getElementById('history').innerHTML = "
         "'<div class=\"error\"><h3>Could not load history</h3><p>' + e + '</p></div>'; });"
     )
-    script = history_script + (
-        "" if upcoming else price_chart_script(event.event_id, chosen)
+    script = (
+        history_script
+        + ("" if upcoming else price_chart_script(event.event_id, chosen))
+        + ai_summary_script(event.event_id, chosen)
     )
 
     return HTMLResponse(
@@ -161,6 +166,62 @@ async def event_detail(event_id: str, symbol: str = "BTCUSDT") -> HTMLResponse:
             head_scripts=() if upcoming else (LIGHTWEIGHT_CHARTS_CDN,),
         )
     )
+
+
+@app.get("/api/event/{event_id}/explain", response_class=HTMLResponse)
+async def event_explain(
+    event_id: str, symbol: str = "BTCUSDT", interval: str = "5m"
+) -> HTMLResponse:
+    """Have the model explain this event's historical statistics.
+
+    Runs the same study the history section shows, then hands the *computed
+    results* to the model -- never candles. The interpretation is rendered by
+    the reporting layer, so a summary shown here looks identical to one saved
+    into a report.
+    """
+    event = _find_event(event_id)
+    chosen = symbol.upper() if symbol.upper() in SYMBOLS else SYMBOLS[0]
+
+    if not _ai_available():
+        return HTMLResponse(
+            render_error("ANTHROPIC_API_KEY is not set on the server."),
+            status_code=503,
+        )
+
+    try:
+        html = await asyncio.to_thread(
+            _event_explain, event=event, symbol=chosen, interval=interval
+        )
+    except Exception as exc:  # noqa: BLE001 - the panel must show the reason
+        logger.exception("Explanation failed")
+        return HTMLResponse(render_error(f"{type(exc).__name__}: {exc}"), status_code=502)
+
+    return HTMLResponse(html)
+
+
+def _event_explain(*, event: MarketEvent, symbol: str, interval: str) -> str:
+    """Run the study, interpret it, and render the interpretation."""
+    from backtool.ai import interpret_study
+    from backtool.reporting.html import render_interpretation_card
+
+    now = dt.datetime.now(tz=UTC)
+    spec = ResearchSpec(
+        symbol=symbol,
+        event_type=event.event_type,
+        event_count=DEFAULT_HISTORY_EVENTS,
+        interval=Interval(interval.lower()),
+        windows=DEFAULT_WINDOWS,
+        as_of=min(event.timestamp_utc, now),
+    )
+    with MarketDataService.from_settings(Settings.from_env()) as service:
+        study = run_study(spec, service, load_events(spec.event_type), now=now)
+
+    question = (
+        f"Summarise how {symbol} behaved around the last "
+        f"{DEFAULT_HISTORY_EVENTS} {event.event_type.value} releases, for a "
+        f"reader looking at the {event.local_date.isoformat()} release."
+    )
+    return render_interpretation_card(interpret_study(study, question=question))
 
 
 @app.get("/api/event/{event_id}/candles")
