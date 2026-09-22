@@ -123,6 +123,70 @@ def _schedule_note(event: MarketEvent) -> str:
     return f'<div class="{css}"><strong>{escape(label)}.</strong> {escape(detail)}</div>'
 
 
+def render_ai_summary(*, available: bool, has_history: bool) -> str:
+    """The AI summary slot: a button, and somewhere to put the answer.
+
+    On demand rather than automatic. Each summary is a paid API call taking
+    tens of seconds, and a reader who came to look at the chart should not be
+    billed for prose they did not ask for.
+
+    The badge is not decoration. A reader has to be able to tell at a glance
+    which parts of the page were computed and which were written, and the only
+    reliable way to do that is to say so next to the writing.
+    """
+    if not has_history:
+        return ""
+    if not available:
+        return (
+            "<h2>AI summary</h2>"
+            '<div class="card"><p class="hint">Set <code>ANTHROPIC_API_KEY</code> '
+            "in <code>.env</code> and restart to have the statistics above "
+            "summarised in plain language. Everything else on this page works "
+            "without it.</p></div>"
+        )
+
+    return (
+        "<h2>AI summary</h2>"
+        '<div class="card ai">'
+        '<p class="ai-badge">A language model reads the statistics above and '
+        "explains them. It computes nothing, and every figure it quotes appears "
+        "in the numbers on this page.</p>"
+        '<button type="button" class="run" id="explain-btn">Explain these results</button>'
+        '<span class="status" id="explain-status"></span>'
+        '<div id="explain-out"></div>'
+        "</div>"
+    )
+
+
+def ai_summary_script(event_id: str, symbol: str) -> str:
+    """Client code for the on-demand summary button."""
+    return f"""
+(function () {{
+  const btn = document.getElementById('explain-btn');
+  if (!btn) return;
+  const status = document.getElementById('explain-status');
+  const out = document.getElementById('explain-out');
+
+  btn.addEventListener('click', async () => {{
+    btn.disabled = true;
+    status.innerHTML = '<span class="spinner"></span>Reading the statistics…';
+    out.innerHTML = '';
+    try {{
+      const r = await fetch('/api/event/{event_id}/explain?symbol={symbol}');
+      out.innerHTML = await r.text();
+      if (r.ok) btn.remove();
+    }} catch (e) {{
+      out.innerHTML = '<div class="error"><h3>Could not reach the server</h3><p>'
+        + String(e) + '</p></div>';
+    }} finally {{
+      btn.disabled = false;
+      status.textContent = '';
+    }}
+  }});
+}})();
+"""
+
+
 def render_outcome_placeholder() -> str:
     """State plainly which outcome figures exist and which do not.
 

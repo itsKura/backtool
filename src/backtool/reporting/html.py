@@ -200,6 +200,16 @@ def _coverage(study: StudyResult) -> str:
     return f'<div class="card"><strong>Coverage.</strong> {escape(study.coverage_note())}.</div>'
 
 
+def render_interpretation_card(interpretation: Any) -> str:
+    """The interpretation card without the surrounding heading.
+
+    Public so the web page can render a summary on demand and get markup
+    identical to what a saved report contains -- the same words should not look
+    like two different things depending on where they are read.
+    """
+    return _interpretation_body(interpretation)
+
+
 def _interpretation(interpretation: Any) -> str:
     """Render the AI reading, clearly marked as interpretation not measurement.
 
@@ -207,6 +217,11 @@ def _interpretation(interpretation: Any) -> str:
     so a reader is never in doubt about which parts of the page were computed
     and which were written.
     """
+    return "<h2>Interpretation</h2>" + _interpretation_body(interpretation)
+
+
+def _interpretation_body(interpretation: Any) -> str:
+    """The card itself, shared by the report and the live page."""
 
     def block(title: str, items: list[str]) -> str:
         if not items:
@@ -215,10 +230,9 @@ def _interpretation(interpretation: Any) -> str:
         return f"<p class='ai-label'>{escape(title)}</p><ul>{entries}</ul>"
 
     return (
-        "<h2>Interpretation</h2>"
         '<div class="card ai">'
         '<p class="ai-badge">Written by a language model from the statistics '
-        "below. It computed none of them.</p>"
+        "on this page. It computed none of them.</p>"
         f'<p class="ai-headline">{escape(interpretation.headline)}</p>'
         f"{block('Findings', list(interpretation.findings))}"
         f"{block('Caveats', list(interpretation.caveats))}"
@@ -359,4 +373,9 @@ def write_report(
     return str(target.resolve())
 
 
-__all__ = ["render_body", "render_report", "write_report"]
+__all__ = [
+    "render_body",
+    "render_interpretation_card",
+    "render_report",
+    "write_report",
+]
