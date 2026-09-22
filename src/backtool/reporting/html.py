@@ -20,36 +20,15 @@ from backtool.research.results import StudyResult
 
 # Palette: the data-viz reference instance's diverging pair, used unchanged.
 # Blue/red rather than green/red -- see charts.py for why.
+#
+# Dark is the default, not an OS-conditional variant. The steps below are the
+# reference palette's *dark* column, chosen and contrast-checked against the
+# dark surface rather than produced by inverting the light ones -- an automatic
+# flip drops saturated hues below the contrast floor. Light remains available
+# under an explicit `data-theme="light"` stamp, so a reader who needs it (print,
+# a bright room, low vision) is not locked out.
 _STYLE = """
 :root {
-  color-scheme: light;
-  --surface-0: #f4f3f0;
-  --surface-1: #fcfcfb;
-  --surface-2: #eceae5;
-  --text-primary: #0b0b0b;
-  --text-secondary: #52514e;
-  --text-muted: #77756f;
-  --grid: #e3e1db;
-  --up: #2a78d6;
-  --down: #e34948;
-  --accent: #2a78d6;
-}
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    color-scheme: dark;
-    --surface-0: #121211;
-    --surface-1: #1a1a19;
-    --surface-2: #262624;
-    --text-primary: #ffffff;
-    --text-secondary: #c3c2b7;
-    --text-muted: #8f8e85;
-    --grid: #343431;
-    --up: #3987e5;
-    --down: #e66767;
-    --accent: #3987e5;
-  }
-}
-:root[data-theme="dark"] {
   color-scheme: dark;
   --surface-0: #121211;
   --surface-1: #1a1a19;
@@ -61,6 +40,19 @@ _STYLE = """
   --up: #3987e5;
   --down: #e66767;
   --accent: #3987e5;
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --surface-0: #f4f3f0;
+  --surface-1: #fcfcfb;
+  --surface-2: #eceae5;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #77756f;
+  --grid: #e3e1db;
+  --up: #2a78d6;
+  --down: #e34948;
+  --accent: #2a78d6;
 }
 * { box-sizing: border-box; }
 body {
