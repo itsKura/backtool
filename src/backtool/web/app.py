@@ -39,8 +39,13 @@ from backtool.research.spec import ResearchSpec
 from backtool.research.windows import DEFAULT_WINDOWS, WindowSpec
 from backtool.web.calendar_page import render_calendar
 from backtool.web.event_page import (
+    CHART_SPAN,
+    LIGHTWEIGHT_CHARTS_CDN,
+    price_chart_script,
+    render_event_explainer,
     render_event_header,
     render_outcome_placeholder,
+    render_price_chart,
     render_upcoming_notice,
 )
 from backtool.web.page import render_error, render_page, shell
@@ -114,19 +119,24 @@ async def event_detail(event_id: str, symbol: str = "BTCUSDT") -> HTMLResponse:
     )
 
     upcoming = event.timestamp_utc > now
+
+    # Price first, explainer last. Someone who clicked a CPI release came to
+    # see what price did, not to have CPI explained to them first.
     body = (
         render_event_header(event, now=now)
         + (render_upcoming_notice(event) if upcoming else "")
-        + render_outcome_placeholder()
-        + "<h2>Historical reaction</h2>"
         + f'<div class="symbol-tabs">{tabs}</div>'
+        + render_price_chart(event, chosen, available=not upcoming)
+        + "<h2>Historical reaction</h2>"
         + '<div id="history"><p class="status"><span class="spinner"></span>'
         + "Loading the last "
         + str(DEFAULT_HISTORY_EVENTS)
         + " occurrences&hellip;</p></div>"
+        + render_outcome_placeholder()
+        + render_event_explainer(event)
     )
 
-    script = (
+    history_script = (
         "fetch('/api/event/"
         + event.event_id
         + "/history?symbol="
@@ -137,9 +147,94 @@ async def event_detail(event_id: str, symbol: str = "BTCUSDT") -> HTMLResponse:
         ".catch(e => { document.getElementById('history').innerHTML = "
         "'<div class=\"error\"><h3>Could not load history</h3><p>' + e + '</p></div>'; });"
     )
-    return HTMLResponse(
-        shell(f"backtool - {event.event_id}", body, active="calendar", script=script)
+    script = history_script + (
+        "" if upcoming else price_chart_script(event.event_id, chosen)
     )
+
+    return HTMLResponse(
+        shell(
+            f"backtool - {event.event_id}",
+            body,
+            active="calendar",
+            script=script,
+            # The chart library is only loaded on pages that actually chart.
+            head_scripts=() if upcoming else (LIGHTWEIGHT_CHARTS_CDN,),
+        )
+    )
+
+
+@app.get("/api/event/{event_id}/candles")
+async def event_candles(
+    event_id: str, symbol: str = "BTCUSDT", interval: str = "5m"
+) -> dict[str, Any]:
+    """Candles around one event, in the shape Lightweight Charts expects.
+
+    Served from the same cache the statistics are computed from, so the chart
+    and the numbers cannot disagree.
+    """
+    event = _find_event(event_id)
+    chosen = symbol.upper() if symbol.upper() in SYMBOLS else SYMBOLS[0]
+    now = dt.datetime.now(tz=UTC)
+
+    if event.timestamp_utc > now:
+        return {
+            "symbol": chosen,
+            "candles": [],
+            "message": "This event has not happened yet.",
+        }
+
+    try:
+        candles = await asyncio.to_thread(
+            _event_candles, event=event, symbol=chosen, interval=interval
+        )
+    except Exception as exc:  # noqa: BLE001 - the chart shows the reason
+        logger.exception("Candle fetch failed")
+        return {"symbol": chosen, "candles": [], "message": f"{type(exc).__name__}: {exc}"}
+
+    return {
+        "symbol": chosen,
+        "interval": interval,
+        "event_time": int(event.timestamp_utc.timestamp()),
+        "candles": candles,
+    }
+
+
+def _event_candles(
+    *, event: MarketEvent, symbol: str, interval: str
+) -> list[dict[str, float | int]]:
+    """Fetch and shape the candles surrounding an event.
+
+    Times are UNIX seconds, which is what Lightweight Charts wants for
+    intraday data. Converted via ``timestamp()`` rather than integer epoch
+    arithmetic so the result does not depend on the frame's backing
+    resolution -- the mistake that cost a debugging session earlier.
+    """
+    import pandas as pd
+
+    resolved = Interval(interval.lower())
+    start = event.timestamp_utc - CHART_SPAN
+    end = event.timestamp_utc + CHART_SPAN
+
+    with MarketDataService.from_settings(Settings.from_env()) as service:
+        frame = service.get_candles(symbol, resolved, start, end)
+
+    seconds: list[int] = (
+        (frame["open_time"] - pd.Timestamp(0, tz="UTC"))
+        .dt.total_seconds()
+        .astype("int64")
+        .tolist()
+    )
+    return [
+        {"time": t, "open": o, "high": h, "low": low, "close": c}
+        for t, o, h, low, c in zip(
+            seconds,
+            frame["open"].astype("float64").tolist(),
+            frame["high"].astype("float64").tolist(),
+            frame["low"].astype("float64").tolist(),
+            frame["close"].astype("float64").tolist(),
+            strict=True,
+        )
+    ]
 
 
 @app.get("/api/event/{event_id}/history", response_class=HTMLResponse)

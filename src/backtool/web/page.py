@@ -136,11 +136,24 @@ _NAV = """
 """
 
 
-def shell(title: str, body: str, *, active: str = "", script: str = "") -> str:
+def shell(
+    title: str,
+    body: str,
+    *,
+    active: str = "",
+    script: str = "",
+    head_scripts: tuple[str, ...] = (),
+) -> str:
     """Wrap page content in the shared document, styling and navigation.
 
     One shell for every page so the calendar, an event, and the study form are
     visibly one product, and so report styling is defined exactly once.
+
+    Args:
+        head_scripts: External scripts to load before the body script. Only the
+            event page uses this, for the charting library; every other page
+            stays dependency-free, and the saved HTML report -- which must work
+            offline -- never touches it.
     """
     def nav_link(href: str, label: str, key: str) -> str:
         current = ' aria-current="page"' if key == active else ""
@@ -153,6 +166,7 @@ def shell(title: str, body: str, *, active: str = "", script: str = "") -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{escape(title)}</title>
 <style>{REPORT_STYLE}{_PAGE_STYLE}{CALENDAR_STYLE}{EVENT_STYLE}{_NAV}</style>
+{"".join(f'<script src="{src}"></script>' for src in head_scripts)}
 </head>
 <body>
 <div class="wrap">

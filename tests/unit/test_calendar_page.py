@@ -195,3 +195,112 @@ class TestEventHistory:
 
     def test_unknown_event_is_a_404(self, client: TestClient) -> None:
         assert client.get("/api/event/NOPE/history").status_code == 404
+
+
+class TestEventPageOrder:
+    """Price first, explainer last.
+
+    Someone who clicked a CPI release came to see what price did, not to have
+    CPI explained to them before they can reach the chart.
+    """
+
+    def test_price_chart_comes_before_the_explainer(self, client: TestClient) -> None:
+        html = client.get("/event/FOMC-2026-09-16").text
+        assert html.index("Price around the event") < html.index("About this event")
+
+    def test_history_comes_before_the_explainer(self, client: TestClient) -> None:
+        html = client.get("/event/FOMC-2026-09-16").text
+        assert html.index("Historical reaction") < html.index("About this event")
+
+    def test_explainer_is_still_present(self, client: TestClient) -> None:
+        html = client.get("/event/FOMC-2026-09-16").text
+        assert "What it is" in html
+        assert "Why markets care" in html
+
+
+class TestPriceChart:
+    def test_past_event_loads_the_chart_library(self, client: TestClient) -> None:
+        html = client.get("/event/FOMC-2026-09-16").text
+        assert "lightweight-charts" in html
+        assert 'id="price-chart"' in html
+
+    def test_future_event_has_no_chart_and_says_why(self, client: TestClient) -> None:
+        """An empty frame the reader has to interpret is worse than a sentence."""
+        upcoming = next(
+            event
+            for event in load_events()
+            if event.timestamp_utc > dt.datetime.now(tz=dt.UTC)
+        )
+        html = client.get(f"/event/{upcoming.event_id}").text
+        assert "no candles around it to chart" in html
+        assert "lightweight-charts" not in html
+
+    def test_chart_library_version_is_pinned(self) -> None:
+        """v5 replaced addCandlestickSeries with addSeries(CandlestickSeries,
+        ...); an unpinned range would break the page on the next major."""
+        from backtool.web.event_page import LIGHTWEIGHT_CHARTS_CDN
+
+        assert "lightweight-charts@5" in LIGHTWEIGHT_CHARTS_CDN
+
+    def test_saved_report_stays_free_of_external_scripts(self) -> None:
+        """The chart is a web-page feature. A saved report must still open
+        offline, so the charting CDN must not leak into it."""
+        import datetime as dtime
+
+        from backtool.reporting.html import render_report
+        from backtool.research.results import StudyResult
+        from backtool.research.spec import ResearchSpec
+
+        spec = ResearchSpec(
+            event_count=1, as_of=dtime.datetime(2026, 1, 1, tzinfo=dtime.UTC)
+        )
+        study = StudyResult(
+            spec=spec,
+            generated_at=dtime.datetime(2026, 1, 1, tzinfo=dtime.UTC),
+            events=(),
+        )
+        html = render_report(study)
+        assert "<script" not in html
+        assert "cdn.jsdelivr.net" not in html
+
+
+class TestCandlesEndpoint:
+    def test_returns_candles_centred_on_the_event(self, client: TestClient) -> None:
+        payload = client.get(
+            "/api/event/FOMC-2026-09-16/candles?symbol=BTCUSDT"
+        ).json()
+
+        assert payload["symbol"] == "BTCUSDT"
+        assert payload["candles"], "no candles returned"
+
+        first = payload["candles"][0]["time"]
+        last = payload["candles"][-1]["time"]
+        event = payload["event_time"]
+        assert first < event < last
+        # Roughly symmetric either side, within one candle.
+        assert abs((event - first) - (last - event)) < 3600
+
+    def test_candle_shape_matches_the_chart_library(
+        self, client: TestClient
+    ) -> None:
+        candle = client.get(
+            "/api/event/FOMC-2026-09-16/candles?symbol=BTCUSDT"
+        ).json()["candles"][0]
+        assert set(candle) == {"time", "open", "high", "low", "close"}
+        assert isinstance(candle["time"], int)
+        assert candle["high"] >= candle["low"]
+
+    def test_future_event_returns_empty_with_a_reason(
+        self, client: TestClient
+    ) -> None:
+        upcoming = next(
+            event
+            for event in load_events()
+            if event.timestamp_utc > dt.datetime.now(tz=dt.UTC)
+        )
+        payload = client.get(f"/api/event/{upcoming.event_id}/candles").json()
+        assert payload["candles"] == []
+        assert "not happened yet" in payload["message"]
+
+    def test_unknown_event_is_a_404(self, client: TestClient) -> None:
+        assert client.get("/api/event/NOPE/candles").status_code == 404
