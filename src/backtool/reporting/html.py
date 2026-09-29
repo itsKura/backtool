@@ -17,6 +17,7 @@ from xml.sax.saxutils import escape
 from backtool.reporting.charts import BarItem, diverging_bar_chart
 from backtool.research.aggregate import WindowAggregate, aggregate_study
 from backtool.research.results import StudyResult
+from backtool.research.windows import WindowSpec, window_label, window_title
 
 # Palette: the data-viz reference instance's diverging pair, used unchanged.
 # Blue/red rather than green/red -- see charts.py for why.
@@ -40,6 +41,15 @@ _STYLE = """
   --up: #3987e5;
   --down: #e66767;
   --accent: #3987e5;
+  /* Window shading on the price chart. Deliberately neither blue nor red:
+     those two carry direction everywhere in this project, and a band tinted
+     with one of them behind a candle would read as a claim about that candle.
+     Violet and ochre are annotation colours, and they stay distinguishable
+     under the common red-green deficiencies. */
+  --band-before: 139, 127, 212;
+  --band-after: 212, 162, 76;
+  --band-before-text: #b3a7ea;
+  --band-after-text: #e0b96a;
 }
 :root[data-theme="light"] {
   color-scheme: light;
@@ -53,6 +63,10 @@ _STYLE = """
   --up: #2a78d6;
   --down: #e34948;
   --accent: #2a78d6;
+  --band-before: 109, 92, 188;
+  --band-after: 170, 120, 32;
+  --band-before-text: #5b4aa0;
+  --band-after-text: #8a5f18;
 }
 * { box-sizing: border-box; }
 body {
@@ -111,6 +125,9 @@ td.na { color: var(--text-muted); }
                              font-family: ui-monospace, Consolas, monospace; }
 .chart .axis-label { fill: var(--text-muted); font-size: 11px; }
 .chart .axis-caption { fill: var(--text-muted); font-size: 11px; }
+.chart .median-line { stroke: var(--text-primary); stroke-width: 1;
+                      stroke-dasharray: 3 3; opacity: 0.55; }
+.chart .median-label { fill: var(--text-secondary); font-size: 11px; }
 .chart .bar-group { cursor: default; }
 .chart .bar-group:hover .bar-up,
 .chart .bar-group:hover .bar-down { filter: brightness(1.15); }
@@ -152,7 +169,9 @@ def render_body(study: StudyResult, interpretation: Any | None = None) -> str:
     if interpretation is not None:
         sections.append(_interpretation(interpretation))
     for window_spec in study.spec.windows:
-        sections.append(_window_section(study, aggregates[window_spec.name]))
+        sections.append(
+            _window_section(study, window_spec, aggregates[window_spec.name])
+        )
     sections.append(_evidence_table(study))
     sections.append(_footer(study))
     return "".join(sections)
@@ -236,12 +255,21 @@ def _interpretation_body(interpretation: Any) -> str:
         f'<p class="ai-headline">{escape(interpretation.headline)}</p>'
         f"{block('Findings', list(interpretation.findings))}"
         f"{block('Caveats', list(interpretation.caveats))}"
-        f"{block('Worth running next', list(interpretation.suggested_followups))}"
+        f"{block('Explore further', list(interpretation.suggested_followups))}"
         "</div>"
     )
 
 
-def _window_section(study: StudyResult, agg: WindowAggregate) -> str:
+def _window_section(
+    study: StudyResult, window_spec: WindowSpec, agg: WindowAggregate
+) -> str:
+    """One window's statistics and per-event bars.
+
+    Headed by the window's duration rather than its name. The name is the
+    engine's identifier and it stays where it is load-bearing -- the assumptions
+    block and the spec fingerprint -- but a section heading is read, not looked
+    up.
+    """
     items = [
         BarItem(
             label=event.event_id.replace("FOMC-", ""),
@@ -258,7 +286,7 @@ def _window_section(study: StudyResult, agg: WindowAggregate) -> str:
     )
 
     return (
-        f"<h2>{escape(agg.window)}</h2>"
+        f"<h2>{escape(window_title(window_spec))}</h2>"
         f'<div class="card">{_kpis(agg)}{caveat}'
         '<div class="legend">'
         '<span><span class="swatch up"></span>positive return</span>'
@@ -280,12 +308,16 @@ def _kpis(agg: WindowAggregate) -> str:
         f"{agg.stdev_return_pct:.2f}" if agg.stdev_return_pct is not None else "&mdash;"
     )
     tiles = [
-        ("observations", f"{agg.sample_size}", ""),
-        ("mean return", f"{agg.mean_return_pct:+.2f}%", _sign(agg.mean_return_pct)),
-        ("median return", f"{agg.median_return_pct:+.2f}%", _sign(agg.median_return_pct)),
-        ("positive", f"{agg.up_rate_pct:.0f}%", ""),
-        ("std dev", f"{stdev}%", ""),
-        ("mean range", f"{agg.mean_range_pct:.2f}%", ""),
+        ("Events analyzed", f"{agg.sample_size}", ""),
+        ("Average return", f"{agg.mean_return_pct:+.2f}%", _sign(agg.mean_return_pct)),
+        (
+            "Median return",
+            f"{agg.median_return_pct:+.2f}%",
+            _sign(agg.median_return_pct),
+        ),
+        ("Positive events", f"{agg.up_rate_pct:.0f}%", ""),
+        ("Return variability", f"{stdev}%", ""),
+        ("Average trading range", f"{agg.mean_range_pct:.2f}%", ""),
     ]
     cells = "".join(
         f'<div class="kpi"><div class="label">{label}</div>'
@@ -303,7 +335,9 @@ def _evidence_table(study: StudyResult) -> str:
     excluded and why.
     """
     names = [window.name for window in study.spec.windows]
-    head = "".join(f"<th>{escape(name)}</th>" for name in names)
+    head = "".join(
+        f"<th>{escape(window_label(window))}</th>" for window in study.spec.windows
+    )
 
     rows = []
     for event in study.events:
