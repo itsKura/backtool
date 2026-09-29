@@ -37,6 +37,10 @@ class EventMeta:
 
     label: str
     importance: Importance
+    #: One sentence for the page header, above the fold. Deliberately separate
+    #: from ``what_it_is``: a header needs a line, not a paragraph, and
+    #: truncating prose at a character count produces a sentence nobody wrote.
+    summary: str
     #: Who publishes it, and on what schedule.
     source: str
     release_time: str
@@ -52,6 +56,11 @@ EVENT_META: dict[EventType, EventMeta] = {
     EventType.FOMC: EventMeta(
         label="FOMC rate decision",
         importance=Importance.HIGH,
+        summary=(
+            "The Federal Reserve announces its interest-rate decision and policy "
+            "statement. Markets often react more to changes in the statement and "
+            "the press conference than to the rate decision alone."
+        ),
         source="US Federal Reserve",
         release_time="14:00 America/New_York, second day of a two-day meeting",
         what_it_is=(
@@ -81,6 +90,11 @@ EVENT_META: dict[EventType, EventMeta] = {
     EventType.CPI: EventMeta(
         label="US Consumer Price Index",
         importance=Importance.HIGH,
+        summary=(
+            "The monthly reading on US consumer inflation. It is the single "
+            "biggest input to what the Federal Reserve does next, so rate "
+            "expectations often move more on CPI than on the decision itself."
+        ),
         source="US Bureau of Labor Statistics",
         release_time="08:30 America/New_York, monthly",
         what_it_is=(
