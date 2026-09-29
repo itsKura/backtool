@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
@@ -145,6 +146,91 @@ class WindowSpec(BaseModel):
         )
 
 
+_ZERO = dt.timedelta(0)
+
+#: Units tried largest-first when rendering a duration, each with the smallest
+#: value at which it is worth using. A window boundary is always a whole number
+#: of one of these in practice, but the fallback below keeps an odd offset
+#: readable rather than crashing.
+#:
+#: Days start at two, not one. A 24-hour window written as "1 day" is correct
+#: and useless: it sits in a tab strip beside "1 hour before" and "1 hour
+#: after", where the reader is comparing spans and the unit switching under
+#: them hides that 24h is twenty-four times the others.
+_UNITS: tuple[tuple[str, str, int, int], ...] = (
+    ("day", "d", 86400, 2),
+    ("hour", "h", 3600, 1),
+    ("minute", "m", 60, 1),
+)
+
+
+def humanise_duration(delta: dt.timedelta) -> str:
+    """Render a duration in words: ``24 hours``, ``1 hour``, ``30 minutes``.
+
+    Used in headings and prose, where ``24h`` reads as jargon.
+    """
+    seconds = abs(delta.total_seconds())
+    for name, _, size, minimum in _UNITS:
+        if seconds >= size * minimum and seconds % size == 0:
+            value = int(seconds // size)
+            return f"{value} {name}{'' if value == 1 else 's'}"
+    minutes = seconds / 60
+    return f"{minutes:g} minutes"
+
+
+def compact_duration(delta: dt.timedelta) -> str:
+    """Render a duration tersely: ``24h``, ``1h``, ``30m``.
+
+    Used in table headers and chips, where a full phrase would force the
+    column wider than the numbers it describes.
+    """
+    seconds = abs(delta.total_seconds())
+    for _, short, size, minimum in _UNITS:
+        if seconds >= size * minimum and seconds % size == 0:
+            return f"{int(seconds // size)}{short}"
+    return f"{seconds / 60:g}m"
+
+
+def window_title(spec: WindowSpec) -> str:
+    """The window as a heading: ``24 hours before``, ``1 hour after``."""
+    return _describe(spec, humanise_duration)
+
+
+def window_label(spec: WindowSpec) -> str:
+    """The window as a compact chip or column header: ``24h before``."""
+    return _describe(spec, compact_duration)
+
+
+def _describe(spec: WindowSpec, fmt: Callable[[dt.timedelta], str]) -> str:
+    """Shared shape for both label widths.
+
+    ``fmt`` is the duration formatter; the five cases below are the same either
+    way, so the phrasing lives in one place and the two public functions cannot
+    drift apart.
+    """
+    start, end = spec.start_offset, spec.end_offset
+
+    if start < _ZERO and end == _ZERO:
+        return f"{fmt(start)} before"
+    if start == _ZERO and end > _ZERO:
+        return f"{fmt(end)} after"
+    if start < _ZERO and end > _ZERO:
+        return f"{fmt(start)} before to {fmt(end)} after"
+    if start < _ZERO and end < _ZERO:
+        return f"{fmt(start)} to {fmt(end)} before"
+    return f"{fmt(start)} to {fmt(end)} after"
+
+
+def window_sentence(spec: WindowSpec) -> str:
+    """The window as a phrase inside a sentence: ``the 24 hours before it``."""
+    start, end = spec.start_offset, spec.end_offset
+    if start < _ZERO and end == _ZERO:
+        return f"the {humanise_duration(start)} before the release"
+    if start == _ZERO and end > _ZERO:
+        return f"the {humanise_duration(end)} after the release"
+    return window_title(spec)
+
+
 #: The default V1 window set. Deliberately small: two pre-event windows to
 #: characterise the run-up, two post-event windows to characterise the reaction.
 #: Every one of these is an explicit, editable research choice, not a constant.
@@ -152,5 +238,23 @@ DEFAULT_WINDOWS: tuple[WindowSpec, ...] = (
     WindowSpec(name="pre_event_24h", start="-24h", end="0h"),
     WindowSpec(name="pre_event_1h", start="-1h", end="0h"),
     WindowSpec(name="post_event_1h", start="0h", end="1h"),
+    WindowSpec(name="post_event_24h", start="0h", end="24h"),
+)
+
+#: The reaction grid used by scenario and setup cohorts: how far price had moved
+#: at five points after the release, all measured from the same anchor.
+#:
+#: Every one of these is a *separate* measurement from the release price, not a
+#: leg of a path -- the 24h figure is not the 4h figure plus something. Reading
+#: them as a sequence is the point: a move that appears at 5m and holds to 24h
+#: is a different event from one that appears at 5m and is gone by 1h.
+#:
+#: The 5m window is exactly one candle at the 5m interval. Anything finer would
+#: need an interval this project deliberately does not support.
+REACTION_WINDOWS: tuple[WindowSpec, ...] = (
+    WindowSpec(name="post_event_5m", start="0h", end="5m"),
+    WindowSpec(name="post_event_15m", start="0h", end="15m"),
+    WindowSpec(name="post_event_1h", start="0h", end="1h"),
+    WindowSpec(name="post_event_4h", start="0h", end="4h"),
     WindowSpec(name="post_event_24h", start="0h", end="24h"),
 )

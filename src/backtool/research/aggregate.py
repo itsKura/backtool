@@ -43,6 +43,12 @@ class WindowAggregate(BaseModel):
     up_rate_pct: float
     down_rate_pct: float
     flat_count: int
+    #: The same thing as a count. Carried rather than recovered from the rate,
+    #: because rounding a percentage back into a count over a five-event sample
+    #: produces the wrong integer often enough to matter, and "4 of 5" printed
+    #: beside "100%" would be worse than showing neither.
+    up_count: int
+    down_count: int
 
     p10_return_pct: float
     p25_return_pct: float
@@ -53,7 +59,20 @@ class WindowAggregate(BaseModel):
     mean_mfe_pct: float
     mean_mae_pct: float
     mean_range_pct: float
+    #: Median rather than mean high-to-low range. One violent release drags a
+    #: mean range somewhere no typical release went, and "how far does this
+    #: usually travel" is a question about the typical case.
+    median_range_pct: float
     mean_realized_vol_pct: float | None
+
+    #: Share of events whose absolute move cleared a threshold, in percent.
+    #: A median of +0.1% over events that individually moved 2% either way is a
+    #: different fact from a median of +0.1% over events that barely moved, and
+    #: these two are what separate them.
+    move_over_0_5_pct: float
+    move_over_1_pct: float
+    move_over_0_5_count: int
+    move_over_1_count: int
 
     #: Mean share of expected candles actually present, in percent.
     mean_coverage_pct: float | None
@@ -104,6 +123,7 @@ def aggregate_window(study: StudyResult, window_name: str) -> WindowAggregate:
         return _empty_aggregate(window_name, excluded)
 
     returns = np.array([m.return_pct for m in usable], dtype="float64")
+    moves = np.array([m.abs_move_pct for m in usable], dtype="float64")
     directions = [m.direction for m in usable]
     coverages = [m.coverage_pct for m in usable if m.coverage_pct is not None]
     vols = [m.realized_vol_pct for m in usable if m.realized_vol_pct is not None]
@@ -123,11 +143,18 @@ def aggregate_window(study: StudyResult, window_name: str) -> WindowAggregate:
         up_rate_pct=_share(directions, Direction.UP),
         down_rate_pct=_share(directions, Direction.DOWN),
         flat_count=sum(1 for d in directions if d is Direction.FLAT),
+        up_count=sum(1 for d in directions if d is Direction.UP),
+        down_count=sum(1 for d in directions if d is Direction.DOWN),
         p10_return_pct=float(np.percentile(returns, 10)),
         p25_return_pct=float(np.percentile(returns, 25)),
         p75_return_pct=float(np.percentile(returns, 75)),
         p90_return_pct=float(np.percentile(returns, 90)),
-        mean_abs_move_pct=float(np.mean([m.abs_move_pct for m in usable])),
+        mean_abs_move_pct=float(np.mean(moves)),
+        move_over_0_5_pct=float(np.mean(moves >= 0.5) * 100.0),
+        move_over_1_pct=float(np.mean(moves >= 1.0) * 100.0),
+        move_over_0_5_count=int(np.count_nonzero(moves >= 0.5)),
+        move_over_1_count=int(np.count_nonzero(moves >= 1.0)),
+        median_range_pct=float(np.median([m.range_pct for m in usable])),
         mean_mfe_pct=float(np.mean([m.mfe_pct for m in usable])),
         mean_mae_pct=float(np.mean([m.mae_pct for m in usable])),
         mean_range_pct=float(np.mean([m.range_pct for m in usable])),
@@ -159,6 +186,9 @@ def _empty_aggregate(window_name: str, excluded: int) -> WindowAggregate:
             "mean_mfe_pct",
             "mean_mae_pct",
             "mean_range_pct",
+            "median_range_pct",
+            "move_over_0_5_pct",
+            "move_over_1_pct",
         ),
         0.0,
     )
@@ -168,6 +198,10 @@ def _empty_aggregate(window_name: str, excluded: int) -> WindowAggregate:
         excluded=excluded,
         stdev_return_pct=None,
         flat_count=0,
+        up_count=0,
+        down_count=0,
+        move_over_0_5_count=0,
+        move_over_1_count=0,
         mean_realized_vol_pct=None,
         mean_coverage_pct=None,
         **zeros,
