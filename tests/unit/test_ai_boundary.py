@@ -140,7 +140,18 @@ def test_interpreter_payload_contains_no_price_series() -> None:
 
     payload = build_payload(study)
 
-    assert set(payload) == {"question", "assumptions", "coverage", "aggregates", "per_event"}
+    # Pinned deliberately: this function is the boundary deciding what reaches
+    # the model, so adding a key must be a conscious edit here too.
+    # `window_labels` is derived from window offsets alone -- it carries the
+    # reader's phrase for each window so the model stops quoting engine keys.
+    assert set(payload) == {
+        "question",
+        "window_labels",
+        "assumptions",
+        "coverage",
+        "aggregates",
+        "per_event",
+    }
     for event in payload["per_event"]:
         for window in event["windows"].values():
             assert "open" not in window

@@ -66,7 +66,7 @@ def _event_card(event: MarketEvent, now: dt.datetime) -> str:
         f"</span>"
         f'<span class="event-body">'
         f'<span class="event-title">{escape(meta.label)}</span>'
-        f'<span class="event-sub">{escape(event.event_id)}'
+        f'<span class="event-sub">{escape(meta.source)}'
         f"{_note_suffix(event)}</span>"
         f"</span>"
         f'<span class="event-meta">'
@@ -125,9 +125,8 @@ CALENDAR_STYLE = """
               font-family: ui-monospace, Consolas, monospace; }
 .event-body { display: flex; flex-direction: column; min-width: 0; }
 .event-title { font-size: 15px; font-weight: 500; }
-.event-sub { color: var(--text-muted); font-size: 12px;
-             font-family: ui-monospace, Consolas, monospace; }
-.event-flag { color: var(--down); font-family: inherit; }
+.event-sub { color: var(--text-muted); font-size: 12px; }
+.event-flag { color: var(--down); }
 .event-meta { display: flex; align-items: center; gap: 14px; white-space: nowrap; }
 .event-countdown { color: var(--text-secondary); font-size: 13px; }
 .badge { font-size: 11px; padding: 2px 8px; border-radius: 99px;

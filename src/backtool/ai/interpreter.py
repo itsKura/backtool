@@ -20,6 +20,7 @@ from backtool.ai.models import Interpretation
 from backtool.ai.prompts import INTERPRETER_SYSTEM
 from backtool.research.aggregate import WindowAggregate, aggregate_study
 from backtool.research.results import StudyResult
+from backtool.research.windows import window_title
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,14 @@ def build_payload(study: StudyResult, *, question: str | None = None) -> dict[st
 
     return {
         "question": question,
+        # The model reads the engine's window keys because ``aggregates`` and
+        # ``per_event`` are keyed by them, and it then writes them into its
+        # prose -- "the post_event_1h window", "mean_range_pct 0.888". Handing
+        # it the reader's phrase for each window gives it something correct to
+        # say instead; the prompt forbids the key itself.
+        "window_labels": {
+            window.name: window_title(window) for window in study.spec.windows
+        },
         "assumptions": dict(study.spec.describe_items()),
         "coverage": {
             "events_requested": study.requested_count,
@@ -158,7 +167,7 @@ def render_interpretation(interpretation: Interpretation) -> list[str]:
         lines.append("")
 
     if interpretation.suggested_followups:
-        lines.append("Worth running next:")
+        lines.append("Explore further:")
         lines.extend(f"  - {item}" for item in interpretation.suggested_followups)
 
     return lines

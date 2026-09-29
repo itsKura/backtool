@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from backtool.core.types import EventType
 from backtool.events import load_events
 from backtool.events.meta import EVENT_META, Importance, meta_for
+from backtool.research.windows import window_title
 from backtool.web.app import DEFAULT_HISTORY_EVENTS, SYMBOLS, app
 from backtool.web.calendar_page import PAST_LIMIT, format_delta, render_calendar
 
@@ -134,18 +135,39 @@ class TestEventRoutes:
         assert "has not happened yet" in response.text
         assert "record, not a forecast" in response.text
 
-    def test_forecast_gap_is_stated_not_hidden(self, client: TestClient) -> None:
+    def test_forecast_gap_is_shown_as_absent_not_as_a_substitute(
+        self, client: TestClient
+    ) -> None:
         """Substituting something else and labelling it 'forecast' is the exact
-        silent redefinition this project exists to avoid."""
-        response = client.get("/event/FOMC-2026-06-17")
-        assert "no free licence-clean source" in response.text
+        silent redefinition this project exists to avoid. The row is rendered
+        with the value missing rather than omitted, so a reader can see what is
+        tracked and that there is nothing in it yet."""
+        html = client.get("/event/FOMC-2026-06-17").text
+        assert "Expected" in html
+        assert 'class="expect-value">&mdash;' in html
+
+    def test_no_development_terminology_reaches_the_page(
+        self, client: TestClient
+    ) -> None:
+        """'Not yet wired up' and 'planned' describe the state of the codebase,
+        which is not something a reader of a market page has any use for."""
+        html = client.get("/event/FOMC-2026-06-17").text
+        for phrase in ("not wired up", "Not yet wired up", "are planned", "TODO"):
+            assert phrase not in html
 
     def test_history_loads_asynchronously(self, client: TestClient) -> None:
         """A cold cache means fetching candles for twenty events; the
         explanation should not wait on that."""
         response = client.get("/event/FOMC-2026-06-17")
-        assert 'id="history"' in response.text
+        assert 'id="slot-summary"' in response.text
         assert "/api/event/FOMC-2026-06-17/history" in response.text
+
+    def test_history_fills_three_separate_slots(self, client: TestClient) -> None:
+        """Other sections sit between the statistics, the evidence table and the
+        methodology, so the fragment cannot be injected as one block."""
+        html = client.get("/event/FOMC-2026-06-17").text
+        for slot in ("slot-summary", "slot-evidence", "slot-methodology"):
+            assert f'id="{slot}"' in html
 
 
 class TestEventHistory:
@@ -166,7 +188,7 @@ class TestEventHistory:
         event = next(e for e in load_events() if e.event_id == "FOMC-2025-06-18")
 
         with patch("backtool.web.app.run_study", side_effect=capture), patch(
-            "backtool.web.app.render_body", return_value="<h2>ok</h2>"
+            "backtool.web.app.render_history", return_value="<h2>ok</h2>"
         ):
             client = TestClient(app)
             response = client.get("/api/event/FOMC-2025-06-18/history")
@@ -185,7 +207,7 @@ class TestEventHistory:
             return object()
 
         with patch("backtool.web.app.run_study", side_effect=capture), patch(
-            "backtool.web.app.render_body", return_value=""
+            "backtool.web.app.render_history", return_value=""
         ):
             TestClient(app).get(
                 "/api/event/FOMC-2025-06-18/history?symbol=ETHUSDT"
@@ -206,11 +228,23 @@ class TestEventPageOrder:
 
     def test_price_chart_comes_before_the_explainer(self, client: TestClient) -> None:
         html = client.get("/event/FOMC-2026-09-16").text
-        assert html.index("Price around the event") < html.index("About this event")
+        assert html.index("Price around the release") < html.index("About this event")
 
     def test_history_comes_before_the_explainer(self, client: TestClient) -> None:
         html = client.get("/event/FOMC-2026-09-16").text
-        assert html.index("Historical reaction") < html.index("About this event")
+        assert html.index('id="slot-summary"') < html.index("About this event")
+
+    def test_findings_come_before_the_evidence_table(
+        self, client: TestClient
+    ) -> None:
+        """What the numbers show is primary; the rows they were computed from
+        are there to be checked, not to be read first."""
+        html = client.get("/event/FOMC-2026-09-16").text
+        assert html.index("Key findings") < html.index('id="slot-evidence"')
+
+    def test_methodology_is_last(self, client: TestClient) -> None:
+        html = client.get("/event/FOMC-2026-09-16").text
+        assert html.index("About this event") < html.index('id="slot-methodology"')
 
     def test_explainer_is_still_present(self, client: TestClient) -> None:
         html = client.get("/event/FOMC-2026-09-16").text
@@ -234,6 +268,121 @@ class TestPriceChart:
         html = client.get(f"/event/{upcoming.event_id}").text
         assert "no candles around it to chart" in html
         assert "lightweight-charts" not in html
+
+    def test_bands_come_from_the_measured_windows(self) -> None:
+        """The shaded regions and the statistics must describe the same spans,
+        so both are derived from DEFAULT_WINDOWS rather than restated."""
+        from backtool.research.windows import DEFAULT_WINDOWS
+        from backtool.web.event_page import chart_window_bands
+
+        event_time = dt.datetime(2026, 9, 16, 18, 0, tzinfo=dt.UTC)
+        bands = chart_window_bands(event_time)
+
+        assert len(bands) == len(DEFAULT_WINDOWS)
+        for band, window in zip(bands, DEFAULT_WINDOWS, strict=True):
+            assert band["start"] == int(
+                (event_time + window.start_offset).timestamp()
+            )
+            assert band["end"] == int((event_time + window.end_offset).timestamp())
+
+    def test_band_labels_are_never_window_names(self) -> None:
+        from backtool.web.event_page import chart_window_bands
+
+        bands = chart_window_bands(dt.datetime(2026, 9, 16, 18, 0, tzinfo=dt.UTC))
+        for band in bands:
+            assert "_" not in str(band["title"])
+            assert "_" not in str(band["label"])
+
+    def test_bands_are_split_into_before_and_after(self) -> None:
+        from backtool.web.event_page import chart_window_bands
+
+        event_time = dt.datetime(2026, 9, 16, 18, 0, tzinfo=dt.UTC)
+        stamp = int(event_time.timestamp())
+        for band in chart_window_bands(event_time):
+            if band["phase"] == "before":
+                assert band["end"] <= stamp
+            else:
+                assert band["start"] >= stamp
+
+    def test_a_band_is_clipped_to_the_charted_span(self) -> None:
+        """A window reaching past the last candle would otherwise shade empty
+        canvas, which reads as data that is not there."""
+        from backtool.web.event_page import CHART_SPAN, chart_window_bands
+
+        event_time = dt.datetime(2026, 9, 16, 18, 0, tzinfo=dt.UTC)
+        low = int((event_time - CHART_SPAN).timestamp())
+        high = int((event_time + CHART_SPAN).timestamp())
+        for band in chart_window_bands(event_time):
+            assert low <= int(str(band["start"])) <= high
+            assert low <= int(str(band["end"])) <= high
+
+    def test_candles_endpoint_ships_the_bands(self, client: TestClient) -> None:
+        payload = client.get(
+            "/api/event/FOMC-2026-09-16/candles?symbol=BTCUSDT"
+        ).json()
+        assert payload["windows"]
+        first = payload["windows"][0]
+        assert set(first) == {"label", "title", "start", "end", "phase", "high", "low"}
+
+    def test_band_price_range_comes_from_the_research_layer(
+        self, client: TestClient
+    ) -> None:
+        """A window's high is a statistic with a specific rule about which
+        candles fall inside the window. Taking a max in the browser instead
+        would put a second, untested definition of it in the codebase."""
+        payload = client.get(
+            "/api/event/FOMC-2026-09-16/candles?symbol=BTCUSDT"
+        ).json()
+
+        for band in payload["windows"]:
+            assert band["high"] is not None, band["title"]
+            assert band["low"] <= band["high"]
+
+        # The 24h window contains the 1h window, so it cannot be the narrower
+        # of the two in either direction.
+        by_title = {b["title"]: b for b in payload["windows"]}
+        wide, narrow = by_title["24 hours after"], by_title["1 hour after"]
+        assert wide["high"] >= narrow["high"]
+        assert wide["low"] <= narrow["low"]
+
+    def test_band_prices_equal_what_the_metrics_layer_reports(self) -> None:
+        """Not merely close to it: the same function, so there is exactly one
+        definition of a window's high in the codebase."""
+        from tests.conftest import CANDLE_START, EVENT_TIME, build_candles
+
+        from backtool.core.types import Interval
+        from backtool.research.metrics import compute_window_metrics
+        from backtool.research.windows import DEFAULT_WINDOWS
+        from backtool.web.event_page import chart_window_bands
+
+        # A visible spike, so a band that silently used the wrong slice of
+        # candles would report a different high rather than the same flat one.
+        closes = [100.0] * 36
+        closes[30] = 140.0
+        frame = build_candles(CANDLE_START, closes)
+
+        bands = chart_window_bands(EVENT_TIME, frame, Interval.M5)
+        priced = {band["title"]: band for band in bands}
+
+        for window in DEFAULT_WINDOWS:
+            expected = compute_window_metrics(
+                frame, window.resolve(EVENT_TIME), Interval.M5
+            )
+            band = priced[window_title(window)]
+            if expected.is_usable:
+                assert band["high"] == expected.high
+                assert band["low"] == expected.low
+            else:
+                assert band["high"] is None
+
+    def test_a_band_without_candles_falls_back_to_full_height(self) -> None:
+        """No frame means no price range, and a box drawn to an invented one
+        would be worse than a full-height band."""
+        from backtool.web.event_page import chart_window_bands
+
+        for band in chart_window_bands(dt.datetime(2026, 9, 16, 18, tzinfo=dt.UTC)):
+            assert band["high"] is None
+            assert band["low"] is None
 
     def test_chart_library_version_is_pinned(self) -> None:
         """v5 replaced addCandlestickSeries with addSeries(CandlestickSeries,
@@ -315,7 +464,7 @@ class TestAiSummary:
         with patch("backtool.web.app._ai_available", return_value=True):
             html = TestClient(app).get("/event/FOMC-2026-09-16").text
         assert 'id="explain-btn"' in html
-        assert "Explain these results" in html
+        assert "Summarise these results" in html
 
     def test_it_is_not_automatic(self) -> None:
         """Each summary is a paid call taking tens of seconds. A reader who came
@@ -353,9 +502,9 @@ class TestAiSummary:
         assert response.status_code == 503
         assert "ANTHROPIC_API_KEY" in response.text
 
-    def test_endpoint_renders_the_shared_interpretation_card(self) -> None:
-        """Identical markup to a saved report -- the same words should not look
-        like two different things depending on where they are read."""
+    def test_endpoint_renders_the_findings_card(self) -> None:
+        """The headline leads, the model's own words are used verbatim, and the
+        attribution travels with them."""
         from unittest.mock import patch
 
         from backtool.ai.models import Interpretation
@@ -373,7 +522,9 @@ class TestAiSummary:
 
         assert response.status_code == 200
         assert "A headline with 1.234% in it." in response.text
-        assert 'class="card ai"' in response.text
+        assert 'class="finding-headline"' in response.text
+        assert "It computed none of them." in response.text
+        assert "Explore further" in response.text
 
     def test_failure_is_reported_not_swallowed(self) -> None:
         from unittest.mock import patch

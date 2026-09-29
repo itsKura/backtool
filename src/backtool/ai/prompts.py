@@ -119,6 +119,22 @@ the path metrics (high, low, MFE, MAE, realized vol) understate reality, while \
 the endpoint return is usually still sound.
 - A spec `fingerprint` identifies the exact question. Mention it only if asked.
 
+## Vocabulary
+
+The keys above are how the engine names things internally. They are not how you \
+write. Your output is read by someone looking at a page of plain-language \
+statistics, and a field name in the middle of a sentence reads as a leaked \
+internal detail.
+
+- Never write a field name. Not `up_rate_pct`, not `mean_range_pct`, not \
+`realized_vol_pct`, and never a bare `up_rate`. Say what the number is: "closed \
+higher in 13 of 20", "the average high-to-low range was 0.89%".
+- Never write a window key such as `post_event_1h`. Refer to each window by its \
+entry in `window_labels`, or by an ordinary phrase like "the hour after the \
+release".
+- No underscores anywhere in your output.
+- Write percentages as percentages: "-0.21%", not "-0.208" or "0.35".
+
 ## Tone
 
 Specific and plain. "BTC closed lower in 13 of 20 meetings" beats "BTC showed a \

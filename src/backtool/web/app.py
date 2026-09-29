@@ -36,21 +36,35 @@ from backtool.reporting.html import render_body
 from backtool.research.results import StudyResult
 from backtool.research.runner import run_study
 from backtool.research.spec import ResearchSpec
-from backtool.research.windows import DEFAULT_WINDOWS, WindowSpec
+from backtool.research.windows import DEFAULT_WINDOWS, WindowSpec, window_title
 from backtool.web.calendar_page import render_calendar
 from backtool.web.event_page import (
     CHART_SPAN,
     LIGHTWEIGHT_CHARTS_CDN,
     ai_summary_script,
+    chart_window_bands,
+    history_load_script,
     price_chart_script,
     render_ai_summary,
+    render_asset_selector,
     render_event_explainer,
     render_event_header,
-    render_outcome_placeholder,
+    render_expectations,
     render_price_chart,
+    render_scenarios_slot,
+    render_similar_setups,
     render_upcoming_notice,
+    scenarios_load_script,
+    setups_load_script,
 )
+from backtool.web.history_panel import HISTORY_SCRIPT, render_history
 from backtool.web.page import render_error, render_page, shell
+from backtool.web.scenario_panel import (
+    SCENARIO_SCRIPT,
+    build_scenarios,
+    render_scenarios_section,
+)
+from backtool.web.setups_panel import build_setup_match, render_setups_section
 
 logger = logging.getLogger(__name__)
 
@@ -113,45 +127,38 @@ async def event_detail(event_id: str, symbol: str = "BTCUSDT") -> HTMLResponse:
     event = _find_event(event_id)
     chosen = symbol.upper() if symbol.upper() in SYMBOLS else SYMBOLS[0]
     now = dt.datetime.now(tz=UTC)
-
-    tabs = "".join(
-        f'<a class="symbol-tab" href="/event/{event.event_id}?symbol={candidate}" '
-        f'aria-selected="{str(candidate == chosen).lower()}">{candidate}</a>'
-        for candidate in SYMBOLS
-    )
-
     upcoming = event.timestamp_utc > now
 
-    # Price first, explainer last. Someone who clicked a CPI release came to
-    # see what price did, not to have CPI explained to them first.
+    # The order is the reader's order: what is this, what is expected, what has
+    # happened before, what stands out -- then, for anyone still reading, the
+    # individual observations and the method. The three history slots are filled
+    # asynchronously because a cold cache means fetching candles for twenty
+    # releases, and the explanation should not wait on that.
     body = (
         render_event_header(event, now=now)
         + (render_upcoming_notice(event) if upcoming else "")
-        + f'<div class="symbol-tabs">{tabs}</div>'
+        + render_expectations()
+        + render_asset_selector(event, SYMBOLS, chosen)
         + render_price_chart(event, chosen, available=not upcoming)
-        + "<h2>Historical reaction</h2>"
-        + '<div id="history"><p class="status"><span class="spinner"></span>'
-        + "Loading the last "
+        + '<section class="reaction" id="reaction-summary">'
+        + '<div id="slot-summary"><p class="status"><span class="spinner"></span>'
+        + "Measuring the last "
         + str(DEFAULT_HISTORY_EVENTS)
-        + " occurrences&hellip;</p></div>"
+        + " releases&hellip;</p></div></section>"
         + render_ai_summary(available=_ai_available(), has_history=True)
-        + render_outcome_placeholder()
+        + render_scenarios_slot()
+        + render_similar_setups()
+        + '<div id="slot-evidence"></div>'
         + render_event_explainer(event)
+        + '<div id="slot-methodology"></div>'
     )
 
-    history_script = (
-        "fetch('/api/event/"
-        + event.event_id
-        + "/history?symbol="
-        + chosen
-        + "')"
-        ".then(r => r.text())"
-        ".then(html => { document.getElementById('history').innerHTML = html; })"
-        ".catch(e => { document.getElementById('history').innerHTML = "
-        "'<div class=\"error\"><h3>Could not load history</h3><p>' + e + '</p></div>'; });"
-    )
     script = (
-        history_script
+        history_load_script(event.event_id, chosen)
+        + setups_load_script(event.event_id, chosen)
+        + scenarios_load_script(event.event_id, chosen)
+        + SCENARIO_SCRIPT
+        + HISTORY_SCRIPT
         + ("" if upcoming else price_chart_script(event.event_id, chosen))
         + ai_summary_script(event.event_id, chosen)
     )
@@ -202,7 +209,7 @@ async def event_explain(
 def _event_explain(*, event: MarketEvent, symbol: str, interval: str) -> str:
     """Run the study, interpret it, and render the interpretation."""
     from backtool.ai import interpret_study
-    from backtool.reporting.html import render_interpretation_card
+    from backtool.web.event_page import render_key_findings
 
     now = dt.datetime.now(tz=UTC)
     spec = ResearchSpec(
@@ -221,7 +228,7 @@ def _event_explain(*, event: MarketEvent, symbol: str, interval: str) -> str:
         f"{DEFAULT_HISTORY_EVENTS} {event.event_type.value} releases, for a "
         f"reader looking at the {event.local_date.isoformat()} release."
     )
-    return render_interpretation_card(interpret_study(study, question=question))
+    return render_key_findings(interpret_study(study, question=question))
 
 
 @app.get("/api/event/{event_id}/candles")
@@ -245,7 +252,7 @@ async def event_candles(
         }
 
     try:
-        candles = await asyncio.to_thread(
+        candles, bands = await asyncio.to_thread(
             _event_candles, event=event, symbol=chosen, interval=interval
         )
     except Exception as exc:  # noqa: BLE001 - the chart shows the reason
@@ -257,13 +264,22 @@ async def event_candles(
         "interval": interval,
         "event_time": int(event.timestamp_utc.timestamp()),
         "candles": candles,
+        # Derived from the same windows the statistics are measured over, and
+        # priced by the same function, so a shaded box on the chart cannot
+        # describe a different span -- or a different high -- than the research
+        # layer would report for it.
+        "windows": bands,
     }
 
 
 def _event_candles(
     *, event: MarketEvent, symbol: str, interval: str
-) -> list[dict[str, float | int]]:
-    """Fetch and shape the candles surrounding an event.
+) -> tuple[list[dict[str, float | int]], list[dict[str, Any]]]:
+    """Fetch and shape the candles surrounding an event, plus the window boxes.
+
+    Both come from one fetch. Pricing the bands from a second, separately
+    fetched frame would let the boxes and the candles under them drift apart if
+    the cache changed between calls.
 
     Times are UNIX seconds, which is what Lightweight Charts wants for
     intraday data. Converted via ``timestamp()`` rather than integer epoch
@@ -279,13 +295,15 @@ def _event_candles(
     with MarketDataService.from_settings(Settings.from_env()) as service:
         frame = service.get_candles(symbol, resolved, start, end)
 
+    bands = chart_window_bands(event.timestamp_utc, frame, resolved)
+
     seconds: list[int] = (
         (frame["open_time"] - pd.Timestamp(0, tz="UTC"))
         .dt.total_seconds()
         .astype("int64")
         .tolist()
     )
-    return [
+    shaped = [
         {"time": t, "open": o, "high": h, "low": low, "close": c}
         for t, o, h, low, c in zip(
             seconds,
@@ -296,6 +314,83 @@ def _event_candles(
             strict=True,
         )
     ]
+    return shaped, bands
+
+
+@app.get("/api/event/{event_id}/setups", response_class=HTMLResponse)
+async def event_setups(
+    event_id: str, symbol: str = "BTCUSDT", interval: str = "5m"
+) -> HTMLResponse:
+    """Past releases that arrived under today's market conditions.
+
+    "Today" is the current instant for an upcoming release and the release's own
+    instant for a past one, so a historical page shows what the market looked
+    like going into *that* release rather than what it looks like now.
+    """
+    event = _find_event(event_id)
+    chosen = symbol.upper() if symbol.upper() in SYMBOLS else SYMBOLS[0]
+
+    try:
+        html = await asyncio.to_thread(
+            _event_setups, event=event, symbol=chosen, interval=interval
+        )
+    except Exception as exc:  # noqa: BLE001 - the panel must show the reason
+        logger.exception("Setup matching failed")
+        return HTMLResponse(render_error(f"{type(exc).__name__}: {exc}"), status_code=500)
+
+    return HTMLResponse(html)
+
+
+def _event_setups(*, event: MarketEvent, symbol: str, interval: str) -> str:
+    """Build and render the setup match. Runs off the event loop."""
+    now = dt.datetime.now(tz=UTC)
+    as_of = min(event.timestamp_utc, now)
+
+    match, measurable = build_setup_match(
+        event_type=event.event_type,
+        symbol=symbol,
+        as_of=as_of,
+        interval=Interval(interval.lower()),
+    )
+    return render_setups_section(
+        match,
+        measurable=measurable,
+        symbol=symbol,
+        event_time=event.timestamp_utc,
+    )
+
+
+@app.get("/api/event/{event_id}/scenarios", response_class=HTMLResponse)
+async def event_scenarios(
+    event_id: str, symbol: str = "BTCUSDT", interval: str = "5m"
+) -> HTMLResponse:
+    """Past releases of this type, split by what the release itself said."""
+    event = _find_event(event_id)
+    chosen = symbol.upper() if symbol.upper() in SYMBOLS else SYMBOLS[0]
+
+    try:
+        html = await asyncio.to_thread(
+            _event_scenarios, event=event, symbol=chosen, interval=interval
+        )
+    except Exception as exc:  # noqa: BLE001 - the panel must show the reason
+        logger.exception("Scenario split failed")
+        return HTMLResponse(render_error(f"{type(exc).__name__}: {exc}"), status_code=500)
+
+    return HTMLResponse(html)
+
+
+def _event_scenarios(*, event: MarketEvent, symbol: str, interval: str) -> str:
+    """Build and render the scenario split. Runs off the event loop."""
+    now = dt.datetime.now(tz=UTC)
+    split = build_scenarios(
+        event_type=event.event_type,
+        symbol=symbol,
+        as_of=min(event.timestamp_utc, now),
+        interval=Interval(interval.lower()),
+    )
+    return render_scenarios_section(
+        split, event_type=event.event_type, symbol=symbol
+    )
 
 
 @app.get("/api/event/{event_id}/history", response_class=HTMLResponse)
@@ -347,7 +442,7 @@ def _event_history(*, event: MarketEvent, symbol: str, interval: str) -> str:
     with MarketDataService.from_settings(Settings.from_env()) as service:
         study = run_study(spec, service, load_events(spec.event_type), now=now)
 
-    return render_body(study)
+    return render_history(study)
 
 
 @app.get("/api/health")
@@ -505,10 +600,17 @@ def _plan_block(plan: Any | None, spec: ResearchSpec) -> str:
         entries = "".join(f"<li>{escape(item)}</li>" for item in items)
         return f"<p class='ai-label'>{escape(title)}</p><ul>{entries}</ul>"
 
+    # The planner's window names are free text it invented, so they are shown as
+    # the duration they actually mean. The offsets stay beside them: this block
+    # exists so a reader can reject a definition, and "-90m to 0h" is the
+    # definition in a way that any phrasing of it is not.
+    # Paired with the spec's own windows rather than re-parsing the plan's: the
+    # spec is what actually ran, and ``to_spec`` builds it from these in order.
     windows = "".join(
-        f"<li><code>{escape(w.name)}</code> {escape(w.start)} &rarr; {escape(w.end)}"
-        f" &mdash; {escape(w.rationale)}</li>"
-        for w in plan.windows
+        f"<li>{escape(window_title(window))} "
+        f"<span class='mono'>({escape(window.start)} &rarr; {escape(window.end)})"
+        f"</span> &mdash; {escape(planned.rationale)}</li>"
+        for window, planned in zip(spec.windows, plan.windows, strict=True)
     )
 
     return (
@@ -519,7 +621,7 @@ def _plan_block(plan: Any | None, spec: ResearchSpec) -> str:
         f'<p class="ai-headline">{escape(plan.restated_question)}</p>'
         f"{section('Ambiguous terms resolved', list(plan.interpretation))}"
         f"{section('Assumed (not specified in the question)', list(plan.assumptions))}"
-        f"<p class='ai-label'>Windows</p><ul>{windows}</ul>"
+        f"<p class='ai-label'>Windows measured</p><ul>{windows}</ul>"
         f"<p class='ai-label'>Spec fingerprint</p>"
         f"<p class='mono'>{escape(spec.fingerprint)}</p>"
         "</div>"
