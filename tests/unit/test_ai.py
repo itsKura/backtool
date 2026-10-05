@@ -177,10 +177,41 @@ class TestRequestShape:
         )
 
         body = json.loads(captured[0].content)
-        assert body["system"] == "SYSTEM TEXT"
+        # A block list rather than a bare string, so a cache breakpoint can be
+        # attached to it. The prompt is identical across every call in a batch
+        # and carries the whole vocabulary, so paying to re-read it each time
+        # was the largest avoidable cost in a matrix run.
+        assert body["system"] == [
+            {
+                "type": "text",
+                "text": "SYSTEM TEXT",
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
         assert body["messages"] == [{"role": "user", "content": "USER TEXT"}]
         assert body["output_config"]["format"]["type"] == "json_schema"
         assert body["thinking"] == {"type": "adaptive"}
+
+    def test_caching_can_be_turned_off(self) -> None:
+        """For a one-off call, where the write costs more than the read saves."""
+        captured: list[httpx.Request] = []
+        client = mock_client(valid_plan_payload(), capture=captured)
+        client.structured(
+            system="S", user="U", schema=PlannedStudy, cache_system=False
+        )
+
+        body = json.loads(captured[0].content)
+        assert body["system"] == [{"type": "text", "text": "S"}]
+
+    def test_the_default_effort_is_not_the_most_expensive_one(self) -> None:
+        """This client only ever asks for a structured object against a fixed
+        schema. The deep-reasoning setting bills for thinking that translation
+        does not need, and it used to be the default by omission."""
+        captured: list[httpx.Request] = []
+        client = mock_client(valid_plan_payload(), capture=captured)
+        client.structured(system="s", user="u", schema=PlannedStudy)
+
+        assert json.loads(captured[0].content)["output_config"]["effort"] == "medium"
 
     def test_sends_authentication_headers(self) -> None:
         captured: list[httpx.Request] = []

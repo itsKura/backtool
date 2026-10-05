@@ -200,7 +200,8 @@ class AIClient:
         system: str,
         user: str,
         schema: type[T],
-        effort: str = "high",
+        effort: str = "medium",
+        cache_system: bool = True,
     ) -> T:
         """Request a response constrained to ``schema`` and return it validated.
 
@@ -208,7 +209,15 @@ class AIClient:
             system: System prompt defining the role.
             user: The request content.
             schema: Pydantic model the response must conform to.
-            effort: Thinking depth -- ``low`` through ``max``.
+            effort: Thinking depth -- ``low`` through ``max``. Defaults to
+                ``medium``: this client only ever asks for a structured object
+                against a fixed schema, and the deep-reasoning setting bills
+                for thinking that translation does not need.
+            cache_system: Whether to mark the system prompt cacheable. Worth it
+                whenever the same prompt is used more than once in a few
+                minutes, which is every batch run -- the prompt is identical
+                across calls and only the question changes, so paying full
+                price for it each time is pure waste.
 
         Returns:
             A validated instance of ``schema``.
@@ -218,10 +227,17 @@ class AIClient:
             AIError: on refusal, truncation, transport failure, or a response
                 that does not validate against ``schema``.
         """
+        # Sent as a block list rather than a string so the cache breakpoint can
+        # be attached. A cache read is billed at a fraction of a fresh read,
+        # and this prompt carries the whole vocabulary.
+        system_blocks: list[dict[str, Any]] = [{"type": "text", "text": system}]
+        if cache_system:
+            system_blocks[0]["cache_control"] = {"type": "ephemeral"}
+
         body = {
             "model": self._model,
             "max_tokens": MAX_TOKENS,
-            "system": system,
+            "system": system_blocks,
             "thinking": {"type": "adaptive"},
             "output_config": {
                 "effort": effort,

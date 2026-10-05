@@ -152,6 +152,18 @@ _WORSE_CLAIMS = (
 )
 
 
+#: Words that cast one group as the standard the other is judged against.
+#: Fine when the right-hand group really is every usable release; wrong when
+#: the reader named two groups, where neither is the other's background.
+_BASELINE_WORDS = (
+    "baseline",
+    "benchmark",
+    "control group",
+    "typical release",
+    "the norm",
+)
+
+
 def violations(text: str, payload: dict[str, Any]) -> list[str]:
     """Reasons this explanation must not be shown.
 
@@ -177,18 +189,29 @@ def violations(text: str, payload: dict[str, Any]) -> list[str]:
         if match:
             found.append(f"{reason} ({match.group(0)!r})")
 
-    direction = str(payload.get("direction_vs_baseline", ""))
-    if direction == "worse":
+    # The better/worse check only applies where "the cohort" is unambiguous,
+    # which is when the other side is every usable release. For two named
+    # groups there is no implied subject, so the equivalent guard is that
+    # neither may be presented as the standard.
+    if payload.get("right_is_baseline"):
+        direction = str(payload.get("direction_vs_baseline", ""))
+        if direction == "worse":
+            found += [
+                f"claims outperformance against a worse result ({claim!r})"
+                for claim in _BETTER_CLAIMS
+                if claim in lowered
+            ]
+        elif direction == "better":
+            found += [
+                f"claims underperformance against a better result ({claim!r})"
+                for claim in _WORSE_CLAIMS
+                if claim in lowered
+            ]
+    elif str(payload.get("result_shape", "")) == "comparison":
         found += [
-            f"claims outperformance against a worse result ({claim!r})"
-            for claim in _BETTER_CLAIMS
-            if claim in lowered
-        ]
-    elif direction == "better":
-        found += [
-            f"claims underperformance against a better result ({claim!r})"
-            for claim in _WORSE_CLAIMS
-            if claim in lowered
+            f"calls a named group a baseline ({word!r})"
+            for word in _BASELINE_WORDS
+            if word in lowered
         ]
 
     return found
@@ -206,11 +229,24 @@ Use only the numbers in the payload. Do not compute new ones: no ratios, no \
 annualised figures, no percentages of percentages, no counts you worked out \
 yourself. If a number is not in the payload, it does not go in your answer.
 
-`direction_vs_baseline` is the verdict and it is already decided. If it says \
-`worse`, the cohort underperformed -- say so, and never write that it \
+`result_shape` says what kind of answer you are explaining, and the payload \
+carries only the fields that shape gives meaning to. Explain what is there and \
+never reach for a field that is absent.
+
+* `scalar with baseline` -- a cohort set against every release of the same \
+type. `direction_vs_baseline` is the verdict and it is already decided. If it \
+says `worse`, the cohort underperformed: say so, and never write that it \
 outperformed, beat, or was stronger than the baseline. If it says `similar`, \
 the difference was immaterial and you must not pick a side. Contradicting this \
 field makes your whole explanation unusable.
+* `scalar` -- one figure describing every release measured. There is no \
+baseline and no comparison, so do not invent one, and do not describe the \
+result as strong, weak, high or low: nothing here establishes what normal is.
+* `ranked rows` -- specific releases and their dates, under `ranking`. These \
+are observed extremes of the sample, not estimates, so do not call them \
+limited evidence, do not hedge them as though they might be wrong, and do not \
+suggest what a future release might do. Name the dates. Say how many releases \
+they were drawn from.
 
 Do not explain *why* the market behaved this way. The study tested what \
 followed a release; it tested nothing about mechanism, positioning, \
@@ -229,14 +265,15 @@ Never write "caused", "because of", "proves", "guarantees", "will rise", \
 
 Two or three short paragraphs, 100-250 words in total.
 
-1. What the cohort did, in absolute terms -- the median return and the hit \
-rate, said as a trader would read them.
-2. How that compares with the baseline, in the direction the payload gives, \
-with the difference in percentage points.
-3. What holds the finding back: sample size where `sample_quality` is not \
-"adequate", and anything in `warnings` or `excluded_counts` a reader would want \
-to know before acting. If nothing holds it back, say the sample is adequate and \
-stop -- do not manufacture a caveat.
+1. The result itself, said as a trader would read it -- the figure and what it \
+was measured over, or the ranked releases and their dates.
+2. For a comparison only: how that sits against the baseline, in the direction \
+the payload gives, with the difference in percentage points.
+3. What holds the finding back: sample size where `small_sample` is true, and \
+anything in `warnings` or `excluded_counts` a reader would want to know before \
+acting. If nothing holds it back, say so briefly and stop -- do not manufacture \
+a caveat, and never apply a sample-size caveat to a ranked result, where the \
+figures are observations rather than estimates.
 
 Plain prose. No headings, no bullet points, no field names from the payload: \
 write "median 24-hour return", never "median_return_pct". Address the reader \

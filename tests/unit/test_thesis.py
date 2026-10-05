@@ -15,7 +15,7 @@ from backtool.core.types import EventType
 from backtool.events.releases import classify_cpi, load_releases
 from backtool.research.experiment import ResearchFinding, run_thesis
 from backtool.research.thesis import (
-    Baseline,
+    Comparison,
     Condition,
     Outcome,
     Thesis,
@@ -24,9 +24,8 @@ from backtool.research.thesis import (
 from backtool.research.vocabulary import (
     CONDITION_FIELDS,
     OUTCOME_HORIZONS,
-    BaselineKind,
+    Aggregation,
     Operator,
-    OutcomeMetric,
     describe_vocabulary,
 )
 
@@ -35,7 +34,10 @@ COOLER_CPI = Thesis(
     asset="BTCUSDT",
     event_type=EventType.CPI,
     conditions=(Condition(field="cpi_surprise", value="cooler"),),
-    outcome=Outcome(metric=OutcomeMetric.RETURN, horizon="24h"),
+    outcome=Outcome(metric="return_pct", horizon="24h", aggregation=Aggregation.MEDIAN),
+    # Explicit now that a baseline is optional: this thesis is a comparison,
+    # and saying so beats a default that quietly decides what is being asked.
+    versus=Comparison(),
 )
 
 
@@ -183,7 +185,7 @@ class TestCoolerCPIEndToEnd:
 
     def test_it_produces_a_finding(self, finding: ResearchFinding) -> None:
         assert finding.cohort.sample_size > 0
-        assert finding.baseline.sample_size > finding.cohort.sample_size
+        assert finding.comparison.sample_size > finding.cohort.sample_size
 
     def test_the_cohort_is_exactly_the_cooler_releases(
         self, finding: ResearchFinding
@@ -210,13 +212,13 @@ class TestCoolerCPIEndToEnd:
     def test_the_baseline_is_every_usable_release(
         self, finding: ResearchFinding
     ) -> None:
-        assert set(finding.cohort.event_ids) <= set(finding.baseline.event_ids)
+        assert set(finding.cohort.event_ids) <= set(finding.comparison.event_ids)
 
     def test_the_difference_is_the_two_medians(
         self, finding: ResearchFinding
     ) -> None:
         cohort = finding.cohort_metrics
-        baseline = finding.baseline_metrics
+        baseline = finding.comparison_metrics
         assert cohort is not None and baseline is not None
         assert finding.difference_pp == pytest.approx(
             cohort.median_return_pct - baseline.median_return_pct
@@ -238,7 +240,10 @@ class TestCoolerCPIEndToEnd:
     def test_the_baseline_overlap_is_disclosed(
         self, finding: ResearchFinding
     ) -> None:
-        assert any("baseline includes the cohort" in w for w in finding.warnings)
+        """The comparison group here is every usable release, so it contains
+        the cohort. Saying so is the difference between a comparison a reader
+        can judge and one they have to reverse-engineer."""
+        assert any("including the ones selected here" in w for w in finding.warnings)
 
     def test_the_verdict_is_deterministic_not_written(
         self, finding: ResearchFinding
@@ -284,7 +289,16 @@ class TestDeterminism:
         assert a.cohort_metrics == b.cohort_metrics
 
 
-class TestBaselineKinds:
-    def test_v1_supports_one_baseline(self) -> None:
-        assert list(BaselineKind) == [BaselineKind.ALL_EVENTS]
-        assert Baseline().describe(EventType.CPI) == "All usable CPI releases"
+class TestComparisonGroups:
+    """A baseline is a group with no filters, not a separate concept."""
+
+    def test_an_unfiltered_group_is_every_usable_release(self) -> None:
+        assert Comparison().describe(EventType.CPI) == "All usable CPI releases"
+        assert Comparison().is_baseline
+
+    def test_a_filtered_group_is_named_by_its_filters(self) -> None:
+        group = Comparison(
+            conditions=(Condition(field="cpi_surprise", value="cooler"),)
+        )
+        assert group.describe(EventType.CPI) == "CPI surprise is cooler than expected"
+        assert not group.is_baseline

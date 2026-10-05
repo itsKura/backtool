@@ -22,7 +22,7 @@ import pytest
 from backtool.ai.thesis_planner import PlannedCondition, PlannedThesis
 from backtool.core.types import EventType
 from backtool.research.regime import MarketSetup, Trend
-from backtool.research.thesis import Condition, Outcome, Thesis
+from backtool.research.thesis import Comparison, Condition, Outcome, Thesis
 from backtool.research.vocabulary import (
     CONDITION_FIELDS,
     NUMERIC_FIELDS,
@@ -296,8 +296,15 @@ class TestPlannerThresholds:
             asset="BTCUSDT",
             event_type="CPI",
             conditions=[PlannedCondition(**condition)],
-            outcome_metric="return",
+            comparison_conditions=[],
+            outcome_metric="return_pct",
             outcome_horizon="24h",
+            aggregation="median",
+            order="",
+            limit="",
+            outcome_threshold="",
+            outcome_threshold_operator="",
+            compare_to_baseline=False,
             assumptions=[],
             clarifications=[],
             unsupported=[],
@@ -370,11 +377,12 @@ class TestSelectionEndToEnd:
                 event_type=EventType.CPI,
                 conditions=(FELL_3_PCT,),
                 outcome=Outcome(horizon="24h"),
+                versus=Comparison(),
             )
         )
 
     def test_it_runs(self, finding) -> None:  # type: ignore[no-untyped-def]
-        assert finding.baseline.sample_size > 0
+        assert finding.comparison.sample_size > 0
 
     def test_every_qualifying_release_really_fell_more_than_three_percent(
         self, finding
@@ -389,7 +397,7 @@ class TestSelectionEndToEnd:
     def test_the_cohort_is_a_subset_of_the_baseline(
         self, finding
     ) -> None:  # type: ignore[no-untyped-def]
-        assert set(finding.cohort.event_ids) <= set(finding.baseline.event_ids)
+        assert set(finding.cohort.event_ids) <= set(finding.comparison.event_ids)
 
     def test_the_rule_is_disclosed_in_the_cohort_label(
         self, finding

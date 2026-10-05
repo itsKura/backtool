@@ -11,11 +11,15 @@ them means anything.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import NamedTuple
+
 import numpy as np
 from pydantic import BaseModel, ConfigDict
 
 from backtool.research.metrics import Direction
-from backtool.research.results import StudyResult
+from backtool.research.results import EventResult, StudyResult
+from backtool.research.vocabulary import Aggregation, MetricSpec, Operator
 
 #: Below this many observations, a summary statistic is too noisy to lead with.
 #: Not a hard cut -- the aggregate is still produced, but flagged.
@@ -206,3 +210,124 @@ def _empty_aggregate(window_name: str, excluded: int) -> WindowAggregate:
         mean_coverage_pct=None,
         **zeros,
     )
+
+
+# ---------------------------------------------------------------------------
+# Generic metric projection
+#
+# `WindowAggregate` above is a fixed set of named statistics: it covers return
+# thoroughly and everything else with a mean. That sparsity is in the struct,
+# not in the data -- every event already carries every metric for every window,
+# so "the largest 24h range" needs no measurement that has not happened, only a
+# different column read out of rows that are already in memory.
+#
+# What follows is that read. A question names a metric and an aggregation; this
+# projects the column and collapses it. Adding a metric to the vocabulary makes
+# every aggregation available over it at once, which is the whole point of
+# projecting rather than enumerating.
+# ---------------------------------------------------------------------------
+
+
+class MetricReading(NamedTuple):
+    """One event's value for one metric in one window."""
+
+    event: EventResult
+    value: float
+
+
+def metric_series(
+    events: Sequence[EventResult], window: str, metric: MetricSpec
+) -> list[MetricReading]:
+    """Project one metric out of a set of events, for one window.
+
+    Events whose window is unusable, or whose reading is missing, are left out
+    rather than defaulted. A missing realised volatility is not zero volatility,
+    and a zero would drag a mean and win a "smallest" sort outright.
+
+    Returns:
+        One reading per event that has one, in the order the events were given.
+    """
+    readings: list[MetricReading] = []
+    for event in events:
+        metrics = event.windows.get(window)
+        if metrics is None or not metrics.is_usable:
+            continue
+        value = getattr(metrics, metric.attribute, None)
+        if value is None:
+            continue
+        readings.append(MetricReading(event=event, value=float(value)))
+    return readings
+
+
+def aggregate_values(
+    values: Sequence[float],
+    aggregation: Aggregation,
+    *,
+    threshold: float | None = None,
+    operator: Operator | None = None,
+) -> float | None:
+    """Collapse a projected column to one number.
+
+    Args:
+        values: The readings, already filtered to those that exist.
+        aggregation: Which collapse to apply. ``ROWS`` has no scalar form and
+            returns ``None`` -- a ranked result is the rows themselves.
+        threshold: Required by ``FREQUENCY``, in the metric's own units.
+        operator: Required by ``FREQUENCY``; a numeric comparison.
+
+    Returns:
+        The statistic, or ``None`` where it does not exist: an empty column has
+        no mean, and ``ROWS`` has no scalar at all. ``COUNT`` is the exception
+        and returns ``0``, because "none matched" is a count, not a missing one.
+
+    Raises:
+        ValueError: if ``FREQUENCY`` is asked for without a threshold and an
+            operator. Defaulting either would invent the question.
+    """
+    if aggregation is Aggregation.COUNT:
+        return float(len(values))
+    if aggregation is Aggregation.ROWS:
+        return None
+    if aggregation is Aggregation.FREQUENCY:
+        if threshold is None or operator is None:
+            raise ValueError(
+                "A frequency needs a threshold and a comparison to count against."
+            )
+        if not values:
+            return None
+        matched = sum(1 for value in values if _compare(value, operator, threshold))
+        return matched / len(values) * 100.0
+    if not values:
+        return None
+
+    column = np.array(values, dtype="float64")
+    if aggregation is Aggregation.MEAN:
+        return float(np.mean(column))
+    if aggregation is Aggregation.MEDIAN:
+        return float(np.median(column))
+    raise ValueError(f"Unsupported aggregation {aggregation!r}")
+
+
+def count_matching(
+    values: Sequence[float], operator: Operator, threshold: float
+) -> int:
+    """How many readings clear a threshold.
+
+    Carried beside the frequency rather than recovered from it: rounding a
+    percentage back into a count over a small sample produces the wrong integer
+    often enough to matter, and "4 of 5" printed beside "80%" would be worse
+    than showing neither.
+    """
+    return sum(1 for value in values if _compare(value, operator, threshold))
+
+
+def _compare(value: float, operator: Operator, threshold: float) -> bool:
+    if operator is Operator.ABOVE:
+        return value > threshold
+    if operator is Operator.AT_LEAST:
+        return value >= threshold
+    if operator is Operator.BELOW:
+        return value < threshold
+    if operator is Operator.AT_MOST:
+        return value <= threshold
+    raise ValueError(f"{operator!r} is not a numeric comparison.")

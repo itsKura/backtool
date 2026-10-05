@@ -24,7 +24,7 @@ from backtool.ai.thesis_planner import PlannedThesis
 from backtool.reporting.charts import BarItem, distribution_chart, diverging_bar_chart
 from backtool.research.experiment import ResearchFinding
 from backtool.research.thesis import Thesis
-from backtool.research.vocabulary import OUTCOME_HORIZONS, asset_label
+from backtool.research.vocabulary import OUTCOME_HORIZONS, ResultShape, asset_label
 from backtool.research.windows import REACTION_WINDOWS
 from backtool.web.cohort_view import render_cohort_table, render_sample_badge
 
@@ -147,43 +147,13 @@ def render_finding(
             when the AI reading was unavailable or rejected; the caller decides
             which, and this function cannot tell them apart.
     """
-    cohort = finding.cohort_metrics
-    baseline = finding.baseline_metrics
-
-    if cohort is None or cohort.sample_size == 0:
+    if finding.sample_size == 0:
         return (
             '<div class="turn turn-result"><div class="panel-card">'
             f'<p class="finding-headline">{escape(finding.verdict())}</p>'
             f"{_interpretation(interpretation)}"
             f"{_excluded(finding)}</div></div>"
         )
-
-    assert baseline is not None
-    horizon = finding.thesis.outcome.horizon
-    difference = finding.difference_pp
-
-    headline = (
-        f'<p class="finding-headline">{escape(finding.verdict())}</p>'
-    )
-    cohort_tile = _tile(
-        finding.cohort.label,
-        cohort.median_return_pct,
-        cohort.sample_size,
-        cohort.up_count,
-        horizon,
-    )
-    baseline_tile = _tile(
-        "A typical release",
-        baseline.median_return_pct,
-        baseline.sample_size,
-        baseline.up_count,
-        horizon,
-    )
-    numbers = (
-        '<div class="compare">'
-        f"{cohort_tile}{baseline_tile}{_difference_tile(difference)}"
-        "</div>"
-    )
 
     warnings = "".join(
         f'<p class="note">{escape(w)}</p>' for w in finding.warnings
@@ -192,15 +162,156 @@ def render_finding(
     return (
         '<div class="turn turn-result">'
         '<div class="panel-card">'
-        f"{headline}"
+        f'<p class="finding-headline">{escape(finding.verdict())}</p>'
         f"{_interpretation(interpretation)}"
-        f"{numbers}{warnings}"
-        f"{_comparison_chart(finding)}"
+        f"{_hero(finding)}{warnings}"
         f"{_distribution(finding)}"
         f"{_observations(finding)}"
         f"{_full_statistics(finding)}"
         f"{_methodology(finding)}"
         "</div></div>"
+    )
+
+
+def _hero(finding: ResearchFinding) -> str:
+    """The block that answers the question, chosen by the result's shape.
+
+    Three layouts, selected from
+    :class:`~backtool.research.vocabulary.ResultShape` -- which is derived from
+    the query, not carried as a question type. A new kind of question reaches
+    whichever of these fits its shape without adding a fourth branch here.
+
+    Everything below this block is shared: the distribution, the releases, the
+    full statistics and the methodology look the same whatever was asked.
+    """
+    if finding.shape is ResultShape.RANKED:
+        return _ranked_rows(finding)
+    if finding.shape is ResultShape.SCALAR:
+        return _scalar_figure(finding)
+    return _comparison(finding)
+
+
+def _comparison(finding: ResearchFinding) -> str:
+    """Two groups: three tiles and a two-bar chart.
+
+    Symmetrical. Each tile carries its own group's name and its own sample
+    size, because in an A-versus-B question neither side is the other's
+    background.
+    """
+    cohort, other = finding.cohort_metrics, finding.comparison_metrics
+    if finding.value is None or finding.comparison_value is None:
+        return ""
+
+    horizon = finding.thesis.outcome.horizon
+    label = f"{finding.thesis.outcome.aggregation.value} {horizon} {finding.metric.label}"
+    tiles = (
+        _tile(
+            finding.cohort.label,
+            finding.format_value(finding.value),
+            finding.sample_size,
+            cohort.up_count if cohort and finding.metric.key == "return_pct" else None,
+            label,
+        )
+        + _tile(
+            _group_name(finding),
+            finding.format_value(finding.comparison_value),
+            finding.comparison_sample_size,
+            other.up_count
+            if other and finding.metric.key == "return_pct"
+            else None,
+            label,
+        )
+        + _difference_tile(finding)
+    )
+    return f'<div class="compare">{tiles}</div>{_comparison_chart(finding)}'
+
+
+def _overlap_note(finding: ResearchFinding) -> str:
+    """Whether the two groups can share releases, said in their own terms.
+
+    A baseline contains the cohort by construction and the reader has to know
+    that before reading the gap. Two named groups usually do not overlap, but
+    nothing guarantees it, so the possibility is stated rather than assumed
+    away -- and neither is described as containing the other.
+    """
+    versus = finding.thesis.versus
+    if versus is not None and versus.is_baseline:
+        return "The comparison group includes the releases selected here."
+    return "The two groups are selected independently."
+
+
+def _group_name(finding: ResearchFinding) -> str:
+    """What to call the right-hand group on its tile.
+
+    "A typical release" is only honest for a group that is every release. When
+    the reader named two groups, each tile carries its own name -- calling one
+    of them typical would present it as the standard the other is judged
+    against, which is not what was asked.
+    """
+    versus = finding.thesis.versus
+    if versus is not None and versus.is_baseline:
+        return "A typical release"
+    return finding.comparison.label if finding.comparison else "The other group"
+
+
+def _scalar_figure(finding: ResearchFinding) -> str:
+    """One number, standing on its own, with what it was measured over.
+
+    No difference tile and no baseline column: there is nothing to compare
+    against, and an empty second tile would read as a measurement that failed.
+    """
+    if finding.value is None:
+        return ""
+    outcome = finding.thesis.outcome
+    if finding.matched_count is not None:
+        meta = (
+            f"{finding.matched_count} of {finding.sample_size} releases "
+            f"&middot; {escape(outcome.describe())}"
+        )
+    else:
+        meta = (
+            f"across {finding.sample_size} releases &middot; "
+            f"{escape(outcome.describe())}"
+        )
+    return (
+        '<div class="compare compare-single">'
+        '<div class="compare-tile">'
+        f'<span class="compare-label">{escape(finding.cohort.label)}</span>'
+        f'<span class="compare-value">{escape(finding.format_value(finding.value))}</span>'
+        f'<span class="compare-meta">{meta}</span>'
+        "</div></div>"
+    )
+
+
+def _ranked_rows(finding: ResearchFinding) -> str:
+    """The releases themselves, in the order asked for.
+
+    The ranked table is the answer here rather than a supporting detail, so it
+    sits where the comparison tiles would otherwise be. Each row links to the
+    release, because "the largest range was 7.09%" invites the next question,
+    which is "what happened that day?".
+    """
+    rows = finding.rows
+    if not rows:
+        return ""
+    body = "".join(
+        f"<tr><td class=\"rank\">{index}</td>"
+        f'<td><a href="/event/{escape(row.event_id)}">'
+        f"{row.event_date:%d %b %Y}</a></td>"
+        f'<td class="rank-value">'
+        f"{escape(finding.metric.format(row.value or 0.0))}</td>"
+        f"{_return_cell(row.returns.get(finding.thesis.outcome.horizon))}</tr>"
+        for index, row in enumerate(rows, start=1)
+    )
+    horizon = finding.thesis.outcome.horizon
+    return (
+        '<table class="cohort-table ranked">'
+        f"<thead><tr><th>#</th><th>Release</th>"
+        f"<th>{escape(horizon)} {escape(finding.metric.label)}</th>"
+        f"<th>{escape(horizon)} return</th></tr></thead>"
+        f"<tbody>{body}</tbody></table>"
+        f'<p class="chart-note">Ranked across {finding.sample_size} releases '
+        "with usable data at this horizon.</p>"
     )
 
 
@@ -222,26 +333,44 @@ def _interpretation(paragraphs: tuple[str, ...]) -> str:
     )
 
 
-def _tile(label: str, median: float, n: int, up: int, horizon: str) -> str:
-    value, css = _signed(median)
+def _tile(label: str, value: str, n: int, up: int | None, measure: str) -> str:
+    """One figure with what it was measured over.
+
+    The hit rate appears only when the metric is a signed return. A trading
+    range is never negative, so "31/31 positive" beside one would be true,
+    useless, and read as a finding.
+    """
+    css = "pos" if value.startswith("+") else "neg" if value.startswith("-") else ""
+    hits = f" &middot; {up}/{n} positive" if up is not None else ""
     return (
         '<div class="compare-tile">'
         f'<span class="compare-label">{escape(label)}</span>'
-        f'<span class="compare-value {css}">{value}</span>'
-        f'<span class="compare-meta">median {escape(horizon)} return &middot; '
-        f"n={n} &middot; {up}/{n} positive</span></div>"
+        f'<span class="compare-value {css}">{escape(value)}</span>'
+        f'<span class="compare-meta">{escape(measure)} &middot; '
+        f"n={n}{hits}</span></div>"
     )
 
 
-def _difference_tile(difference: float | None) -> str:
+def _difference_tile(finding: ResearchFinding) -> str:
+    """The gap, with the subtraction spelled out in the groups' own names.
+
+    "cohort minus baseline" is only true when one side is every release. With
+    two named groups it would reintroduce exactly the framing the labels above
+    it were written to avoid, and a reader could not tell which way the
+    subtraction ran.
+    """
+    difference = finding.difference_pp
     if difference is None:
         return ""
     value, css = _signed(difference, suffix=" pp")
+    left = _truncate(finding.cohort.label, 24)
+    right = _truncate(_group_name(finding), 24)
     return (
         '<div class="compare-tile compare-diff">'
         '<span class="compare-label">Difference</span>'
         f'<span class="compare-value {css}">{value}</span>'
-        '<span class="compare-meta">cohort median minus baseline median</span>'
+        f'<span class="compare-meta">{escape(left)} minus '
+        f"{escape(right)}</span>"
         "</div>"
     )
 
@@ -253,43 +382,55 @@ def _comparison_chart(finding: ResearchFinding) -> str:
     means nothing. Reuses the report's diverging bar chart rather than drawing
     a second kind of bar.
     """
-    cohort, baseline = finding.cohort_metrics, finding.baseline_metrics
-    if cohort is None or baseline is None:
+    if finding.value is None or finding.comparison_value is None:
         return ""
     items = [
         BarItem(
             label=_truncate(finding.cohort.label),
-            value=cohort.median_return_pct,
-            tooltip=f"{finding.cohort.label}: n={cohort.sample_size}",
+            value=finding.value,
+            tooltip=f"{finding.cohort.label}: n={finding.sample_size}",
         ),
         BarItem(
-            label="Typical release",
-            value=baseline.median_return_pct,
-            tooltip=f"All usable releases: n={baseline.sample_size}",
+            label=_truncate(_group_name(finding)),
+            value=finding.comparison_value,
+            tooltip=(
+                f"{_group_name(finding)}: n={finding.comparison_sample_size}"
+            ),
         ),
     ]
+    outcome = finding.thesis.outcome
     return (
-        '<h3 class="finding-sub">Cohort against baseline</h3>'
+        '<h3 class="finding-sub">'
+        f"{escape(_truncate(finding.cohort.label, 40))} against "
+        f"{escape(_truncate(_group_name(finding), 40))}</h3>"
         f"{diverging_bar_chart(items)}"
-        '<p class="chart-note">Median return at the chosen horizon. The '
-        "baseline includes the cohort.</p>"
+        f'<p class="chart-note">{escape(outcome.aggregation.value.capitalize())} '
+        f"{escape(outcome.horizon)} {escape(finding.metric.label)} across each "
+        f"group. {escape(_overlap_note(finding))}</p>"
     )
 
 
 def _distribution(finding: ResearchFinding) -> str:
-    """How the qualifying releases were spread, not just where their middle was."""
-    values = [
-        observation.returns.get(finding.thesis.outcome.horizon)
+    """How the qualifying releases were spread, not just where their middle was.
+
+    Plots the queried metric, so a question about trading range shows the
+    spread of ranges rather than the spread of returns. The marker is the
+    scalar result where there is one -- on a ranked query there is no central
+    figure, and drawing a median the reader did not ask for would imply the
+    answer was about the middle.
+    """
+    clean = [
+        observation.value
         for observation in finding.observations
+        if observation.value is not None
     ]
-    clean = [v for v in values if v is not None]
     if len(clean) < 2:
         return ""
-    cohort = finding.cohort_metrics
-    median = cohort.median_return_pct if cohort else None
+    marker = finding.value if finding.shape is not ResultShape.RANKED else None
     return (
-        '<h3 class="finding-sub">Distribution of the qualifying releases</h3>'
-        f"{distribution_chart(clean, median=median)}"
+        f'<h3 class="finding-sub">Distribution of {escape(finding.metric.label)} '
+        "across the qualifying releases</h3>"
+        f"{distribution_chart(clean, median=marker)}"
     )
 
 
@@ -329,15 +470,24 @@ def _full_statistics(finding: ResearchFinding) -> str:
     return (
         '<details class="disclosure inline">'
         '<summary><span class="disclosure-title">View full statistics</span>'
-        '<span class="disclosure-hint">every horizon, cohort and baseline'
+        '<span class="disclosure-hint">every horizon, for each group'
         "</span></summary>"
         '<div class="disclosure-body">'
         f"{render_sample_badge(finding.cohort)}"
         f"{render_cohort_table(finding.cohort, REACTION_WINDOWS)}"
-        f'<h3 class="finding-sub">Baseline</h3>'
-        f"{render_sample_badge(finding.baseline)}"
-        f"{render_cohort_table(finding.baseline, REACTION_WINDOWS)}"
+        f"{_comparison_statistics(finding)}"
         "</div></details>"
+    )
+
+
+def _comparison_statistics(finding: ResearchFinding) -> str:
+    """The other group's full statistics, when the question had one."""
+    if finding.comparison is None:
+        return ""
+    return (
+        f'<h3 class="finding-sub">{escape(_group_name(finding))}</h3>'
+        f"{render_sample_badge(finding.comparison)}"
+        f"{render_cohort_table(finding.comparison, REACTION_WINDOWS)}"
     )
 
 
@@ -351,8 +501,11 @@ def _methodology(finding: ResearchFinding) -> str:
             "Condition",
             " and ".join(c.describe() for c in thesis.conditions) or "none",
         ),
-        ("Outcome", f"{thesis.outcome.horizon} return from the release price"),
-        ("Baseline", thesis.baseline.describe(thesis.event_type)),
+        ("Measure", f"{thesis.outcome.describe()}, from the release price"),
+    ]
+    if thesis.versus is not None:
+        rows.append(("Compared with", thesis.versus.describe(thesis.event_type)))
+    rows += [
         (
             "Anchoring",
             "the last candle that closed at or before each boundary, so no "
@@ -360,7 +513,13 @@ def _methodology(finding: ResearchFinding) -> str:
             "describes",
         ),
         ("Candles", f"{finding.spec.interval.value} from Binance"),
-        ("Releases used", f"{finding.cohort.sample_size} of {finding.baseline.sample_size} usable"),
+        (
+            "Releases used",
+            f"{finding.sample_size} with a usable reading at this horizon",
+        ),
+        # Stated because it is the thing that makes "show me the top five
+        # instead" free: the same measurement answers median, rank and
+        # frequency, and the fingerprint is how a reader can tell.
         ("Specification", finding.spec.fingerprint),
     ]
     items = "".join(
@@ -571,6 +730,15 @@ RESEARCH_STYLE = """
 .interpretation p { margin: 0 0 10px; max-width: 64ch; font-size: 14.5px;
                     line-height: 1.62; color: var(--text); }
 .interpretation p:last-child { margin-bottom: 0; }
+/* A single figure has no second column to balance against, so it is left
+   aligned with the prose above rather than stretched across the card. */
+.compare-single { grid-template-columns: minmax(0, 320px); }
+.cohort-table.ranked td.rank { color: var(--text-muted); width: 2.5em; }
+.cohort-table.ranked td.rank-value { font-weight: 600;
+                                     font-variant-numeric: tabular-nums; }
+.cohort-table.ranked a { color: inherit; text-decoration: none;
+                         border-bottom: 1px solid var(--grid); }
+.cohort-table.ranked a:hover { border-bottom-color: var(--text-muted); }
 
 @media (max-width: 680px) {
   .compare { grid-template-columns: 1fr; }

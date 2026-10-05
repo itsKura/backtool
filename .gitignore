@@ -39,3 +39,7 @@ desktop.ini
 
 # --- Generated reports (regenerable from a spec fingerprint) ---
 /reports/
+
+# Token usage written by the live planner suites. A measurement of one run,
+# not a fact about the project.
+planner-usage.jsonl

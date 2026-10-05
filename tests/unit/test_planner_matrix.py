@@ -26,9 +26,14 @@ trusting the refusal.
 
 from __future__ import annotations
 
+import datetime as dt
+import hashlib
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -38,9 +43,131 @@ from backtool.ai.thesis_planner import (
     PlannedThesis,
 )
 from backtool.research.thesis import Thesis
-from backtool.research.vocabulary import Operator
+from backtool.research.vocabulary import Operator, ResultShape
 
-LIVE = os.getenv("BACKTOOL_STRESS_PLANNER") == "1"
+#: The environment variable that decides whether this suite spends money.
+#:
+#: Named for what it does rather than for the suite it belongs to, and parsed
+#: strictly: an unrecognised value raises instead of falling back. A typo must
+#: not quietly become "replay" and report false confidence, and it must
+#: certainly not quietly become "full".
+LIVE_ENV = "BACKTOOL_PLANNER_LIVE"
+
+#: Retired. Named here so a stale command fails with an explanation rather than
+#: being ignored, which would silently run nothing and look like a pass.
+_RETIRED_ENV = "BACKTOOL_STRESS_PLANNER"
+
+
+class PlannerMode(StrEnum):
+    """How much of this suite runs, and what it costs.
+
+    Three levels, because the three answer different questions:
+
+    * :attr:`REPLAY` -- does *our code* still handle real planner output?
+      Free, and the default, so it runs on every commit.
+    * :attr:`SMOKE` -- does the *model* still read a representative question
+      correctly? A handful of calls, run by hand after touching the prompt,
+      the vocabulary, the schema or the model.
+    * :attr:`FULL` -- the whole matrix. A redesign, a model change, or a
+      release check. Never automatic.
+
+    :attr:`RECORD` is :attr:`FULL` plus writing the answers down.
+    """
+
+    REPLAY = "replay"
+    SMOKE = "smoke"
+    FULL = "full"
+    RECORD = "record"
+
+
+def _resolve_mode() -> PlannerMode:
+    if os.getenv(_RETIRED_ENV):
+        raise RuntimeError(
+            f"{_RETIRED_ENV} is no longer read. Use "
+            f"{LIVE_ENV}=smoke for the live smoke suite, =full for the whole "
+            "matrix, or leave it unset to replay recorded answers for free."
+        )
+    raw = os.getenv(LIVE_ENV, "").strip().lower()
+    if not raw:
+        return PlannerMode.REPLAY
+    try:
+        return PlannerMode(raw)
+    except ValueError:
+        raise RuntimeError(
+            f"{LIVE_ENV}={raw!r} is not a mode. Use one of: "
+            + ", ".join(m.value for m in PlannerMode)
+        ) from None
+
+
+MODE = _resolve_mode()
+LIVE = MODE in {PlannerMode.SMOKE, PlannerMode.FULL, PlannerMode.RECORD}
+RECORDING = MODE is PlannerMode.RECORD
+
+#: Where per-call token usage is appended during a live run, so the cost of a
+#: run can be reported from measurement rather than estimated.
+USAGE_LOG = Path(
+    os.getenv("BACKTOOL_PLANNER_USAGE_LOG", "")
+    or Path(__file__).resolve().parents[2] / "planner-usage.jsonl"
+)
+
+#: Recorded planner answers plus the fingerprint of what produced them.
+#: Checked in, so a clone runs the whole matrix with no API key and no spend.
+CASSETTE_FILE = Path(__file__).resolve().parents[1] / "fixtures" / "planner_answers.json"
+
+
+def current_fingerprint() -> dict[str, str]:
+    """What the recordings would be made against today.
+
+    Stored beside the answers so staleness is detectable rather than assumed.
+    A recording made against a different prompt may still be a perfectly valid
+    exercise of the downstream code -- which is why a mismatch does not fail
+    the replay tests -- but it is no longer evidence about how the *current*
+    planner reads a question, and that difference has to be visible.
+    """
+    # Imported here, not at module scope, so the fingerprint reflects the
+    # planner as it is when asked rather than as it was when this file was
+    # first imported. Staleness detection that reads a stale copy of the thing
+    # it is checking would be worse than none.
+    from backtool.ai import thesis_planner
+    from backtool.research.vocabulary import describe_vocabulary
+
+    def canonical(value: Any) -> Any:
+        """Strip incidental ordering before hashing.
+
+        A fingerprint has to answer "did the vocabulary change?", and the order
+        two operators happen to come out of a set in is not a change. Hashing
+        the raw form made this test fail about half the time, for a reason that
+        had nothing to do with staleness -- an alarm that cries wolf gets
+        muted, which would have cost the real signal.
+        """
+        if isinstance(value, dict):
+            return {key: canonical(value[key]) for key in sorted(value)}
+        if isinstance(value, list):
+            return sorted((canonical(item) for item in value), key=repr)
+        return value
+
+    def digest(value: object) -> str:
+        return hashlib.sha256(
+            json.dumps(canonical(value), sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:12]
+
+    return {
+        "model": thesis_planner.planner_model(development=True) or "client default",
+        "planner_prompt": digest(thesis_planner.THESIS_PLANNER_SYSTEM),
+        "planner_schema": digest(PlannedThesis.model_json_schema()),
+        "vocabulary": digest(describe_vocabulary()),
+    }
+
+
+def _load_cassette() -> tuple[dict[str, Any], dict[str, Any]]:
+    """The recorded answers and the fingerprint they were recorded against."""
+    if not CASSETTE_FILE.exists():
+        return {}, {}
+    loaded: dict[str, Any] = json.loads(CASSETTE_FILE.read_text(encoding="utf-8"))
+    return loaded.get("answers", {}), loaded.get("recorded_with", {})
+
+
+CASSETTES, RECORDED_WITH = _load_cassette()
 
 
 class Expect(StrEnum):
@@ -65,6 +192,17 @@ class Case:
     fields: tuple[str, ...] = ()
     #: Substrings that must appear in whatever is refused or asked about.
     mentions: tuple[str, ...] = ()
+    #: The result shape a correct reading produces, where the question pins it.
+    shape: ResultShape | None = None
+    #: Metric key a correct reading must measure, where the question names one.
+    metric: str = ""
+    #: ``(left value, right value)`` the two groups must select on, for a
+    #: question naming two groups.
+    groups: tuple[str, str] = ()
+    #: What this row represents in the live smoke suite. Set on exactly one row
+    #: per category, so the smoke set is derived from the matrix rather than
+    #: duplicated beside it and left to drift.
+    smoke: str = ""
     note: str = ""
 
 
@@ -110,6 +248,75 @@ NUMERIC: tuple[Case, ...] = (
         "Does CPI perform differently when BTC's 7-day return is below zero?",
         Expect.RUNNABLE,
         fields=("btc_return_7d",),
+    ),
+)
+
+#: Questions whose answer is not a cohort-versus-baseline comparison. These are
+#: the rows that would have needed a bespoke handler each under the old shape,
+#: and now differ only in which fields the planner fills.
+SHAPES: tuple[Case, ...] = (
+    Case(
+        "What was the largest 24h BTC trading range after CPI?",
+        Expect.RUNNABLE,
+        shape=ResultShape.RANKED,
+        metric="range_pct",
+        note="rows, descending, limit 1 -- a maximum, expressed as a ranking",
+    ),
+    Case(
+        "Show me the 5 largest 24h BTC trading ranges after CPI.",
+        Expect.RUNNABLE,
+        shape=ResultShape.RANKED,
+        metric="range_pct",
+        note="the same query as the row above with limit 5",
+    ),
+    Case(
+        "What is the median 24h BTC trading range after CPI?",
+        Expect.RUNNABLE,
+        shape=ResultShape.SCALAR,
+        metric="range_pct",
+        note="no conditions, so no baseline: it would compare a set with itself",
+    ),
+    Case(
+        "How often did BTC move more than 2% after CPI?",
+        Expect.RUNNABLE,
+        shape=ResultShape.SCALAR,
+        metric="abs_move_pct",
+        note="the 2% is a frequency threshold, never a cohort condition",
+    ),
+    Case(
+        "What was the worst 24h BTC return after FOMC?",
+        Expect.RUNNABLE,
+        shape=ResultShape.RANKED,
+        metric="return_pct",
+        note="rows, ascending, limit 1 -- a minimum on a signed metric",
+    ),
+)
+
+#: Two named groups, neither of which is a baseline. These exist to catch the
+#: planner reading "A compared with B" as "A against everything", which would
+#: answer a different question with no sign that it had.
+GROUPED: tuple[Case, ...] = (
+    Case(
+        "How does BTC perform after hotter CPI compared with cooler CPI?",
+        Expect.RUNNABLE,
+        shape=ResultShape.COMPARISON,
+        fields=("cpi_surprise",),
+        groups=("hotter", "cooler"),
+    ),
+    Case(
+        "Is BTC more volatile after hotter CPI than cooler CPI?",
+        Expect.RUNNABLE,
+        shape=ResultShape.COMPARISON,
+        groups=("hotter", "cooler"),
+        note="volatility must map to an existing metric, not a new statistic",
+    ),
+    Case(
+        "Compare CPI reactions when BTC had a bullish 7-day trend versus a "
+        "bearish 7-day trend.",
+        Expect.RUNNABLE,
+        shape=ResultShape.COMPARISON,
+        fields=("btc_trend_7d",),
+        groups=("bullish", "bearish"),
     ),
 )
 
@@ -180,22 +387,90 @@ ADVERSARIAL: tuple[Case, ...] = (
     ),
 )
 
+def _smoke(question: str, covers: str) -> None:
+    """Mark one matrix row as the smoke representative for a category."""
+    for index, case in enumerate(_ALL):
+        if case.question == question:
+            _ALL[index] = replace(case, smoke=covers)
+            return
+    raise AssertionError(f"no matrix row for {question!r}")
+
+
 MATRIX: tuple[Case, ...] = (
     *SIMPLE,
     *NUMERIC,
+    *SHAPES,
+    *GROUPED,
     *AMBIGUOUS,
     *UNSUPPORTED,
     *ADVERSARIAL,
 )
 
+_ALL = list(MATRIX)
+
+# The live smoke suite: one question per category, chosen so that every shape
+# the planner can produce and every way it can refuse is exercised once.
+#
+# Deliberately small. This is the check to run after touching the prompt, the
+# vocabulary, the schema or the model -- often enough that it has to be cheap,
+# and the full matrix is what a redesign gets.
+_smoke(
+    "Does a bearish 7-day BTC trend change the reaction to CPI?",
+    "simple comparison against a baseline",
+)
+_smoke(
+    "How does BTC perform after hotter CPI compared with cooler CPI?",
+    "grouped A-versus-B comparison",
+)
+_smoke(
+    "What happens after CPI when BTC fell more than 3% during the previous week?",
+    "numeric condition with a signed threshold",
+)
+_smoke(
+    "Show me the 5 largest 24h BTC trading ranges after CPI.",
+    "ranking query: rows, order and limit",
+)
+# The look-ahead slot. "Use future prices" is the louder adversarial question,
+# but it cannot succeed -- no field expresses it. This one can: read as a
+# filter it would select releases by their own outcome and report a correct
+# statistic over a cohort chosen by hindsight, with nothing in the output to
+# show it. That is the failure worth paying to check.
+_smoke(
+    "How often did BTC move more than 2% after CPI?",
+    "look-ahead: an outcome threshold must not become a cohort condition",
+)
+_smoke("Does BTC recover after CPI?", "ambiguous question requiring clarification")
+_smoke("What happens when funding is negative?", "unsupported dataset, refused by name")
+
+MATRIX = tuple(_ALL)
+
+#: The rows the smoke suite runs.
+SMOKE: tuple[Case, ...] = tuple(case for case in MATRIX if case.smoke)
+
+
+def live_cases() -> tuple[Case, ...]:
+    """Which rows the current mode calls the API for."""
+    if MODE is PlannerMode.SMOKE:
+        return SMOKE
+    if MODE in {PlannerMode.FULL, PlannerMode.RECORD}:
+        return MATRIX
+    return ()
+
 
 def planned(
     *,
     conditions: list[PlannedCondition] | None = None,
+    comparison: list[PlannedCondition] | None = None,
     asset: str = "BTCUSDT",
     event_type: str = "CPI",
-    metric: str = "return",
+    metric: str = "return_pct",
     horizon: str = "24h",
+    aggregation: str = "median",
+    order: str = "",
+    limit: str = "",
+    threshold: str = "",
+    threshold_operator: str = "",
+    baseline: bool = True,
     clarifications: list[str] | None = None,
     unsupported: list[str] | None = None,
 ) -> PlannedThesis:
@@ -205,8 +480,15 @@ def planned(
         asset=asset,
         event_type=event_type,
         conditions=conditions or [],
+        comparison_conditions=comparison or [],
         outcome_metric=metric,
         outcome_horizon=horizon,
+        aggregation=aggregation,
+        order=order,
+        limit=limit,
+        outcome_threshold=threshold,
+        outcome_threshold_operator=threshold_operator,
+        compare_to_baseline=baseline,
         assumptions=[],
         clarifications=clarifications or [],
         unsupported=unsupported or [],
@@ -421,8 +703,19 @@ class TestMethodologyCannotBeChanged:
             "asset",
             "event_type",
             "conditions",
+            # The second group of an A-versus-B question. Generic filters,
+            # not a comparison type.
+            "comparison_conditions",
             "outcome_metric",
             "outcome_horizon",
+            # The query projection. Each one changes what is reported from a
+            # measurement; none of them changes the measurement itself.
+            "aggregation",
+            "order",
+            "limit",
+            "outcome_threshold",
+            "outcome_threshold_operator",
+            "compare_to_baseline",
             "assumptions",
             "clarifications",
             "unsupported",
@@ -450,6 +743,64 @@ class TestMethodologyCannotBeChanged:
         assert "cannot alter the methodology" in lowered
 
 
+class TestOutcomesCannotBecomeConditions:
+    """The frequency question, pushed at from the planner side."""
+
+    def test_a_metric_in_conditions_is_refused_at_the_boundary(self) -> None:
+        """Even if the planner reads "moved more than 2%" as a filter, the
+        conversion refuses it rather than selecting a cohort by its outcome."""
+        with pytest.raises(ValueError, match="measured after the event"):
+            planned(
+                conditions=[condition("abs_move_pct", ">", threshold="2")]
+            ).to_thesis("q")
+
+    def test_the_frequency_form_compiles(self) -> None:
+        thesis = planned(
+            aggregation="frequency",
+            metric="abs_move_pct",
+            threshold="2",
+            threshold_operator=">",
+            baseline=False,
+        ).to_thesis("q")
+        assert thesis.conditions == ()
+        assert thesis.outcome.threshold == 2.0
+        assert thesis.shape is ResultShape.SCALAR
+
+    def test_a_maximum_becomes_rows_with_a_limit(self) -> None:
+        """A planner that says "max" gets the ranking form, because that is the
+        only form this engine has."""
+        thesis = planned(
+            aggregation="max", metric="range_pct", order="descending", limit="1",
+            baseline=False,
+        ).to_thesis("q")
+        assert thesis.outcome.aggregation.value == "rows"
+        assert thesis.outcome.limit == 1
+        assert thesis.shape is ResultShape.RANKED
+
+    def test_a_baseline_is_dropped_when_it_cannot_mean_anything(self) -> None:
+        """The planner asking for a comparison on a ranked query is a mistake
+        the reader cannot see, so it is dropped rather than raised."""
+        thesis = planned(
+            aggregation="rows", metric="range_pct", order="descending",
+            limit="5", baseline=True,
+        ).to_thesis("q")
+        assert thesis.versus is None
+
+    def test_a_baseline_is_dropped_when_there_are_no_conditions(self) -> None:
+        """Both sides would be every usable release. Dropped at the planner
+        boundary rather than raised, because the reader cannot see the flag."""
+        thesis = planned(aggregation="median", baseline=True).to_thesis("q")
+        assert thesis.versus is None
+
+    def test_a_baseline_survives_a_real_comparison(self) -> None:
+        thesis = planned(
+            conditions=[condition("btc_trend_7d", "is", value="bearish")],
+            baseline=True,
+        ).to_thesis("q")
+        assert thesis.versus is not None
+        assert thesis.shape is ResultShape.COMPARISON
+
+
 class TestPromptCoversTheMatrix:
     """What the matrix expects, the prompt has to actually ask for."""
 
@@ -464,26 +815,25 @@ class TestPromptCoversTheMatrix:
     def test_ranges_are_explained_as_two_conditions(self) -> None:
         assert "two conditions on the same field" in THESIS_PLANNER_SYSTEM
 
+    def test_the_outcome_versus_condition_split_is_stated(self) -> None:
+        """The prompt is not the enforcement -- the engine is -- but a planner
+        that does not know the rule wastes a turn on every frequency question."""
+        assert "A metric can never be a condition." in THESIS_PLANNER_SYSTEM
+        assert "There is no maximum or minimum." in THESIS_PLANNER_SYSTEM
+
     def test_the_default_versus_clarify_rule_is_stated(self) -> None:
         lowered = THESIS_PLANNER_SYSTEM.lower()
         assert "low-consequence, conventional, and stated" in lowered
         assert "which releases qualify" in lowered
 
 
-@pytest.mark.network
-@pytest.mark.skipif(not LIVE, reason="set BACKTOOL_STRESS_PLANNER=1 to run live")
-@pytest.mark.parametrize("case", MATRIX, ids=lambda c: c.question[:48])
-def test_the_planner_reads_the_question_as_expected(case: Case) -> None:
-    """The live half: the model's judgement, one API call per row.
+def check_reading(case: Case, result: PlannedThesis) -> None:
+    """Assert a planner response matches what the row expects.
 
-    Opt-in because it costs money and depends on a service. The offline half
-    above is what guarantees a wrong answer here cannot reach the engine; this
-    is what tells us how often the model needs to be guarded.
+    Shared by the replayed and the live run, so the recording is held to
+    exactly the standard the live call was, and a recorded answer cannot drift
+    into passing a weaker test than the one that produced it.
     """
-    from backtool.ai.thesis_planner import plan_thesis
-
-    result = plan_thesis(case.question)
-
     if case.expect is Expect.UNSUPPORTED:
         assert result.unsupported, f"should have refused: {case.question}"
     elif case.expect is Expect.CLARIFY:
@@ -493,8 +843,323 @@ def test_the_planner_reads_the_question_as_expected(case: Case) -> None:
         assert not result.clarifications, result.clarifications
         thesis = result.to_thesis(case.question)
         assert thesis.is_runnable
-        for key in case.fields:
-            assert key in {c.field for c in thesis.conditions}, (
-                f"{case.question}: expected {key}, got "
-                f"{[c.field for c in thesis.conditions]}"
+        if case.shape is not None:
+            assert thesis.shape is case.shape, (
+                f"{case.question}: expected {case.shape.value}, got "
+                f"{thesis.shape.value} ({thesis.outcome.describe()})"
             )
+        if case.metric:
+            assert thesis.outcome.metric == case.metric, (
+                f"{case.question}: expected {case.metric}, got "
+                f"{thesis.outcome.metric}"
+            )
+        for key in case.fields:
+            assert key in {c.field for c in thesis.all_conditions}, (
+                f"{case.question}: expected {key}, got "
+                f"{[c.field for c in thesis.all_conditions]}"
+            )
+        if case.groups:
+            left, right = case.groups
+            assert thesis.versus is not None, f"{case.question}: no second group"
+            assert not thesis.versus.is_baseline, (
+                f"{case.question}: read as a baseline comparison, but two "
+                "groups were named"
+            )
+            assert left in {c.value for c in thesis.conditions}, (
+                f"{case.question}: left group is "
+                f"{[c.value for c in thesis.conditions]}"
+            )
+            assert right in {c.value for c in thesis.versus.conditions}, (
+                f"{case.question}: right group is "
+                f"{[c.value for c in thesis.versus.conditions]}"
+            )
+
+
+class TestCostPolicy:
+    """The spending controls, pinned.
+
+    Cost is a property of the design, not somebody else's problem, and the way
+    it goes wrong is quiet: a default inherited by omission, a suite that calls
+    an API because nothing stopped it. Each of these asserts one of those
+    cannot happen again.
+    """
+
+    def test_the_default_mode_spends_nothing(self) -> None:
+        """An ordinary `pytest` run must never reach the network. This is the
+        assertion that keeps a normal commit free."""
+        assert MODE is PlannerMode.REPLAY
+        assert not LIVE
+        assert live_cases() == ()
+
+    def test_a_typo_fails_instead_of_guessing(self) -> None:
+        """`=ful` must not quietly become replay and report false confidence,
+        and must certainly not quietly become `full`."""
+        os.environ[LIVE_ENV] = "ful"
+        try:
+            with pytest.raises(RuntimeError, match="is not a mode"):
+                _resolve_mode()
+        finally:
+            del os.environ[LIVE_ENV]
+
+    def test_the_retired_variable_explains_itself(self) -> None:
+        """Silently ignoring it would run nothing and look like a pass."""
+        os.environ[_RETIRED_ENV] = "1"
+        try:
+            with pytest.raises(RuntimeError, match="no longer read"):
+                _resolve_mode()
+        finally:
+            del os.environ[_RETIRED_ENV]
+
+    def test_the_smoke_set_is_small_and_covers_every_category(self) -> None:
+        assert 5 <= len(SMOKE) <= 7, [c.question for c in SMOKE]
+        covered = " ".join(case.smoke for case in SMOKE).lower()
+        for category in (
+            "simple comparison",
+            "grouped",
+            "numeric",
+            "ranking",
+            "look-ahead",
+            "ambiguous",
+            "unsupported",
+        ):
+            assert category in covered, category
+
+    def test_the_smoke_set_is_drawn_from_the_matrix(self) -> None:
+        """Derived, not duplicated beside it, so the two cannot drift."""
+        assert set(SMOKE) <= set(MATRIX)
+
+    def test_smoke_is_a_fraction_of_the_full_matrix(self) -> None:
+        assert len(SMOKE) * 3 < len(MATRIX)
+
+    def test_recording_is_never_automatic(self) -> None:
+        """A recording that refreshed itself whenever the prompt changed would
+        turn a regression into a new baseline with nobody seeing it."""
+        assert not RECORDING
+        assert (MODE is PlannerMode.RECORD) == RECORDING
+
+    def test_the_fingerprint_covers_what_would_invalidate_a_recording(self) -> None:
+        assert set(current_fingerprint()) == {
+            "model",
+            "planner_prompt",
+            "planner_schema",
+            "vocabulary",
+        }
+
+    def test_the_fingerprint_moves_when_the_prompt_does(self) -> None:
+        before = current_fingerprint()["planner_prompt"]
+        import backtool.ai.thesis_planner as planner
+
+        original = planner.THESIS_PLANNER_SYSTEM
+        planner.THESIS_PLANNER_SYSTEM = original + " (edited)"
+        try:
+            assert current_fingerprint()["planner_prompt"] != before
+        finally:
+            planner.THESIS_PLANNER_SYSTEM = original
+        assert current_fingerprint()["planner_prompt"] == before
+
+    def test_the_planner_does_not_reason_at_the_most_expensive_setting(self) -> None:
+        """Translation into a fixed schema, not analysis. This inherited the
+        client's `high` default by omission until it was measured."""
+        from backtool.ai.thesis_planner import PLANNER_EFFORT
+
+        assert PLANNER_EFFORT != "high"
+
+
+class TestModelSeam:
+    """Production and live-check model selection are separate."""
+
+    def test_production_ignores_the_development_override(self) -> None:
+        """A cheap model for a live check must have no path to a real
+        question."""
+        from backtool.ai.thesis_planner import (
+            PLANNER_DEV_MODEL_ENV,
+            PLANNER_MODEL_ENV,
+            planner_model,
+        )
+
+        os.environ[PLANNER_DEV_MODEL_ENV] = "cheap-dev-model"
+        os.environ.pop(PLANNER_MODEL_ENV, None)
+        try:
+            assert planner_model() is None
+            assert planner_model(development=True) == "cheap-dev-model"
+        finally:
+            del os.environ[PLANNER_DEV_MODEL_ENV]
+
+    def test_development_falls_back_to_production(self) -> None:
+        """An unset override changes nothing."""
+        from backtool.ai.thesis_planner import (
+            PLANNER_DEV_MODEL_ENV,
+            PLANNER_MODEL_ENV,
+            planner_model,
+        )
+
+        os.environ.pop(PLANNER_DEV_MODEL_ENV, None)
+        os.environ[PLANNER_MODEL_ENV] = "production-model"
+        try:
+            assert planner_model(development=True) == "production-model"
+            assert planner_model() == "production-model"
+        finally:
+            del os.environ[PLANNER_MODEL_ENV]
+
+    def test_the_two_variables_are_distinct(self) -> None:
+        from backtool.ai.thesis_planner import (
+            PLANNER_DEV_MODEL_ENV,
+            PLANNER_MODEL_ENV,
+        )
+
+        assert PLANNER_DEV_MODEL_ENV != PLANNER_MODEL_ENV
+
+
+# ---------------------------------------------------------------------------
+# Level 1: replay. Free, default, runs on every commit.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not CASSETTES, reason=f"no recordings in {CASSETTE_FILE.name}")
+@pytest.mark.parametrize("case", MATRIX, ids=lambda c: c.question[:48])
+def test_a_recorded_reading_still_compiles(case: Case) -> None:
+    """**Validates our integration, not the model's current quality.**
+
+    A recording is what the model answered once, pinned. Replaying it exercises
+    everything downstream of the planner -- the vocabulary validation, the
+    thesis conversion, the shape derivation, the look-ahead wall -- against
+    output a real model really produced. That is where regressions actually
+    come from: a renamed field, a changed validator, a shape derived
+    differently.
+
+    What it cannot tell you is whether the model *still* reads these questions
+    this way. A recording never changes its mind, so a passing replay says
+    nothing about today's model. Only the live suites below do that, and the
+    staleness check is what stops a replay quietly standing in for one.
+    """
+    recorded = CASSETTES.get(case.question)
+    if recorded is None:
+        pytest.skip(f"not recorded; {LIVE_ENV}=record regenerates the fixtures")
+    check_reading(case, PlannedThesis.model_validate(recorded))
+
+
+def test_the_recordings_were_made_against_this_planner() -> None:
+    """Fail loudly when the recordings no longer describe the current planner.
+
+    One test rather than twenty-eight: a stale fixture set is a single fact
+    about the repository, and reporting it once is the difference between a
+    signal and noise.
+
+    This deliberately does not fail the replay tests. Those still exercise the
+    downstream code correctly against real output, and that coverage is worth
+    keeping while the recordings are stale. What is no longer true is that they
+    describe how the *current* planner reads these questions -- which only a
+    live run can re-establish, and which nothing here does automatically.
+    """
+    if not CASSETTES:
+        pytest.skip("nothing recorded yet")
+
+    current = current_fingerprint()
+    drifted = {
+        key: (RECORDED_WITH.get(key, "never recorded"), value)
+        for key, value in current.items()
+        if RECORDED_WITH.get(key) != value
+    }
+    detail = chr(10).join(
+        f"  {key}: recorded {was!r}, now {now!r}"
+        for key, (was, now) in drifted.items()
+    )
+    assert not drifted, (
+        "The recorded planner answers predate the current planner. They still "
+        "exercise the downstream code, but they are no longer evidence about "
+        "how questions are read today." + chr(10) + detail + chr(10) * 2
+        + f"Re-check with {LIVE_ENV}=smoke, then re-record with "
+        f"{LIVE_ENV}=record when you are satisfied."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Levels 2 and 3: live. Opt-in, and they cost money.
+# ---------------------------------------------------------------------------
+
+_CLIENT: Any = None
+
+
+@pytest.mark.network
+@pytest.mark.skipif(
+    not LIVE, reason=f"set {LIVE_ENV}=smoke (small) or =full (whole matrix)"
+)
+@pytest.mark.parametrize("case", live_cases(), ids=lambda c: c.question[:48])
+def test_the_planner_reads_the_question_as_expected(case: Case) -> None:
+    """**This costs money.** One API call per row.
+
+    ``smoke`` runs one question per category -- the check to make after
+    changing the prompt, the vocabulary, the schema or the model. ``full`` runs
+    all twenty-eight and is for a redesign, a model change, or a release check.
+    Neither ever runs by itself.
+
+    Planning uses the development model selection, so a live check can run
+    against something cheap without touching what production does.
+    """
+    from backtool.ai.thesis_planner import plan_thesis
+
+    client = _live_client()
+    result = plan_thesis(case.question, client=client)
+    _log_usage(case, client)
+    if RECORDING:
+        _record(case.question, result)
+    check_reading(case, result)
+
+
+def _live_client() -> Any:
+    """A client on the development model, built once per run."""
+    from backtool.ai.client import AIClient
+    from backtool.ai.thesis_planner import planner_model
+
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = AIClient(model=planner_model(development=True))
+    return _CLIENT
+
+
+def _log_usage(case: Case, client: Any) -> None:
+    """Append what this call cost, so a run is priced from measurement."""
+    with USAGE_LOG.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "mode": MODE.value,
+                    "model": client.model,
+                    "question": case.question,
+                    "usage": client.last_usage,
+                }
+            )
+            + chr(10)
+        )
+
+
+def _record(question: str, result: PlannedThesis) -> None:
+    """Write one answer, with the fingerprint of what produced it.
+
+    Saved per row rather than in one pass at the end, so a run that stops early
+    -- a failure, an interrupt, an exhausted balance -- keeps everything it
+    already paid for.
+
+    Only ever reached under ``record``. Nothing regenerates these on its own: a
+    recording that updated itself whenever the prompt changed would turn a
+    regression into a new baseline without anybody seeing it happen.
+    """
+    CASSETTE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    answers, _ = _load_cassette()
+    answers[question] = result.model_dump(mode="json")
+    CASSETTE_FILE.write_text(
+        json.dumps(
+            {
+                "recorded_with": {
+                    **current_fingerprint(),
+                    "recorded_at": dt.datetime.now(tz=dt.UTC).isoformat(
+                        timespec="seconds"
+                    ),
+                },
+                "answers": answers,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )

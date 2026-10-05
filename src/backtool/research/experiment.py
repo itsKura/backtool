@@ -29,11 +29,17 @@ from pydantic import BaseModel, ConfigDict
 
 from backtool.config import Settings
 from backtool.core.time import UTC
-from backtool.core.types import Interval
+from backtool.core.types import EventType, Interval
 from backtool.data.service import MarketDataService
 from backtool.events import load_events
 from backtool.events.releases import SCENARIO_RULES, load_releases
-from backtool.research.aggregate import WindowAggregate
+from backtool.research.aggregate import (
+    MetricReading,
+    WindowAggregate,
+    aggregate_values,
+    count_matching,
+    metric_series,
+)
 from backtool.research.cohort import Cohort, build_cohort, sample_quality
 from backtool.research.regime import (
     SETUP_INTERVAL,
@@ -44,10 +50,14 @@ from backtool.research.regime import (
 from backtool.research.results import EventResult, StudyResult
 from backtool.research.runner import run_study
 from backtool.research.spec import ResearchSpec
-from backtool.research.thesis import Thesis
+from backtool.research.thesis import Condition, Outcome, Thesis, describe_group
 from backtool.research.vocabulary import (
     CONDITION_FIELDS,
+    Aggregation,
+    MetricSpec,
+    Order,
     ResolutionContext,
+    ResultShape,
     reaction_windows,
 )
 
@@ -68,8 +78,13 @@ class Observation(BaseModel):
     #: The value of every condition field for this release, so the reader can
     #: check membership rather than take it on trust.
     conditions: dict[str, str]
-    #: Return at each measured horizon, keyed by horizon.
+    #: Return at each measured horizon, keyed by horizon. Kept whatever the
+    #: query asked for, because a reader looking at a 24-hour figure almost
+    #: always wants to know whether it was already there at one hour.
     returns: dict[str, float | None]
+    #: The queried metric for this release, at the queried window. The column
+    #: ordering and limiting act on; ``None`` when it could not be measured.
+    value: float | None = None
 
 
 class ResearchFinding(BaseModel):
@@ -89,8 +104,28 @@ class ResearchFinding(BaseModel):
     generated_at: dt.datetime
 
     cohort: Cohort
-    baseline: Cohort
-    observations: tuple[Observation, ...]
+    #: ``None`` when the question is not a comparison.
+    #: The group this one is set against, when the question is a comparison.
+    #: Every usable release when the comparison is a baseline, a second named
+    #: selection when the reader asked about two groups.
+    comparison: Cohort | None = None
+    #: Every qualifying release, already in the query's order. Ordering happens
+    #: once, here; the limit is applied when the rows are read, so changing
+    #: "largest" to "top five" re-slices this tuple and measures nothing again.
+    observations: tuple[Observation, ...] = ()
+
+    #: The scalar answer, for a query that has one. In the metric's own units,
+    #: or percent for a frequency.
+    value: float | None = None
+    #: The same statistic over the comparison group, where there is one.
+    comparison_value: float | None = None
+    #: Releases behind ``value``: the ones whose reading entered it.
+    sample_size: int = 0
+    comparison_sample_size: int = 0
+    #: For a frequency, how many readings cleared the threshold. Carried rather
+    #: than recovered from the percentage, which rounds back to the wrong
+    #: integer often enough to matter over a small sample.
+    matched_count: int | None = None
 
     #: Releases considered but not in the cohort, counted by reason.
     excluded: dict[str, int] = {}
@@ -98,57 +133,152 @@ class ResearchFinding(BaseModel):
     warnings: tuple[str, ...] = ()
 
     @property
+    def shape(self) -> ResultShape:
+        return self.thesis.shape
+
+    @property
+    def metric(self) -> MetricSpec:
+        return self.thesis.outcome.spec
+
+    @property
     def window(self) -> str:
         return self.thesis.outcome.window
+
+    @property
+    def rows(self) -> tuple[Observation, ...]:
+        """The releases this result reports, cut to the limit.
+
+        A slice of ``observations`` rather than a separate measurement, which
+        is what makes "the largest" and "the five largest" the same run.
+        """
+        limit = self.thesis.outcome.limit
+        return self.observations[:limit] if limit else self.observations
 
     @property
     def cohort_metrics(self) -> WindowAggregate | None:
         return self.cohort.windows.get(self.window)
 
     @property
-    def baseline_metrics(self) -> WindowAggregate | None:
-        return self.baseline.windows.get(self.window)
+    def comparison_metrics(self) -> WindowAggregate | None:
+        return (
+            self.comparison.windows.get(self.window) if self.comparison else None
+        )
 
     @property
     def difference_pp(self) -> float | None:
-        """Cohort median minus baseline median, in percentage points.
+        """Left statistic minus right statistic, in the metric's units.
 
-        Medians rather than means on both sides. One violent release drags a
-        mean somewhere no individual release went, and a difference between two
-        means can be produced entirely by a single outlier on either side.
+        Only exists for a comparison. Both sides share one ``Outcome``, so the
+        subtraction is always between like and like -- not because that is
+        checked, but because there is no field in which they could differ.
         """
-        cohort, baseline = self.cohort_metrics, self.baseline_metrics
-        if cohort is None or baseline is None:
+        if self.value is None or self.comparison_value is None:
             return None
-        if cohort.sample_size == 0 or baseline.sample_size == 0:
-            return None
-        return cohort.median_return_pct - baseline.median_return_pct
+        return self.value - self.comparison_value
+
+    def format_value(self, value: float | None) -> str:
+        """A result in the units it was measured in.
+
+        A frequency is a percentage of releases whatever the metric was, so it
+        is formatted as one rather than inheriting the metric's unit -- "72% of
+        releases" and "72% range" are different claims.
+        """
+        if value is None:
+            return "not measured"
+        aggregation = self.thesis.outcome.aggregation
+        if aggregation is Aggregation.FREQUENCY:
+            return f"{value:.0f}%"
+        if aggregation is Aggregation.COUNT:
+            return f"{value:.0f}"
+        return self.metric.format(value)
 
     def verdict(self) -> str:
-        """A neutral one-line reading of the comparison.
+        """A neutral one-line reading, derived from the result and its shape.
 
         Deterministic, not written by a model: this sentence is the first thing
-        a reader sees, and it has to be derivable from the two numbers above it.
-        The language layer may elaborate on it but never replaces it.
+        a reader sees and it has to be derivable from the numbers beneath it.
+        Three shapes, three sentences -- not three handlers, because the shape
+        is read off the query rather than carried as a question type.
         """
-        difference = self.difference_pp
-        cohort = self.cohort_metrics
-        if cohort is None or cohort.sample_size == 0:
-            return "No releases matched these conditions, so there is nothing to compare."
-        if difference is None:
-            return "The baseline could not be measured, so there is nothing to compare against."
+        outcome = self.thesis.outcome
+        horizon = outcome.horizon
+        subject = f"{horizon} {self.metric.label}"
 
-        horizon = self.thesis.outcome.horizon
+        if self.shape is ResultShape.RANKED:
+            if not self.rows:
+                return "No release had a usable reading, so there is nothing to rank."
+            top = self.rows[0]
+            extreme = "largest" if outcome.order is Order.DESCENDING else "smallest"
+            return (
+                f"The {extreme} {subject} was "
+                f"{self.metric.format(top.value or 0.0)} on "
+                f"{top.event_date:%d %B %Y}."
+            )
+
+        if self.value is None:
+            return (
+                "No release matched with a usable reading, so there is nothing "
+                "to report."
+            )
+
+        if outcome.aggregation is Aggregation.FREQUENCY:
+            assert outcome.threshold is not None
+            comparison = (
+                outcome.threshold_operator.phrase().removeprefix("is ")
+                if outcome.threshold_operator
+                else "above"
+            )
+            matched = self.matched_count
+            counted = (
+                f" ({matched} of {self.sample_size})" if matched is not None else ""
+            )
+            return (
+                f"The {subject} was {comparison} "
+                f"{self.metric.format(outcome.threshold)} after "
+                f"{self.value:.0f}% of releases{counted}."
+            )
+
+        if outcome.aggregation is Aggregation.COUNT:
+            return f"{self.value:.0f} releases had a usable {subject}."
+
+        if self.shape is ResultShape.SCALAR:
+            return (
+                f"The {outcome.aggregation.value} {subject} was "
+                f"{self.format_value(self.value)} across "
+                f"{self.sample_size} releases."
+            )
+
+        difference = self.difference_pp
+        if difference is None:
+            return (
+                "The other group could not be measured, so there is nothing "
+                "to compare against."
+            )
         size = abs(difference)
+        measure = f"{outcome.aggregation.value} {horizon} {self.metric.label}"
+
+        # A group the reader named is called by its name. Only an unfiltered
+        # group can be "a typical release", because only an unfiltered group
+        # is every release.
+        against = (
+            "a typical release"
+            if self.comparison is not None and self.comparison.key == "right"
+            and self.thesis.versus is not None
+            and self.thesis.versus.is_baseline
+            else self.comparison.label
+            if self.comparison
+            else "the other group"
+        )
         if size < 0.1:
             return (
-                f"No meaningful difference: the {horizon} median is within "
-                f"0.1 percentage points of a typical release."
+                f"No meaningful difference: the {measure} for "
+                f"{self.cohort.label} is within 0.1 percentage points of "
+                f"{against}."
             )
-        direction = "better" if difference > 0 else "worse"
+        direction = "higher" if difference > 0 else "lower"
         return (
-            f"These releases performed {direction} than a typical one over "
-            f"{horizon}, by {size:.2f} percentage points of median return."
+            f"{self.cohort.label}: {measure} was {direction} than "
+            f"{against}, by {size:.2f} percentage points."
         )
 
 
@@ -189,30 +319,70 @@ def run_thesis(thesis: Thesis, *, as_of: dt.datetime | None = None) -> ResearchF
         study = run_study(spec, service, load_events(thesis.event_type), now=now)
         context = _context(study, service, thesis, cutoff)
 
-    members, excluded = _select(study, thesis, context)
-    usable = [
-        event
-        for event in study.events
-        if event.windows.get(thesis.outcome.window, None) is not None
-        and event.windows[thesis.outcome.window].is_usable
-    ]
+    # Both sides are selected the same way, from the same study, by the same
+    # function. A baseline is the call with no conditions -- there is no second
+    # path for it, which is what stops the two drifting apart in what they
+    # count as usable.
+    members, excluded = _select(study, thesis.conditions, thesis, context)
 
     cohort = build_cohort(
         study,
-        key="cohort",
-        label=_cohort_label(thesis),
-        description=_cohort_description(thesis),
+        key="left",
+        label=describe_group(thesis.conditions, thesis.event_type),
+        description=_group_description(thesis.conditions, thesis.event_type),
         members=members,
     )
-    baseline = build_cohort(
-        study,
-        key="baseline",
-        label=thesis.baseline.describe(thesis.event_type),
-        description=(
-            f"Every {thesis.event_type.value} release with usable price data, "
-            "whatever the conditions around it."
-        ),
-        members=usable,
+    comparison: Cohort | None = None
+    comparison_members: list[EventResult] = []
+    if thesis.versus is not None:
+        comparison_members, _ = _select(study, thesis.versus.conditions, thesis, context)
+        comparison = build_cohort(
+            study,
+            key="right",
+            label=thesis.versus.describe(thesis.event_type),
+            description=_group_description(
+                thesis.versus.conditions, thesis.event_type
+            ),
+            members=comparison_members,
+        )
+
+    # The projection. Everything above decided *which* releases; this decides
+    # which column of them to read and what to do with it. No measurement
+    # happens here -- every value already exists on the events.
+    outcome = thesis.outcome
+    readings = metric_series(members, outcome.window, outcome.spec)
+    values = [reading.value for reading in readings]
+
+    ordered = _ordered(readings, outcome)
+    value = aggregate_values(
+        values,
+        outcome.aggregation,
+        threshold=outcome.threshold,
+        operator=outcome.threshold_operator,
+    )
+
+    comparison_value: float | None = None
+    comparison_values: list[float] = []
+    if comparison is not None:
+        comparison_values = [
+            reading.value
+            for reading in metric_series(
+                comparison_members, outcome.window, outcome.spec
+            )
+        ]
+        comparison_value = aggregate_values(
+            comparison_values,
+            outcome.aggregation,
+            threshold=outcome.threshold,
+            operator=outcome.threshold_operator,
+        )
+
+    matched = (
+        count_matching(values, outcome.threshold_operator, outcome.threshold)
+        if outcome.aggregation is Aggregation.FREQUENCY
+        and outcome.threshold is not None
+        and outcome.threshold_operator is not None
+        else None
     )
 
     return ResearchFinding(
@@ -220,11 +390,45 @@ def run_thesis(thesis: Thesis, *, as_of: dt.datetime | None = None) -> ResearchF
         spec=spec,
         generated_at=now,
         cohort=cohort,
-        baseline=baseline,
-        observations=_observations(members, thesis, context),
+        comparison=comparison,
+        observations=_observations(ordered, thesis, context),
+        value=value,
+        comparison_value=comparison_value,
+        sample_size=len(values),
+        comparison_sample_size=len(comparison_values),
+        matched_count=matched,
         excluded=excluded,
-        warnings=_warnings(cohort, baseline, thesis),
+        warnings=_warnings(thesis, len(values), len(comparison_values)),
     )
+
+
+def _ordered(
+    readings: list[MetricReading], outcome: Outcome
+) -> list[tuple[EventResult, float | None]]:
+    """Put the qualifying releases in the order the query asked for.
+
+    Sorted by the queried metric when one was requested, newest first
+    otherwise. Ordering happens once over the whole set and the limit is
+    applied when the rows are read, so asking for five instead of one is a
+    different slice of the same list rather than a second run.
+    """
+    if outcome.order is None:
+        return [
+            (reading.event, reading.value)
+            for reading in sorted(
+                readings, key=lambda r: r.event.event_time_utc, reverse=True
+            )
+        ]
+    # Ties broken by recency so the order is total: two releases with the same
+    # range must not swap places between runs.
+    return [
+        (reading.event, reading.value)
+        for reading in sorted(
+            readings,
+            key=lambda r: (r.value, r.event.event_time_utc),
+            reverse=outcome.order is Order.DESCENDING,
+        )
+    ]
 
 
 def _context(
@@ -269,9 +473,16 @@ def _context(
 
 
 def _select(
-    study: StudyResult, thesis: Thesis, context: ResolutionContext
+    study: StudyResult,
+    conditions: tuple[Condition, ...],
+    thesis: Thesis,
+    context: ResolutionContext,
 ) -> tuple[list[EventResult], dict[str, int]]:
-    """Split releases into the cohort and a tally of why the rest are out.
+    """Split releases into one group and a tally of why the rest are out.
+
+    Takes the conditions rather than reading them off the thesis, so the same
+    function selects the left group, the right group and a baseline. An empty
+    tuple selects every release with usable data, which is what a baseline is.
 
     Each exclusion reason is kept distinct. "No consensus was published" and
     "the surprise was hotter, not cooler" are different facts, and one count
@@ -291,7 +502,7 @@ def _select(
             continue
 
         failed = False
-        for condition in thesis.conditions:
+        for condition in conditions:
             spec = CONDITION_FIELDS[condition.field]
             if condition.is_numeric:
                 reading = context.resolve_number(condition.field, event.event_id)
@@ -321,9 +532,15 @@ def spec_label(field_key: str) -> str:
 
 
 def _observations(
-    members: list[EventResult], thesis: Thesis, context: ResolutionContext
+    ordered: list[tuple[EventResult, float | None]],
+    thesis: Thesis,
+    context: ResolutionContext,
 ) -> tuple[Observation, ...]:
-    """Every qualifying release, with the values that qualified it."""
+    """Every qualifying release, in query order, with what qualified it.
+
+    Takes the ordered pairs rather than re-sorting, so the sequence a reader
+    sees and the sequence the limit cuts are the same one.
+    """
     horizons = {window: horizon for horizon, window in _horizon_windows().items()}
     return tuple(
         Observation(
@@ -337,8 +554,9 @@ def _observations(
                 for name, metrics in event.windows.items()
                 if name in horizons
             },
+            value=value,
         )
-        for event in sorted(members, key=lambda e: e.event_time_utc, reverse=True)
+        for event, value in ordered
     )
 
 
@@ -376,48 +594,75 @@ def _horizon_windows() -> dict[str, str]:
     return dict(OUTCOME_HORIZONS)
 
 
-def _cohort_label(thesis: Thesis) -> str:
-    if not thesis.conditions:
-        return f"All {thesis.event_type.value} releases"
-    return " and ".join(condition.describe() for condition in thesis.conditions)
-
-
-def _cohort_description(thesis: Thesis) -> str:
+def _group_description(
+    conditions: tuple[Condition, ...], event_type: EventType
+) -> str:
+    """One sentence saying what a group holds. Used for both sides."""
+    if not conditions:
+        return f"Every {event_type.value} release with usable price data."
     return (
-        f"{thesis.event_type.value} releases where "
-        + " and ".join(condition.describe() for condition in thesis.conditions)
-        if thesis.conditions
-        else f"Every {thesis.event_type.value} release with usable price data."
+        f"{event_type.value} releases where "
+        + " and ".join(condition.describe() for condition in conditions)
     )
 
 
-def _warnings(cohort: Cohort, baseline: Cohort, thesis: Thesis) -> tuple[str, ...]:
-    """What a reader should know before trusting the comparison."""
+def _warnings(thesis: Thesis, measured: int, compared: int) -> tuple[str, ...]:
+    """What a reader should know before trusting the result.
+
+    Shape-aware, because the same sample size means different things to
+    different results. A median over eight releases is an estimate that eight
+    different outcomes would move; the largest of thirty-one observed releases
+    is not an estimate at all, it is a fact about the sample, and warning that
+    it is "limited evidence" would be telling the reader to doubt an
+    observation rather than an inference.
+    """
     notes: list[str] = []
 
-    if cohort.sample_size == 0:
-        notes.append("No release matched these conditions.")
+    if measured == 0:
+        notes.append("No release matched with a usable reading.")
+        return tuple(notes)
+
+    if thesis.shape is ResultShape.RANKED:
+        # Stated as context rather than as a caveat: a reader ranking releases
+        # needs to know how many were in the running.
+        notes.append(
+            f"Ranked across {measured} releases with a usable reading. These "
+            "are the observed extremes of that sample, not an estimate of how "
+            "extreme a future release could be."
+        )
     else:
-        quality = sample_quality(cohort.sample_size)
+        quality = sample_quality(measured)
         if quality.needs_warning:
             notes.append(
-                f"{quality.value.capitalize()} sample: {cohort.sample_size} "
-                "releases. No statistical test has been run, and a handful of "
-                "different outcomes would move these figures."
+                f"{quality.value.capitalize()} sample: {measured} releases. "
+                "No statistical test has been run, and a handful of different "
+                "outcomes would move these figures."
             )
 
-    if 0 < cohort.sample_size == baseline.sample_size:
-        notes.append(
-            "Every usable release met these conditions, so the cohort and the "
-            "baseline are the same set and the difference is zero by "
-            "construction."
-        )
-    elif cohort.sample_size:
-        notes.append(
-            "The baseline includes the cohort. Comparing against the remaining "
-            "releases instead would answer a different question and would widen "
-            "the gap."
-        )
+    if thesis.versus is not None:
+        if thesis.versus.is_baseline:
+            notes.append(
+                "The comparison group is every usable release, including the "
+                "ones selected here. Comparing against the remaining releases "
+                "instead would answer a different question and would widen "
+                "the gap."
+            )
+        else:
+            # Two named groups are disjoint whenever their conditions
+            # contradict, which is the usual case, but nothing guarantees it --
+            # so the overlap is reported rather than assumed away.
+            notes.append(
+                "The two groups are selected independently; a release meeting "
+                "both sets of conditions would appear in both."
+            )
+        quality = sample_quality(compared)
+        if compared == 0:
+            notes.append("No release matched the comparison group.")
+        elif quality.needs_warning:
+            notes.append(
+                f"Comparison group: {compared} releases, a "
+                f"{quality.value} sample on that side."
+            )
 
     return tuple(notes)
 

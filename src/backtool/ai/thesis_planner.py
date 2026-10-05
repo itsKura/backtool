@@ -26,20 +26,68 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from backtool.ai.client import AIClient
 from backtool.core.types import EventType
-from backtool.research.thesis import Condition, Outcome, Thesis
+from backtool.research.thesis import Comparison, Condition, Outcome, Thesis
 from backtool.research.vocabulary import (
     DEFAULT_HORIZON,
+    DEFAULT_METRIC,
+    METRICS,
+    Aggregation,
     Operator,
-    OutcomeMetric,
+    Order,
     describe_vocabulary,
 )
 
 logger = logging.getLogger(__name__)
+
+#: Thinking effort for planning. Translation into a fixed schema, not analysis:
+#: the hard reasoning in this product is done by the engine, and the planner's
+#: job is to decide which of a few dozen declared values each field takes.
+#:
+#: Previously this inherited the client's ``high`` default by omission, which
+#: is the sort of cost that accumulates silently -- nothing was wrong, it was
+#: simply never chosen. Override with BACKTOOL_PLANNER_EFFORT when a question
+#: set needs more care; the stress matrix is how to tell whether it does.
+PLANNER_EFFORT = os.getenv("BACKTOOL_PLANNER_EFFORT", "medium")
+
+#: Model used for planning in production. Separate from the interpreter's,
+#: because a planning mistake changes what gets measured while an
+#: interpretation mistake only changes the prose about it.
+PLANNER_MODEL_ENV = "BACKTOOL_PLANNER_MODEL"
+
+#: Model used for planning in *development checks only* -- the live smoke suite
+#: and the full matrix. Read exclusively by :func:`planner_model` when asked
+#: for a development client, never on the production path, so a cheap model can
+#: be used for a live check without any chance of it reaching a reader's
+#: question. A test asserts that separation.
+PLANNER_DEV_MODEL_ENV = "BACKTOOL_PLANNER_DEV_MODEL"
+
+
+def planner_model(*, development: bool = False) -> str | None:
+    """Which model to plan with, for production or for a live check.
+
+    Args:
+        development: True only for the live test suites. The development
+            override is then preferred, falling back to the production choice
+            so an unset override changes nothing.
+
+    Returns:
+        A model name, or ``None`` to let :class:`AIClient` apply its own
+        default. ``None`` rather than the default spelled out here, so there is
+        one place that decides what the default is.
+    """
+    if development:
+        return (
+            os.getenv(PLANNER_DEV_MODEL_ENV)
+            or os.getenv(PLANNER_MODEL_ENV)
+            or None
+        )
+    return os.getenv(PLANNER_MODEL_ENV) or None
 
 
 class PlannedCondition(BaseModel):
@@ -88,8 +136,58 @@ class PlannedThesis(BaseModel):
     conditions: list[PlannedCondition] = Field(
         description="Filters selecting the cohort. Empty means every release."
     )
-    outcome_metric: str = Field(description="One of the supported outcome metrics")
+    outcome_metric: str = Field(
+        description="One of the supported metric keys, e.g. return_pct or range_pct"
+    )
     outcome_horizon: str = Field(description="One of the supported horizons")
+    aggregation: str = Field(
+        description=(
+            "What to do with the readings: mean, median, count, frequency, or "
+            "rows. Use 'rows' to rank individual releases -- the largest is "
+            "rows with order descending and limit 1."
+        )
+    )
+    order: str = Field(
+        description=(
+            "'ascending' or 'descending' when the aggregation is 'rows'. "
+            "Empty string otherwise."
+        )
+    )
+    limit: str = Field(
+        description=(
+            "How many releases to report, as a number, when the aggregation "
+            "is 'rows'. '1' for the largest or smallest, '5' for a top five. "
+            "Empty string otherwise."
+        )
+    )
+    outcome_threshold: str = Field(
+        description=(
+            "For 'frequency' only: the level to count against, in the units a "
+            "reader speaks, so a 2% move is '2'. Empty string otherwise."
+        )
+    )
+    outcome_threshold_operator: str = Field(
+        description=(
+            "For 'frequency' only: '>', '>=', '<' or '<='. Empty otherwise."
+        )
+    )
+    comparison_conditions: list[PlannedCondition] = Field(
+        description=(
+            "Filters selecting a SECOND group to compare against, for an "
+            "A-versus-B question such as 'hotter CPI compared with cooler "
+            "CPI'. The first group is `conditions`; this is the other one. "
+            "Empty unless the question names two groups."
+        )
+    )
+    compare_to_baseline: bool = Field(
+        description=(
+            "True to set the result against every usable release of the same "
+            "type. Use this when the question asks whether one condition "
+            "changes the reaction, with no second group named. Ignored when "
+            "comparison_conditions is non-empty, false for a ranked list, and "
+            "false when there are no conditions at all."
+        )
+    )
     assumptions: list[str] = Field(
         description=(
             "Anything the question did not specify that was filled in with a "
@@ -118,15 +216,45 @@ class PlannedThesis(BaseModel):
                 metric or horizon outside what the engine supports. Validation
                 happens here rather than being trusted from the model.
         """
+        aggregation = _aggregation(self.aggregation)
+        ranked = aggregation is Aggregation.ROWS
+        frequency = aggregation is Aggregation.FREQUENCY
+        conditions = tuple(_condition(c) for c in self.conditions)
+
+        outcome = Outcome(
+            metric=_metric(self.outcome_metric),
+            horizon=(self.outcome_horizon or DEFAULT_HORIZON).strip(),
+            aggregation=aggregation,
+            order=_order(self.order) if ranked else None,
+            limit=_limit(self.limit) if ranked else None,
+            threshold=(
+                _number(self.outcome_threshold, "threshold") if frequency else None
+            ),
+            threshold_operator=(
+                _operator(self.outcome_threshold_operator) if frequency else None
+            ),
+        )
+
+        # A second named group wins over a baseline: the reader asked about
+        # two things, and measuring one of them against everything would
+        # answer a question they did not ask.
+        other = tuple(_condition(c) for c in self.comparison_conditions)
+        versus: Comparison | None = None
+        if not ranked:
+            if other:
+                versus = Comparison(conditions=other)
+            elif self.compare_to_baseline and conditions:
+                # An empty Comparison is every usable release. One concept,
+                # not a second kind of thing.
+                versus = Comparison()
+
         return Thesis(
             question=question or self.restated_question,
             asset=self.asset,
             event_type=EventType(self.event_type.strip().upper()),
-            conditions=tuple(_condition(c) for c in self.conditions),
-            outcome=Outcome(
-                metric=_metric(self.outcome_metric),
-                horizon=(self.outcome_horizon or DEFAULT_HORIZON).strip(),
-            ),
+            conditions=conditions,
+            outcome=outcome,
+            versus=versus,
             unresolved=tuple(self.clarifications),
         )
 
@@ -217,12 +345,93 @@ def _threshold(raw: str, field_key: str) -> float:
         ) from None
 
 
-def _metric(raw: str) -> OutcomeMetric:
+#: Phrases a planner might use for a metric, mapped to its key. The keys
+#: themselves are accepted verbatim; this covers the plain-English spellings
+#: the vocabulary advertises as labels.
+_METRIC_SPELLINGS: dict[str, str] = {
+    "return": "return_pct",
+    "returns": "return_pct",
+    "absolute move": "abs_move_pct",
+    "abs move": "abs_move_pct",
+    "move": "abs_move_pct",
+    "trading range": "range_pct",
+    "range": "range_pct",
+    "best gain reached": "mfe_pct",
+    "mfe": "mfe_pct",
+    "worst drawdown reached": "mae_pct",
+    "drawdown": "mae_pct",
+    "mae": "mae_pct",
+    "realised volatility": "realized_vol_pct",
+    "realized volatility": "realized_vol_pct",
+    "volatility": "realized_vol_pct",
+    "highest price": "high",
+    "lowest price": "low",
+}
+
+
+def _metric(raw: str) -> str:
+    """Read a metric key, defaulting to return.
+
+    Defaulting is safe because :class:`Outcome` validates the result: an
+    unrecognised spelling becomes ``return_pct`` and is visible on the
+    specification card, where a reader who asked about range will see that it
+    says return.
+    """
     text = raw.strip().lower()
-    for metric in OutcomeMetric:
-        if text == metric.value or text.startswith(metric.value.split()[0]):
-            return metric
-    return OutcomeMetric.RETURN
+    if text in METRICS:
+        return text
+    return _METRIC_SPELLINGS.get(text, DEFAULT_METRIC)
+
+
+def _aggregation(raw: str) -> Aggregation:
+    text = raw.strip().lower()
+    for aggregation in Aggregation:
+        if text == aggregation.value:
+            return aggregation
+    if text in {"max", "maximum", "min", "minimum", "largest", "smallest", "top"}:
+        # The question wanted an extreme, which this system expresses as rows
+        # with an order. Honouring it as ROWS is right; the order and limit
+        # come from their own fields and are validated there.
+        return Aggregation.ROWS
+    return Aggregation.MEDIAN
+
+
+def _order(raw: str) -> Order:
+    text = raw.strip().lower()
+    if text.startswith("asc") or text in {"smallest", "lowest", "worst"}:
+        return Order.ASCENDING
+    return Order.DESCENDING
+
+
+def _limit(raw: str) -> int:
+    """How many rows to report, defaulting to one.
+
+    One rather than an error: "the largest" is the common case and names no
+    number, so a missing limit almost always means a single row.
+    """
+    text = raw.strip()
+    if not text:
+        return 1
+    try:
+        return max(1, min(100, int(float(text))))
+    except ValueError:
+        return 1
+
+
+def _number(raw: str, what: str) -> float:
+    """Read an outcome threshold, or refuse it.
+
+    Shares the unit rule with condition thresholds: a 2% move is ``2``. No
+    rescaling, for the same reason -- the figure is shown back on the
+    specification card and a wrong unit is visible there.
+    """
+    text = raw.strip().translate(_THRESHOLD_STRIP).strip()
+    try:
+        return float(text)
+    except ValueError:
+        raise ValueError(
+            f"A frequency needs a numeric {what}, and {raw!r} is not one."
+        ) from None
 
 
 def plan_thesis(
@@ -245,7 +454,7 @@ def plan_thesis(
     Raises:
         AIError: on any API failure or refusal.
     """
-    resolved = client or AIClient()
+    resolved = client or AIClient(model=planner_model())
     payload: dict[str, object] = {
         "question": question,
         "vocabulary": describe_vocabulary(),
@@ -258,8 +467,18 @@ def plan_thesis(
                 {"field": c.field, "operator": c.operator.value, "value": c.value}
                 for c in previous.conditions
             ],
-            "outcome_metric": previous.outcome.metric.value,
+            "outcome_metric": previous.outcome.metric,
             "outcome_horizon": previous.outcome.horizon,
+            "aggregation": previous.outcome.aggregation.value,
+            "order": previous.outcome.order.value if previous.outcome.order else "",
+            "limit": str(previous.outcome.limit or ""),
+            "comparison_conditions": [
+                {"field": c.field, "operator": c.operator.value, "value": c.value}
+                for c in (previous.versus.conditions if previous.versus else ())
+            ],
+            "compare_to_baseline": (
+                previous.versus is not None and previous.versus.is_baseline
+            ),
         }
         payload["instruction"] = (
             "This is a follow-up. Start from current_thesis and change only "
@@ -271,6 +490,7 @@ def plan_thesis(
         system=THESIS_PLANNER_SYSTEM,
         user=json.dumps(payload, indent=2),
         schema=PlannedThesis,
+        effort=PLANNER_EFFORT,
     )
 
 
@@ -291,6 +511,52 @@ rates, open interest, equities, yields, an event type not listed -- put it in \
 `unsupported`, named plainly. A question with anything in `unsupported` will \
 not be run, and that is the correct outcome. Refusing is better than \
 substituting something adjacent and labelling it as what was asked for.
+
+## What is measured, and how it is reported
+
+A question has two halves, and keeping them apart is the single most important \
+thing you do.
+
+**Conditions select which releases to study.** They may only use things that \
+were already true *before* the release -- the CPI surprise, the trend going in, \
+the volatility regime. The `condition_fields` list is exactly those.
+
+**The outcome is what gets measured afterwards.** The `metrics` list is \
+exactly those: return, absolute move, trading range, drawdown, and so on.
+
+A metric can never be a condition. "How often did BTC move more than 2% after \
+CPI?" does not filter to the releases that moved 2% -- that would choose the \
+sample using the answer. It measures `abs_move_pct` over every release and \
+reports the share that cleared 2%:
+
+    metric = abs_move_pct, aggregation = frequency,
+    outcome_threshold = 2, outcome_threshold_operator = >
+
+Putting a metric in `conditions` is rejected by the engine, so a question \
+phrased as a filter on an outcome must be read as a frequency instead.
+
+## Choosing the aggregation
+
+Pick from `aggregations`. The common readings:
+
+* "median / typical / usually" -> median
+* "average" -> mean
+* "how many releases" -> count
+* "how often / what share / what percentage of the time" -> frequency, with a \
+threshold and an operator
+* "largest / biggest / worst / smallest / top five" -> rows, with an order and \
+a limit
+
+There is no maximum or minimum. The largest is `rows` with order descending \
+and limit 1; the worst return is `rows` with order ascending and limit 1; the \
+five largest is limit 5. This is deliberate -- it hands back the release and \
+its date, not just a number.
+
+`compare_to_baseline` is true only when all three hold: the aggregation is a \
+single statistic, there is at least one condition, and the question is asking \
+whether the condition made a difference. "Does a bearish trend change the \
+reaction to CPI?" is true. "What is the median range after CPI?" is false, \
+because with no conditions the comparison would be a set against itself.
 
 ## Named states versus numbers
 
@@ -374,8 +640,12 @@ that they can tell whether you understood them. Not "analysis of CPI data".
 
 
 __all__ = [
+    "PLANNER_DEV_MODEL_ENV",
+    "PLANNER_EFFORT",
+    "PLANNER_MODEL_ENV",
     "THESIS_PLANNER_SYSTEM",
     "PlannedCondition",
     "PlannedThesis",
     "plan_thesis",
+    "planner_model",
 ]

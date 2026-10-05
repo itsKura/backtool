@@ -42,7 +42,13 @@ from backtool.research.interpretation import (
     methodology_summary,
 )
 from backtool.research.spec import ResearchSpec
-from backtool.research.thesis import Condition, Outcome, Thesis
+from backtool.research.thesis import (
+    Comparison,
+    Condition,
+    Outcome,
+    Thesis,
+    describe_group,
+)
 from backtool.research.vocabulary import Operator, reaction_windows
 
 WINDOW = "post_event_24h"
@@ -102,6 +108,8 @@ def finding(
     ),
     excluded: dict[str, int] | None = None,
     warnings: tuple[str, ...] = ("The baseline includes the cohort.",),
+    outcome: Outcome | None = None,
+    baseline: bool = True,
 ) -> ResearchFinding:
     """The worked example from the brief, as a finding.
 
@@ -112,7 +120,8 @@ def finding(
         question="Does a bearish 7-day BTC trend change the reaction to CPI?",
         event_type=EventType.CPI,
         conditions=conditions,
-        outcome=Outcome(horizon="24h"),
+        outcome=outcome or Outcome(horizon="24h"),
+        versus=Comparison() if baseline and conditions else None,
     )
     spec = ResearchSpec(
         symbol="BTCUSDT",
@@ -122,34 +131,45 @@ def finding(
         windows=reaction_windows(),
         as_of=dt.datetime(2026, 10, 1, tzinfo=dt.UTC),
     )
+    wants_baseline = thesis.versus is not None
     return ResearchFinding(
         thesis=thesis,
         spec=spec,
         generated_at=dt.datetime(2026, 10, 1, tzinfo=dt.UTC),
         cohort=Cohort(
-            key="cohort",
-            label="BTC 7-day trend is bearish",
+            key="left",
+            # Derived from the conditions, as the engine derives it, so a
+            # fixture cannot assert a label the engine would never produce.
+            label=describe_group(conditions, EventType.CPI),
             description="CPI releases entered in a bearish 7-day trend",
             event_ids=tuple(f"CPI-2024-{m:02d}-10" for m in range(1, cohort_n + 1)),
             windows={WINDOW: aggregate(n=cohort_n, median=cohort_median, up=cohort_up)},
         ),
-        baseline=Cohort(
-            key="baseline",
+        comparison=Cohort(
+            key="right",
             label="All usable CPI releases",
             description="Every CPI release with usable price data",
             event_ids=tuple(f"CPI-B-{i:02d}" for i in range(baseline_n)),
             windows={
                 WINDOW: aggregate(n=baseline_n, median=baseline_median, up=baseline_up)
             },
-        ),
-        observations=(
+        )
+        if wants_baseline
+        else None,
+        observations=tuple(
             Observation(
-                event_id="CPI-2024-01-10",
-                event_date=dt.date(2024, 1, 11),
+                event_id=f"CPI-2024-{i:02d}-10",
+                event_date=dt.date(2024, (i - 1) % 12 + 1, 11),
                 conditions={"BTC 7-day trend": "bearish"},
-                returns={"24h": 0.38},
-            ),
+                returns={"24h": cohort_median},
+                value=cohort_median + i / 100,
+            )
+            for i in range(1, cohort_n + 1)
         ),
+        value=cohort_median if cohort_n else None,
+        comparison_value=baseline_median if wants_baseline and baseline_n else None,
+        sample_size=cohort_n,
+        comparison_sample_size=baseline_n if wants_baseline else 0,
         excluded=excluded if excluded is not None else {"did not match: x": 17},
         warnings=warnings,
     )
@@ -201,14 +221,14 @@ class TestDeterministicFacts:
     def test_an_empty_cohort_is_undetermined_not_worse(self) -> None:
         facts = build_facts(finding(cohort_n=0, cohort_up=0))
         assert facts.direction is Direction.UNDETERMINED
-        assert facts.cohort is None
+        assert facts.left is None
 
     def test_the_counts_are_carried_not_recomputed_from_rates(self) -> None:
         """6/8 printed beside 75% has to be the same 6."""
         facts = build_facts(finding())
-        assert facts.cohort is not None
-        assert facts.cohort.positive_count == 6
-        assert facts.cohort.sample_size == 8
+        assert facts.left is not None
+        assert facts.left.positive_count == 6
+        assert facts.left.sample_size == 8
 
     def test_a_small_sample_is_flagged(self) -> None:
         facts = build_facts(finding())
@@ -284,20 +304,35 @@ class TestPayloadBoundary:
         so adding a key has to be a conscious edit here too."""
         payload = interpretation_payload(build_facts(finding()))
         assert set(payload) == {
+            # Shared by every shape.
             "question",
             "asset",
             "event_type",
             "horizon",
-            "cohort_rule",
-            "direction_vs_baseline",
-            "difference_pp",
-            "difference_is_material",
-            "sample_quality",
+            "measure",
+            "metric",
+            "result_shape",
+            "sample_size",
             "warnings",
             "excluded_counts",
             "methodology",
-            "cohort",
-            "baseline",
+            # Any scalar result.
+            "cohort_rule",
+            "result",
+            "sample_quality",
+            "small_sample",
+            # A comparison, and only a comparison. Named left and right, not
+            # cohort and baseline: in an A-versus-B question neither side is
+            # the other's background.
+            "left",
+            "right",
+            "difference_pp",
+            "difference_is_material",
+            "higher_side",
+            # Sent only because the right group here IS every usable release.
+            # A comparison of two named groups carries neither of these.
+            "right_is_baseline",
+            "direction_vs_baseline",
         }
 
     def test_the_payload_carries_no_price_data(self) -> None:
@@ -348,17 +383,23 @@ class TestPayloadBoundary:
 
     def test_each_group_reports_its_own_count(self) -> None:
         payload = interpretation_payload(build_facts(finding()))
-        assert payload["cohort"]["n"] == 8
-        assert payload["baseline"]["n"] == 31
-        assert payload["cohort"]["positive_count"] == 6
+        assert payload["left"]["n"] == 8
+        assert payload["right"]["n"] == 31
+        assert payload["left"]["positive_count"] == 6
+        # Each side carries its own band, so a lopsided comparison cannot hide
+        # the weaker half behind the stronger one's sample size.
+        assert payload["left"]["sample_quality"] == "limited"
+        assert payload["right"]["sample_quality"] == "adequate"
+        assert payload["left"]["small_sample"] is True
+        assert payload["right"]["small_sample"] is False
 
     def test_a_missing_cohort_is_null_not_zero(self) -> None:
         payload = interpretation_payload(build_facts(finding(cohort_n=0, cohort_up=0)))
-        assert payload["cohort"] is None
+        assert payload["left"] is None
 
     def test_the_methodology_summary_is_short_and_factual(self) -> None:
         summary = methodology_summary(finding())
-        assert summary["statistic"] == "median across releases, not mean"
+        assert summary["statistic"] == "median across releases"
         assert "5m" in summary["candles"]
         assert len(json.dumps(summary)) < 1000
 
@@ -481,7 +522,7 @@ class TestRenderingWithoutAI:
         facts = build_facts(result)
         html = render_finding(result, deterministic_summary(facts))
         assert "What this suggests" in html
-        assert "8 releases matched" in html
+        assert "8 releases" in html
         assert "+0.38%" in html
 
     def test_the_report_renders_with_no_interpretation_at_all(self) -> None:
@@ -493,7 +534,7 @@ class TestRenderingWithoutAI:
         # report, not a part of it.
         assert "+0.38%" in html
         assert "n=8" in html
-        assert "Cohort against baseline" in html
+        assert "against A typical release" in html
 
     def test_a_failed_call_leaves_the_deterministic_summary_in_place(self) -> None:
         """The wiring in the route catches this; here it is at the source."""
@@ -513,8 +554,8 @@ class TestRenderingWithoutAI:
         result = finding()
         html = render_finding(result, deterministic_summary(build_facts(result)))
         assert html.index("What this suggests") < html.index("compare-tile")
-        assert html.index("compare-tile") < html.index("Cohort against baseline")
-        assert html.index("Cohort against baseline") < html.index(
+        assert html.index("compare-tile") < html.index("against A typical release")
+        assert html.index("against A typical release") < html.index(
             "The releases behind this"
         )
         assert html.index("The releases behind this") < html.index(
@@ -545,7 +586,7 @@ class TestWordingCannotChangeTheNumbers:
         """Whatever the prose says, the first line comes from the two numbers
         above it."""
         result = finding()
-        assert "worse" in result.verdict()
+        assert "lower" in result.verdict()
         assert "0.57 percentage points" in result.verdict()
 
 
@@ -563,6 +604,8 @@ class TestConditionAwareFacts:
             )
         )
         assert facts.cohort_rule == "BTC 7-day return is below -3%"
+        assert facts.left is not None
+        assert facts.left.label == "BTC 7-day return is below -3%"
         assert "-3%" in " ".join(deterministic_summary(facts))
 
     def test_a_range_is_described_as_both_bounds(self) -> None:

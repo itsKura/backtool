@@ -8,7 +8,7 @@ engine. Its live half tests the model's *judgement*, which needs real calls:
 BACKTOOL_STRESS_PLANNER=1 python -m pytest tests/unit/test_planner_matrix.py -m network -q
 ```
 
-That covers twenty questions and costs roughly twenty planner calls. This
+That covers twenty-five questions and costs roughly twenty-five planner calls. This
 document is for what a test cannot assert: whether the result reads well, and
 whether the reading is one a trader would actually act on.
 
@@ -42,6 +42,36 @@ threshold on your behalf — that is deliberate, because `-0.03%` is a legal
 question — so the card is the only place the mistake is visible. Open **The
 releases behind this** and confirm the measured 7-day return on each row really
 clears the threshold.
+
+## 2b. Result shapes — the answer's form follows the query
+
+A question is a query: universe, asset, conditions, metric, window,
+aggregation, order, limit, baseline. Nothing here has a handler of its own, so
+what you are checking is that the *fields* came out right.
+
+| Type this | Expect on the spec card | Layout |
+|---|---|---|
+| What was the largest 24h BTC trading range after CPI? | `the largest 24h trading range`, no Baseline row | one ranked row, dated and linked |
+| Show me the 5 largest 24h BTC trading ranges after CPI. | `the 5 largest 24h trading range readings` | five ranked rows |
+| What is the median 24h BTC trading range after CPI? | `median 24h trading range`, no Baseline row | one figure, no difference tile |
+| How often did BTC move more than 2% after CPI? | `how often the 24h absolute move was above 2.00%`, **Condition: none** | one figure, with `12 of 31` |
+| What was the worst 24h BTC return after FOMC? | `the smallest 24h return` | one ranked row, a negative number |
+
+**The one that matters most.** On "how often did BTC move more than 2%", the
+Condition row must read **none**. If a `2%` filter ever appears there, the
+cohort is being selected by its own outcome and every number below it is
+chosen by hindsight. The engine refuses that construction, so you should never
+see it — but it is the single check worth doing by hand.
+
+Two more worth a glance:
+
+- [ ] A Baseline row appears **only** when there is a condition and a single
+      summary statistic. A ranked list has nothing to compare against; a query
+      with no conditions would compare a set with itself.
+- [ ] Ask for the largest, then ask for the top five. The specification
+      fingerprint under **How was this tested?** must be **identical** — the
+      second question re-reads the first one's measurement rather than running
+      a new one.
 
 ## 3. Ambiguity — it must ask, not guess
 
@@ -107,7 +137,13 @@ On any completed run:
       de-risked" is a bug, and should be impossible — `violations()` in
       `ai/research_interpreter.py` discards it and the deterministic summary
       renders instead.
-- [ ] A small sample is called out in the prose, not only in the badge.
+- [ ] A small sample is called out in the prose, not only in the badge —
+      **except on a ranked result**, where the figures are observations rather
+      than estimates. "The largest of 31 releases was 7.09%" must not be
+      hedged as limited evidence; it is a fact about the sample.
+- [ ] A ranked or unbaselined result says nothing about outperformance. There
+      is nothing to outperform, and the payload carries no direction field for
+      the model to reach for.
 - [ ] Counts appear beside every percentage (`6/8`, not just `75%`).
 - [ ] **The releases behind this** shows the measured value per release, so
       membership can be checked rather than taken on trust.

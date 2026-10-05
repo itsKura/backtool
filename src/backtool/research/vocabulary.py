@@ -136,23 +136,191 @@ NUMERIC_UNIT_RULE = (
 )
 
 
-class OutcomeMetric(StrEnum):
-    """What is measured after the event."""
+class TemporalScope(StrEnum):
+    """When a quantity becomes knowable, relative to the event.
 
-    RETURN = "return"
-    POSITIVE_RATE = "positive rate"
-    RANGE = "trading range"
+    The most important distinction in this module, and the reason it is a
+    declared field rather than a convention. A cohort may only be selected on
+    things that were already true *before* the release. Selecting on something
+    measured afterwards -- "the releases where BTC moved more than 2%" -- picks
+    the sample using the answer, and the resulting statistic describes a group
+    assembled by hindsight while looking exactly like one that was not.
 
-
-class BaselineKind(StrEnum):
-    """What the cohort is compared against.
-
-    V1 offers one: every usable release of the same type. That is the
-    comparison that answers "better than what?" -- without it, "cooler CPI
-    gives +1.2% over 24h" is a number with nothing to be better or worse than.
+    That failure is invisible in the output: the numbers are arithmetically
+    correct, the sample size is honest, and nothing raises. So it is prevented
+    at construction instead. See :class:`~backtool.research.thesis.Condition`.
     """
 
-    ALL_EVENTS = "all events of the same type"
+    PRE_EVENT = "pre-event"
+    POST_EVENT = "post-event"
+
+
+class Aggregation(StrEnum):
+    """How a column of per-event readings becomes a result.
+
+    ``ROWS`` is the identity: it keeps the readings as rows, which is what
+    ordering and limiting operate on. Largest, smallest and "top 5" are all
+    ``ROWS`` with an order and a limit, so there is no MAX or MIN here -- a
+    maximum is the first row of a descending sort, and expressing it that way
+    hands back the release as well as the number.
+    """
+
+    MEAN = "mean"
+    MEDIAN = "median"
+    COUNT = "count"
+    #: Share of readings satisfying a threshold, in percent. The only
+    #: aggregation that takes a parameter.
+    FREQUENCY = "frequency"
+    ROWS = "rows"
+
+    @property
+    def is_scalar(self) -> bool:
+        """Whether this collapses the rows to a single number."""
+        return self is not Aggregation.ROWS
+
+
+class ResultShape(StrEnum):
+    """The kind of answer a query produces, and therefore how it is laid out.
+
+    Derived from the query -- whether the aggregation collapses the rows, and
+    whether a baseline was asked for -- rather than from a catalogue of
+    question types. That is the difference between a product where a new kind
+    of question needs a new handler and one where it needs a new row in a
+    table.
+
+    A fourth shape, every observation as a series, is what ``ROWS`` without a
+    limit would mean. It is deliberately not built yet; the limit is required
+    so the half-built case cannot be reached by accident.
+    """
+
+    #: One number, set against the same number for another group. That group
+    #: may be every usable release -- the classic baseline -- or a second named
+    #: selection; both are the same shape and the same code.
+    COMPARISON = "comparison"
+    #: One number, standing on its own.
+    SCALAR = "scalar"
+    #: Individual releases, ordered and cut to a limit.
+    RANKED = "ranked rows"
+
+
+class Order(StrEnum):
+    """Direction of a sort over per-event readings."""
+
+    ASCENDING = "ascending"
+    DESCENDING = "descending"
+
+
+@dataclass(frozen=True)
+class MetricSpec:
+    """One measured quantity a question may ask about.
+
+    Every one of these is already computed for every event and every window by
+    :class:`~backtool.research.metrics.WindowMetrics`. This table names them and
+    says how to read them; it adds no measurement. ``attribute`` is the field to
+    project out of a ``WindowMetrics``, which is why adding a metric that the
+    engine already produces costs one entry here and nothing else.
+    """
+
+    key: str
+    label: str
+    #: The ``WindowMetrics`` attribute this projects.
+    attribute: str
+    unit: str
+    description: str
+    #: Whether the reading can be negative, which decides whether it is
+    #: rendered with an explicit sign.
+    signed: bool = True
+    #: Always post-event. Declared rather than assumed, so the validator has
+    #: something to check instead of a naming convention to trust.
+    scope: TemporalScope = TemporalScope.POST_EVENT
+
+    def format(self, value: float) -> str:
+        """A reading as a reader sees it, with its unit and sign."""
+        rounded = round(value, 2)
+        if not self.signed:
+            return f"{rounded:,.2f}{self.unit}"
+        if rounded == 0:
+            return f"0.00{self.unit}"
+        return f"{rounded:+.2f}{self.unit}"
+
+
+#: Every quantity a thesis may measure, keyed as the planner names it.
+#:
+#: All eight already exist on ``WindowMetrics`` for every event and window. A
+#: study retains them whatever the question asked, so median, maximum, top-five
+#: and frequency over the same universe are projections of one measurement
+#: rather than four runs of it.
+METRICS: dict[str, MetricSpec] = {
+    "return_pct": MetricSpec(
+        key="return_pct",
+        label="return",
+        attribute="return_pct",
+        unit="%",
+        description="change from the price at the event to the price at the end of the window",
+    ),
+    "abs_move_pct": MetricSpec(
+        key="abs_move_pct",
+        label="absolute move",
+        attribute="abs_move_pct",
+        unit="%",
+        description="size of the move regardless of direction",
+        signed=False,
+    ),
+    "range_pct": MetricSpec(
+        key="range_pct",
+        label="trading range",
+        attribute="range_pct",
+        unit="%",
+        description="high to low across the window, as a share of the price at the event",
+        signed=False,
+    ),
+    "mfe_pct": MetricSpec(
+        key="mfe_pct",
+        label="best gain reached",
+        attribute="mfe_pct",
+        unit="%",
+        description="furthest the price travelled up before the window ended",
+        signed=False,
+    ),
+    "mae_pct": MetricSpec(
+        key="mae_pct",
+        label="worst drawdown reached",
+        attribute="mae_pct",
+        unit="%",
+        description="furthest the price travelled down before the window ended",
+    ),
+    "realized_vol_pct": MetricSpec(
+        key="realized_vol_pct",
+        label="realised volatility",
+        attribute="realized_vol_pct",
+        unit="%",
+        description="standard deviation of candle returns within the window",
+        signed=False,
+    ),
+    "high": MetricSpec(
+        key="high",
+        label="highest price",
+        attribute="high",
+        unit="",
+        description="highest price touched during the window",
+        signed=False,
+    ),
+    "low": MetricSpec(
+        key="low",
+        label="lowest price",
+        attribute="low",
+        unit="",
+        description="lowest price touched during the window",
+        signed=False,
+    ),
+}
+
+#: The metric assumed when a question does not name one.
+DEFAULT_METRIC = "return_pct"
+
+
+def metric_spec(key: str) -> MetricSpec | None:
+    return METRICS.get(key)
 
 
 @dataclass(frozen=True)
@@ -179,6 +347,11 @@ class FieldSpec:
 
     #: Whether this field resolves to a named state or a number.
     kind: FieldKind = FieldKind.CATEGORICAL
+    #: When this becomes knowable. Every condition field must be
+    #: :attr:`TemporalScope.PRE_EVENT`: a cohort selected on anything else is
+    #: selected by hindsight. Declared per field and checked by a test, so the
+    #: rule survives someone adding a field without reading this comment.
+    scope: TemporalScope = TemporalScope.PRE_EVENT
     #: Suffix shown after a numeric reading or threshold, e.g. ``"%"``. Empty
     #: for a dimensionless number such as a percentile.
     unit: str = ""
@@ -367,13 +540,48 @@ def describe_vocabulary() -> dict[str, list[str]]:
         # would invite a field being described in one place and enforced from
         # the other.
         "condition_fields": [_describe_field(spec) for spec in CONDITION_FIELDS.values()],
-        "categorical_operators": [op.value for op in CATEGORICAL_OPERATORS],
+        # Sorted, not iterated. Both of these are frozensets, and a frozenset
+        # of strings iterates in an order that changes between processes --
+        # so without this the planner received a vocabulary whose ordering
+        # varied run to run. Harmless to the meaning, but this project
+        # otherwise goes to some trouble to make the same question produce the
+        # same request, and an unstable payload also makes it impossible to
+        # tell whether the vocabulary has really changed.
+        "categorical_operators": sorted(op.value for op in CATEGORICAL_OPERATORS),
         "numeric_operators": sorted(op.value for op in NUMERIC_OPERATORS),
         "units": [NUMERIC_UNIT_RULE],
-        "outcome_metrics": [metric.value for metric in OutcomeMetric],
+        # Metrics are post-event by construction and therefore never appear in
+        # condition_fields. The two lists are disjoint, and a test asserts it.
+        "metrics": [
+            f"{spec.key} ({spec.label}{', in ' + spec.unit if spec.unit else ''}) "
+            f"-- {spec.description}"
+            for spec in METRICS.values()
+        ],
+        "aggregations": [
+            f"{agg.value} -- {_AGGREGATION_NOTES[agg]}" for agg in Aggregation
+        ],
+        "orders": [order.value for order in Order],
         "horizons": list(OUTCOME_HORIZONS),
-        "baselines": [kind.value for kind in BaselineKind],
     }
+
+
+#: What each aggregation does, for the planner prompt. Kept beside the enum so a
+#: member cannot be advertised without a description, or described without
+#: existing.
+_AGGREGATION_NOTES: dict[Aggregation, str] = {
+    Aggregation.MEAN: "average across the matching releases; one number",
+    Aggregation.MEDIAN: "middle value across the matching releases; one number",
+    Aggregation.COUNT: "how many releases matched; one number",
+    Aggregation.FREQUENCY: (
+        "share of matching releases whose reading clears a threshold, as a "
+        "percentage; requires a threshold and a comparison operator"
+    ),
+    Aggregation.ROWS: (
+        "the releases themselves rather than a summary; use with an order and a "
+        "limit. Largest is descending with limit 1, smallest is ascending with "
+        "limit 1, top five is descending with limit 5"
+    ),
+}
 
 
 def _describe_field(spec: FieldSpec) -> str:
@@ -469,22 +677,28 @@ __all__ = [
     "CATEGORICAL_OPERATORS",
     "CONDITION_FIELDS",
     "DEFAULT_HORIZON",
+    "DEFAULT_METRIC",
+    "METRICS",
     "NUMERIC_FIELDS",
     "NUMERIC_OPERATORS",
     "NUMERIC_UNIT_RULE",
     "OUTCOME_HORIZONS",
     "SUPPORTED_ASSETS",
     "SUPPORTED_EVENTS",
-    "BaselineKind",
+    "Aggregation",
     "FieldKind",
     "FieldSpec",
+    "MetricSpec",
     "Operator",
-    "OutcomeMetric",
+    "Order",
+    "ResultShape",
     "ResolutionContext",
     "Resolver",
+    "TemporalScope",
     "asset_label",
     "describe_vocabulary",
     "field_spec",
+    "metric_spec",
     "reaction_windows",
     "window_for",
 ]
