@@ -128,6 +128,32 @@ class MarketSetup(BaseModel):
             found["ma_position"] = self.ma_position.value
         return found
 
+    @property
+    def readings(self) -> dict[str, float]:
+        """The numeric figures behind the buckets, where they exist.
+
+        The buckets above are a lossy summary: ``-4.6%`` and ``-28%`` are both
+        "bearish", and a reader asking about a fall of more than 3% means the
+        number, not the nearest bucket edge. Both are returned from the same
+        computation, so exposing the figures costs nothing and lets a condition
+        test either one.
+
+        An absent key means the figure could not be computed from the history
+        available before ``as_of``. It is not zero.
+        """
+        found: dict[str, float] = {}
+        if self.return_7d_pct is not None:
+            found["return_7d_pct"] = self.return_7d_pct
+        if self.return_30d_pct is not None:
+            found["return_30d_pct"] = self.return_30d_pct
+        if self.realized_vol_30d_pct is not None:
+            found["realized_vol_30d_pct"] = self.realized_vol_30d_pct
+        if self.vol_percentile is not None:
+            found["vol_percentile"] = self.vol_percentile
+        if self.ma_200d_gap_pct is not None:
+            found["ma_200d_gap_pct"] = self.ma_200d_gap_pct
+        return found
+
     def describe_items(self) -> list[tuple[str, str]]:
         """The setup as label/value pairs, for display.
 

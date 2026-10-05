@@ -156,6 +156,7 @@ class AIClient:
 
         self._model: str = model or os.getenv("BACKTOOL_AI_MODEL") or DEFAULT_MODEL
         self._max_retries = max_retries
+        self._last_usage: dict[str, int] = {}
         self._owns_client = http_client is None
         # Sent per-request rather than baked into the client, so an injected
         # client (tests, a proxy, a custom transport) is still authenticated.
@@ -172,6 +173,16 @@ class AIClient:
     @property
     def model(self) -> str:
         return self._model
+
+    @property
+    def last_usage(self) -> dict[str, int]:
+        """Token counts from the most recent successful request.
+
+        Kept so the cost of a call can be reported rather than estimated. Empty
+        before the first request, and not cleared by a failure -- a retry that
+        eventually succeeds overwrites it, and nothing else reads it.
+        """
+        return dict(self._last_usage)
 
     def close(self) -> None:
         if self._owns_client:
@@ -280,6 +291,11 @@ class AIClient:
             raise AIError("The model returned no structured output.")
 
         usage = payload.get("usage", {})
+        self._last_usage = {
+            key: int(value)
+            for key, value in usage.items()
+            if isinstance(value, int | float)
+        }
         logger.debug(
             "%s: %s in / %s out tokens",
             self._model,

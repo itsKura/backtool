@@ -18,6 +18,7 @@ from backtool.reporting.html import _STYLE as REPORT_STYLE
 from backtool.web.calendar_page import CALENDAR_STYLE
 from backtool.web.cohort_view import COHORT_STYLE
 from backtool.web.event_page import EVENT_STYLE
+from backtool.web.research_page import RESEARCH_STYLE
 
 _PAGE_STYLE = """
 .masthead { margin-bottom: 8px; }
@@ -166,15 +167,16 @@ def shell(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{escape(title)}</title>
-<style>{REPORT_STYLE}{_PAGE_STYLE}{CALENDAR_STYLE}{EVENT_STYLE}{COHORT_STYLE}{_NAV}</style>
+<style>{REPORT_STYLE}{_PAGE_STYLE}{CALENDAR_STYLE}{EVENT_STYLE}{COHORT_STYLE}{RESEARCH_STYLE}{_NAV}</style>
 {"".join(f'<script src="{src}"></script>' for src in head_scripts)}
 </head>
 <body>
 <div class="wrap">
   <nav class="nav">
     <span class="brand">backtool</span>
+    {nav_link("/research", "Research", "research")}
     {nav_link("/", "Calendar", "calendar")}
-    {nav_link("/study", "Ask a question", "study")}
+    {nav_link("/study", "Build a study", "study")}
   </nav>
   {body}
 </div>

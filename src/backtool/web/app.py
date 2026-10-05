@@ -36,6 +36,7 @@ from backtool.reporting.html import render_body
 from backtool.research.results import StudyResult
 from backtool.research.runner import run_study
 from backtool.research.spec import ResearchSpec
+from backtool.research.thesis import Thesis
 from backtool.research.windows import DEFAULT_WINDOWS, WindowSpec, window_title
 from backtool.web.calendar_page import render_calendar
 from backtool.web.event_page import (
@@ -59,6 +60,14 @@ from backtool.web.event_page import (
 )
 from backtool.web.history_panel import HISTORY_SCRIPT, render_history
 from backtool.web.page import render_error, render_page, shell
+from backtool.web.research_page import (
+    RESEARCH_SCRIPT,
+    render_clarification,
+    render_finding,
+    render_research_page,
+    render_spec_card,
+    render_unsupported,
+)
 from backtool.web.scenario_panel import (
     SCENARIO_SCRIPT,
     build_scenarios,
@@ -443,6 +452,150 @@ def _event_history(*, event: MarketEvent, symbol: str, interval: str) -> str:
         study = run_study(spec, service, load_events(spec.event_type), now=now)
 
     return render_history(study)
+
+
+@app.get("/research", response_class=HTMLResponse)
+async def research() -> HTMLResponse:
+    """The conversational research workspace.
+
+    The emerging primary surface. The calendar and event pages remain as
+    discovery and deep-dive tools; this is where a question gets asked.
+    """
+    return HTMLResponse(
+        shell(
+            "backtool - research",
+            render_research_page(),
+            active="research",
+            script=RESEARCH_SCRIPT,
+        )
+    )
+
+
+@app.post("/api/research/interpret", response_class=HTMLResponse)
+async def research_interpret(payload: dict[str, Any]) -> HTMLResponse:
+    """Read a question into a thesis, or say why it cannot be read.
+
+    Returns the specification for confirmation rather than running it. The
+    reader has to be able to see what was understood before trusting what
+    comes back.
+    """
+    question = str(payload.get("question", "")).strip()
+    if not question:
+        return HTMLResponse(render_error("Enter a question first."), status_code=400)
+
+    if not _ai_available():
+        return HTMLResponse(
+            render_error(
+                "ANTHROPIC_API_KEY is not set, so plain-language questions "
+                "cannot be interpreted. The calendar and event pages work "
+                "without it."
+            ),
+            status_code=503,
+        )
+
+    previous = _previous_thesis(payload.get("thesis"))
+
+    try:
+        html = await asyncio.to_thread(_interpret_question, question, previous)
+    except Exception as exc:  # noqa: BLE001 - the thread must show the reason
+        logger.exception("Thesis planning failed")
+        return HTMLResponse(render_error(f"{type(exc).__name__}: {exc}"), status_code=502)
+
+    return HTMLResponse(html)
+
+
+def _interpret_question(question: str, previous: Thesis | None) -> str:
+    """Plan, validate against the vocabulary, and render. Off the event loop."""
+    from backtool.ai.thesis_planner import plan_thesis
+
+    planned = plan_thesis(question, previous=previous)
+
+    if planned.unsupported:
+        return render_unsupported(planned)
+    if planned.clarifications:
+        return render_clarification(planned)
+
+    # Conversion is where the vocabulary is enforced. A field or value the
+    # planner invented fails here rather than reaching the engine.
+    try:
+        thesis = planned.to_thesis(question)
+    except ValueError as exc:
+        return render_error(f"That reading does not fit what Backtool measures: {exc}")
+
+    return render_spec_card(thesis, planned)
+
+
+def _previous_thesis(raw: object) -> Thesis | None:
+    """The thesis currently on screen, if the page sent one.
+
+    A malformed or stale payload is treated as absent rather than fatal: the
+    worst case is that a follow-up is read as a fresh question, which the
+    reader can see and correct from the specification card.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return Thesis.model_validate_json(raw)
+    except ValueError:
+        logger.info("Ignoring unreadable thesis payload")
+        return None
+
+
+@app.post("/api/research/run", response_class=HTMLResponse)
+async def research_run(payload: dict[str, Any]) -> HTMLResponse:
+    """Measure a confirmed thesis against real data."""
+    thesis = _previous_thesis(payload.get("thesis"))
+    if thesis is None:
+        return HTMLResponse(
+            render_error("That specification could not be read. Ask again."),
+            status_code=400,
+        )
+
+    try:
+        html = await asyncio.to_thread(_run_thesis, thesis)
+    except ValueError as exc:
+        return HTMLResponse(render_error(str(exc)), status_code=400)
+    except Exception as exc:  # noqa: BLE001 - the thread must show the reason
+        logger.exception("Research run failed")
+        return HTMLResponse(render_error(f"{type(exc).__name__}: {exc}"), status_code=500)
+
+    return HTMLResponse(html)
+
+
+def _run_thesis(thesis: Thesis) -> str:
+    """Execute, explain, and render. Runs off the event loop.
+
+    The deterministic summary is built first and is what renders unless the AI
+    reading both succeeds and survives its checks. That ordering is the point:
+    the explanation is an improvement on the prose, never a component of the
+    report, so no API key, no budget, no network and no bad paragraph can cost
+    the reader the answer.
+    """
+    from backtool.research.experiment import run_thesis
+    from backtool.research.interpretation import (
+        build_facts,
+        deterministic_summary,
+        interpretation_payload,
+    )
+
+    finding = run_thesis(thesis)
+    facts = build_facts(finding)
+    paragraphs = deterministic_summary(facts)
+
+    if _ai_available():
+        try:
+            from backtool.ai.research_interpreter import explain_research
+
+            explained = explain_research(interpretation_payload(facts))
+            if explained:
+                paragraphs = explained
+        except Exception:  # noqa: BLE001 - the report is already complete
+            # Deliberately silent in the UI. A reader who asked a research
+            # question does not need to hear about an API; they need the
+            # result, and they have it.
+            logger.warning("Falling back to the deterministic summary", exc_info=True)
+
+    return render_finding(finding, paragraphs)
 
 
 @app.get("/api/health")
