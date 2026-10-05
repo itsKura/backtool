@@ -42,6 +42,7 @@ def diverging_bar_chart(
     items: list[BarItem],
     *,
     unit: str = "%",
+    quantity: str = "return",
     value_format: str = "{:+.2f}",
     width: int = 720,
 ) -> str:
@@ -134,7 +135,7 @@ def diverging_bar_chart(
     )
     parts.append(
         f'<text x="{width - 4}" y="{height - 6}" class="axis-caption" '
-        f'text-anchor="end">return ({escape(unit)})</text>'
+        f'text-anchor="end">{escape(quantity)} ({escape(unit)})</text>'
     )
     parts.append("</svg>")
     return "".join(parts)
@@ -156,6 +157,7 @@ def distribution_chart(
     *,
     median: float | None = None,
     unit: str = "%",
+    quantity: str = "return",
     width: int = 720,
 ) -> str:
     """Render the shape of a set of returns as a histogram.
@@ -284,7 +286,7 @@ def distribution_chart(
     )
     parts.append(
         f'<text x="{width - DIST_SIDE_PADDING}" y="{height - 6}" class="axis-caption" '
-        f'text-anchor="end">return ({escape(unit)})</text>'
+        f'text-anchor="end">{escape(quantity)} ({escape(unit)})</text>'
     )
     parts.append("</svg>")
     return "".join(parts)

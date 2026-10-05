@@ -178,6 +178,37 @@ class Aggregation(StrEnum):
         """Whether this collapses the rows to a single number."""
         return self is not Aggregation.ROWS
 
+    @property
+    def yields_metric_units(self) -> bool:
+        """Whether the result is a value *of the metric*, or a fact *about the set*.
+
+        The distinction the renderer needs and did not have. A median return is
+        a return: it shares an axis with the observations, can be marked on
+        their distribution, and is read in percent of price. A frequency is a
+        share of releases -- the same ``75.0`` means something entirely
+        different, and putting it on a chart of returns labels it as a 75%
+        move.
+
+        ``frequency(return_pct > 0)`` has three separate units in play: the
+        metric is a return, the threshold is a return, and the result is a
+        proportion of observations. Only the first two belong on a price axis.
+        """
+        return self in {Aggregation.MEAN, Aggregation.MEDIAN}
+
+    @property
+    def result_noun(self) -> str:
+        """What the result *is*, for an axis caption.
+
+        Empty when the result is a value of the metric, because then the
+        metric's own label is the honest caption and this enum has no business
+        knowing it.
+        """
+        if self is Aggregation.FREQUENCY:
+            return "share of releases"
+        if self is Aggregation.COUNT:
+            return "releases"
+        return ""
+
 
 class ResultShape(StrEnum):
     """The kind of answer a query produces, and therefore how it is laid out.

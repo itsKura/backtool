@@ -126,6 +126,9 @@ class ResearchFinding(BaseModel):
     #: than recovered from the percentage, which rounds back to the wrong
     #: integer often enough to matter over a small sample.
     matched_count: int | None = None
+    #: The same count for the comparison group, so both sides of a frequency
+    #: comparison can show the fraction behind their percentage.
+    comparison_matched_count: int | None = None
 
     #: Releases considered but not in the cohort, counted by reason.
     excluded: dict[str, int] = {}
@@ -139,6 +142,36 @@ class ResearchFinding(BaseModel):
     @property
     def metric(self) -> MetricSpec:
         return self.thesis.outcome.spec
+
+    @property
+    def result_in_metric_units(self) -> bool:
+        """Whether the scalar result is a value of the metric.
+
+        The question anything displaying ``value`` has to ask first. A median
+        return belongs on the same axis as the observations it summarises; a
+        frequency is a share of releases and belongs nowhere near them.
+        """
+        return self.thesis.outcome.aggregation.yields_metric_units
+
+    @property
+    def result_quantity(self) -> str:
+        """What the scalar result *is*, for an axis caption.
+
+        Falls back to the metric's own label, which is right exactly when the
+        result is a value of that metric.
+        """
+        return self.thesis.outcome.aggregation.result_noun or self.metric.label
+
+    def describe_count(self, matched: int | None, size: int) -> str:
+        """The fraction behind a percentage, where one exists.
+
+        A share is far easier to judge beside the count it came from: 75% of
+        eight releases and 75% of eighty are the same number and different
+        evidence.
+        """
+        if matched is None:
+            return ""
+        return f"{matched} of {size}"
 
     @property
     def window(self) -> str:
@@ -221,24 +254,31 @@ class ResearchFinding(BaseModel):
                 "to report."
             )
 
-        if outcome.aggregation is Aggregation.FREQUENCY:
+        # Gated on the shape, so a frequency *comparison* falls through to the
+        # two-group sentence below. Reporting one side's share and stopping
+        # would answer half a question the reader asked all of.
+        if (
+            outcome.aggregation is Aggregation.FREQUENCY
+            and self.shape is not ResultShape.COMPARISON
+        ):
             assert outcome.threshold is not None
             comparison = (
                 outcome.threshold_operator.phrase().removeprefix("is ")
                 if outcome.threshold_operator
                 else "above"
             )
-            matched = self.matched_count
-            counted = (
-                f" ({matched} of {self.sample_size})" if matched is not None else ""
-            )
+            counted = self.describe_count(self.matched_count, self.sample_size)
             return (
                 f"The {subject} was {comparison} "
                 f"{self.metric.format(outcome.threshold)} after "
-                f"{self.value:.0f}% of releases{counted}."
+                f"{self.value:.0f}% of releases"
+                f"{f' ({counted})' if counted else ''}."
             )
 
-        if outcome.aggregation is Aggregation.COUNT:
+        if (
+            outcome.aggregation is Aggregation.COUNT
+            and self.shape is not ResultShape.COMPARISON
+        ):
             return f"{self.value:.0f} releases had a usable {subject}."
 
         if self.shape is ResultShape.SCALAR:
@@ -269,6 +309,23 @@ class ResearchFinding(BaseModel):
             if self.comparison
             else "the other group"
         )
+
+        # A result that is not in the metric's units cannot be described as a
+        # higher or lower *return*: both sides are shares of releases, so the
+        # sentence states the two shares and the gap between them.
+        if not self.result_in_metric_units:
+            left = self.describe_count(self.matched_count, self.sample_size)
+            right = self.describe_count(
+                self.comparison_matched_count, self.comparison_sample_size
+            )
+            return (
+                f"{self.cohort.label}: {self.format_value(self.value)}"
+                f"{f' ({left})' if left else ''} against {against}: "
+                f"{self.format_value(self.comparison_value)}"
+                f"{f' ({right})' if right else ''}, a difference of "
+                f"{difference:+.2f} percentage points."
+            )
+
         if size < 0.1:
             return (
                 f"No meaningful difference: the {measure} for "
@@ -377,11 +434,24 @@ def run_thesis(thesis: Thesis, *, as_of: dt.datetime | None = None) -> ResearchF
             operator=outcome.threshold_operator,
         )
 
-    matched = (
-        count_matching(values, outcome.threshold_operator, outcome.threshold)
-        if outcome.aggregation is Aggregation.FREQUENCY
+    counts_matches = (
+        outcome.aggregation is Aggregation.FREQUENCY
         and outcome.threshold is not None
         and outcome.threshold_operator is not None
+    )
+    matched = (
+        count_matching(values, outcome.threshold_operator, outcome.threshold)
+        if counts_matches and outcome.threshold_operator and outcome.threshold is not None
+        else None
+    )
+    comparison_matched = (
+        count_matching(
+            comparison_values, outcome.threshold_operator, outcome.threshold
+        )
+        if counts_matches
+        and comparison is not None
+        and outcome.threshold_operator
+        and outcome.threshold is not None
         else None
     )
 
@@ -397,6 +467,7 @@ def run_thesis(thesis: Thesis, *, as_of: dt.datetime | None = None) -> ResearchF
         sample_size=len(values),
         comparison_sample_size=len(comparison_values),
         matched_count=matched,
+        comparison_matched_count=comparison_matched,
         excluded=excluded,
         warnings=_warnings(thesis, len(values), len(comparison_values)),
     )

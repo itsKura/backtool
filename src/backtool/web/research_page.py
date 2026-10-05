@@ -24,7 +24,12 @@ from backtool.ai.thesis_planner import PlannedThesis
 from backtool.reporting.charts import BarItem, distribution_chart, diverging_bar_chart
 from backtool.research.experiment import ResearchFinding
 from backtool.research.thesis import Thesis
-from backtool.research.vocabulary import OUTCOME_HORIZONS, ResultShape, asset_label
+from backtool.research.vocabulary import (
+    OUTCOME_HORIZONS,
+    Aggregation,
+    ResultShape,
+    asset_label,
+)
 from backtool.research.windows import REACTION_WINDOWS
 from backtool.web.cohort_view import render_cohort_table, render_sample_badge
 
@@ -202,23 +207,28 @@ def _comparison(finding: ResearchFinding) -> str:
     if finding.value is None or finding.comparison_value is None:
         return ""
 
-    horizon = finding.thesis.outcome.horizon
-    label = f"{finding.thesis.outcome.aggregation.value} {horizon} {finding.metric.label}"
+    # The measure, said once, the same way the specification card says it.
+    # Building it from the aggregation and the metric produced "frequency 24h
+    # return", which reads as a kind of return rather than a count of them.
+    label = finding.thesis.outcome.describe()
     tiles = (
         _tile(
             finding.cohort.label,
             finding.format_value(finding.value),
             finding.sample_size,
-            cohort.up_count if cohort and finding.metric.key == "return_pct" else None,
+            _tile_detail(finding, cohort, finding.matched_count, finding.sample_size),
             label,
         )
         + _tile(
             _group_name(finding),
             finding.format_value(finding.comparison_value),
             finding.comparison_sample_size,
-            other.up_count
-            if other and finding.metric.key == "return_pct"
-            else None,
+            _tile_detail(
+                finding,
+                other,
+                finding.comparison_matched_count,
+                finding.comparison_sample_size,
+            ),
             label,
         )
         + _difference_tile(finding)
@@ -333,22 +343,37 @@ def _interpretation(paragraphs: tuple[str, ...]) -> str:
     )
 
 
-def _tile(label: str, value: str, n: int, up: int | None, measure: str) -> str:
-    """One figure with what it was measured over.
-
-    The hit rate appears only when the metric is a signed return. A trading
-    range is never negative, so "31/31 positive" beside one would be true,
-    useless, and read as a finding.
-    """
+def _tile(label: str, value: str, n: int, detail: str, measure: str) -> str:
+    """One figure with what it was measured over."""
     css = "pos" if value.startswith("+") else "neg" if value.startswith("-") else ""
-    hits = f" &middot; {up}/{n} positive" if up is not None else ""
+    extra = f" &middot; {escape(detail)}" if detail else ""
     return (
         '<div class="compare-tile">'
         f'<span class="compare-label">{escape(label)}</span>'
         f'<span class="compare-value {css}">{escape(value)}</span>'
         f'<span class="compare-meta">{escape(measure)} &middot; '
-        f"n={n}{hits}</span></div>"
+        f"n={n}{extra}</span></div>"
     )
+
+
+def _tile_detail(
+    finding: ResearchFinding, metrics: object, matched: int | None, size: int
+) -> str:
+    """The count beneath a tile's figure, chosen by what the figure is.
+
+    A share gets the fraction it came from, because 75% of eight and 75% of
+    eighty are the same number and different evidence. A median return gets the
+    hit rate, which is a genuinely separate fact about the same releases. A
+    median range gets neither: it is never negative, so "31/31 positive" would
+    be true, useless, and read as a finding.
+    """
+    if matched is not None:
+        return finding.describe_count(matched, size)
+    if finding.result_in_metric_units and finding.metric.key == "return_pct":
+        up = getattr(metrics, "up_count", None)
+        if up is not None:
+            return f"{up}/{size} positive"
+    return ""
 
 
 def _difference_tile(finding: ResearchFinding) -> str:
@@ -403,10 +428,9 @@ def _comparison_chart(finding: ResearchFinding) -> str:
         '<h3 class="finding-sub">'
         f"{escape(_truncate(finding.cohort.label, 40))} against "
         f"{escape(_truncate(_group_name(finding), 40))}</h3>"
-        f"{diverging_bar_chart(items)}"
-        f'<p class="chart-note">{escape(outcome.aggregation.value.capitalize())} '
-        f"{escape(outcome.horizon)} {escape(finding.metric.label)} across each "
-        f"group. {escape(_overlap_note(finding))}</p>"
+        f"{diverging_bar_chart(items, quantity=finding.result_quantity)}"
+        f'<p class="chart-note">{escape(outcome.describe().capitalize())} '
+        f"for each group. {escape(_overlap_note(finding))}</p>"
     )
 
 
@@ -414,11 +438,19 @@ def _distribution(finding: ResearchFinding) -> str:
     """How the qualifying releases were spread, not just where their middle was.
 
     Plots the queried metric, so a question about trading range shows the
-    spread of ranges rather than the spread of returns. The marker is the
-    scalar result where there is one -- on a ranked query there is no central
-    figure, and drawing a median the reader did not ask for would imply the
-    answer was about the middle.
+    spread of ranges rather than the spread of returns.
+
+    Two things it must not do, both of which it used to. It must not mark a
+    result that is not a value of the metric: a frequency of 75 is a share of
+    releases, and drawing it on an axis of returns presents it as a 75% move.
+    And it is skipped entirely for a frequency, because the figure the reader
+    came for is not on this chart at all -- the honest version marks the
+    *threshold* across the distribution, which is a different chart and not
+    this iteration's work.
     """
+    if finding.thesis.outcome.aggregation is Aggregation.FREQUENCY:
+        return ""
+
     clean = [
         observation.value
         for observation in finding.observations
@@ -426,11 +458,18 @@ def _distribution(finding: ResearchFinding) -> str:
     ]
     if len(clean) < 2:
         return ""
-    marker = finding.value if finding.shape is not ResultShape.RANKED else None
+
+    # Marked only when the result is a value of this metric. A ranked query has
+    # no central figure, and a count is a number of releases.
+    marker = (
+        finding.value
+        if finding.shape is not ResultShape.RANKED and finding.result_in_metric_units
+        else None
+    )
     return (
         f'<h3 class="finding-sub">Distribution of {escape(finding.metric.label)} '
         "across the qualifying releases</h3>"
-        f"{distribution_chart(clean, median=marker)}"
+        f"{distribution_chart(clean, median=marker, quantity=finding.metric.label)}"
     )
 
 
