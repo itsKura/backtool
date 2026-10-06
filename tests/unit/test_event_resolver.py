@@ -30,15 +30,26 @@ from typing import Any
 import httpx
 import pytest
 
-from backtool.ai.client import AIClient, AIError
+from backtool.ai.client import AIClient, AIError, ServerToolOutcome
 from backtool.ai.event_resolver import (
+    DEFAULT_EXTRACTION_MODEL,
+    DEFAULT_SEARCH_MODEL,
+    EXTRACTION_EFFORT,
+    EXTRACTION_MODEL_ENV,
     EXTRACTION_SYSTEM,
+    EXTRACTION_THINKS,
+    MAX_SEARCHES,
+    RESEARCH_EFFORT,
     RESEARCH_SYSTEM,
+    SEARCH_MODEL_ENV,
     SEARCH_TOOL_TYPE,
     AmbiguityClaim,
     EventClaim,
     ResolutionClaim,
     SourceAssessment,
+    _clients,
+    _extract,
+    _research,
     resolve_event_concept,
     search_tool,
 )
@@ -1606,6 +1617,323 @@ class TestSeverityInARecurringSet:
         assert concept.is_runnable
 
 
+def capturing(model: str) -> tuple[AIClient, list[dict[str, Any]]]:
+    """A client on ``model`` that records the bodies it sends."""
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "content": [{"type": "text", "text": json.dumps(MERGE_CLAIM)}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+        )
+
+    client = AIClient(
+        model=model,
+        api_key="test-key",
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(handler), base_url="https://example.test"
+        ),
+        max_retries=1,
+    )
+    return client, seen
+
+
+class TestEachStageRunsOnItsOwnModel:
+    """The two stages are not the same kind of work, so they are not priced so.
+
+    Stage A reads pages nobody vetted and judges what published them. Stage B
+    copies settled facts into fields at the lowest effort setting and spends no
+    thinking tokens at all. Paying one rate for both is how establishing a date
+    came to cost more than the study it feeds.
+    """
+
+    def test_the_stages_default_to_different_models(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.delenv(SEARCH_MODEL_ENV, raising=False)
+        monkeypatch.delenv(EXTRACTION_MODEL_ENV, raising=False)
+        search, extraction, owned = _clients(None)
+        try:
+            assert search.model == DEFAULT_SEARCH_MODEL
+            assert extraction.model == DEFAULT_EXTRACTION_MODEL
+            assert search.model != extraction.model
+        finally:
+            for client in owned:
+                client.close()
+
+    def test_each_variable_moves_only_its_own_stage(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setenv(SEARCH_MODEL_ENV, "model-for-searching")
+        monkeypatch.delenv(EXTRACTION_MODEL_ENV, raising=False)
+        search, extraction, owned = _clients(None)
+        try:
+            assert search.model == "model-for-searching"
+            assert extraction.model == DEFAULT_EXTRACTION_MODEL
+        finally:
+            for client in owned:
+                client.close()
+
+    def test_neither_inherits_the_project_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BACKTOOL_AI_MODEL steers the planner and the interpreter. A date
+        lookup is a different job and must not be dragged along by it."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setenv("BACKTOOL_AI_MODEL", "some-expensive-model")
+        monkeypatch.delenv(SEARCH_MODEL_ENV, raising=False)
+        monkeypatch.delenv(EXTRACTION_MODEL_ENV, raising=False)
+        search, extraction, owned = _clients(None)
+        try:
+            assert "some-expensive-model" not in {search.model, extraction.model}
+        finally:
+            for client in owned:
+                client.close()
+
+    def test_an_injected_client_serves_both_stages(self) -> None:
+        """What the tests rely on: one transport standing in for both calls."""
+        client, _ = capturing("whatever")
+        search, extraction, owned = _clients(client)
+        assert search is client and extraction is client
+        assert owned == ()
+        client.close()
+
+    def test_a_resolution_closes_only_what_it_opened(self) -> None:
+        """An injected client belongs to the caller; the ones made here do
+        not, and a resolution that leaked two connections per concept would be
+        a slow problem nobody noticed."""
+        client, _ = capturing("whatever")
+        assert _clients(client)[2] == ()
+        client.close()
+
+    def test_the_search_request_goes_out_on_the_search_model(self) -> None:
+        client, seen = capturing("the-search-model")
+        _research("a concept", client, MAX_SEARCHES)
+        assert seen[0]["model"] == "the-search-model"
+        assert seen[0]["tools"][0]["type"] == SEARCH_TOOL_TYPE
+
+    def test_the_extraction_request_goes_out_on_the_extraction_model(self) -> None:
+        client, seen = capturing("the-extraction-model")
+        outcome = ServerToolOutcome(text="notes", citations=(), usage={})
+        _extract("a concept", outcome, (), client)
+        assert seen[0]["model"] == "the-extraction-model"
+        assert "tools" not in seen[0]
+
+    def test_extraction_asks_for_no_reasoning(self) -> None:
+        """It spent zero thinking tokens when it was allowed them. Asking for
+        reasoning on a transcription step bills for nothing, and is what shut
+        the cheapest models out of the job."""
+        client, seen = capturing("anything")
+        outcome = ServerToolOutcome(text="notes", citations=(), usage={})
+        _extract("a concept", outcome, (), client)
+
+        assert "thinking" not in seen[0]
+        assert "effort" not in seen[0]["output_config"]
+        assert EXTRACTION_EFFORT is None
+        assert EXTRACTION_THINKS is False
+
+    def test_research_still_asks_for_care(self) -> None:
+        """The saving comes out of transcription, not out of judging sources."""
+        client, seen = capturing("anything")
+        _research("a concept", client, MAX_SEARCHES)
+
+        assert seen[0]["output_config"]["effort"] == RESEARCH_EFFORT
+        assert seen[0]["thinking"] == {"type": "adaptive"}
+
+    def test_the_payload_is_not_padded_with_whitespace(self) -> None:
+        """Indentation was for a reader who never sees this, and it is billed
+        at the same rate as the evidence."""
+        client, seen = capturing("anything")
+        outcome = ServerToolOutcome(text="notes", citations=(), usage={})
+        _extract("a concept", outcome, (), client)
+
+        payload = seen[0]["messages"][0]["content"]
+        assert chr(10) not in payload
+
+    def test_the_cheap_stage_is_still_the_one_with_no_tools(self) -> None:
+        """The saving must not come out of the trust boundary. Whatever model
+        stage B runs on, it has no way to reach a page."""
+        client, seen = capturing("anything")
+        outcome = ServerToolOutcome(text="notes", citations=(), usage={})
+        _extract("a concept", outcome, (), client)
+        assert "tools" not in seen[0]
+        assert seen[0]["output_config"]["format"]["type"] == "json_schema"
+
+
+class TestStageAIsAskedForNotesNotProse:
+    """Output is billed at five times input, and this prose is not evidence.
+
+    Stage B takes its facts from the structured source records and reads the
+    notes only to find its way around them -- a distinction the provenance work
+    made explicit. A long write-up is therefore paid for twice, once to produce
+    and once to re-read, and trusted neither time.
+    """
+
+    def test_it_asks_for_brief_notes(self) -> None:
+        assert "Brief notes, not a write-up" in RESEARCH_SYSTEM
+
+    def test_it_no_longer_asks_for_a_full_account(self) -> None:
+        assert "accurate and complete" not in RESEARCH_SYSTEM
+        assert "Quote the wording that establishes each date" not in RESEARCH_SYSTEM
+
+    def test_it_says_why_length_is_not_free(self) -> None:
+        """A model told to be brief without being told why tends to drift back.
+        This one is told the prose is not treated as evidence."""
+        assert "not evidence" in RESEARCH_SYSTEM
+
+    def test_it_is_told_when_to_stop_searching(self) -> None:
+        assert "When to stop searching" in RESEARCH_SYSTEM
+        assert "official or primary source gives the date" in RESEARCH_SYSTEM
+
+    def test_unsettled_is_an_acceptable_answer(self) -> None:
+        """Otherwise a budget cut just produces a confident guess."""
+        assert "that *is* the finding" in RESEARCH_SYSTEM
+
+    def test_milestones_need_a_reason(self) -> None:
+        """Not a ban on context, a requirement that it earn its place."""
+        assert "only when it does a job" in RESEARCH_SYSTEM
+        assert "Do not catalogue the rest" in RESEARCH_SYSTEM
+
+    def test_the_grounding_rules_are_untouched(self) -> None:
+        """Cost work must not quietly relax what the prompt refuses to do."""
+        assert "Do not supply a time of day that no source states" in RESEARCH_SYSTEM
+        assert "Do not resolve a disagreement by choosing" in RESEARCH_SYSTEM
+        assert "Do not produce a plausible date because one is expected" in (
+            RESEARCH_SYSTEM
+        )
+
+
+class TestCompetingPrimaryInstantsSurviveAsQuestions:
+    """A disagreement about when the measured thing happened must be weighable.
+
+    A live benchmark found this the hard way: Stage A noticed two plausible
+    instants for the occurrence being measured, and Stage B wrote the
+    discrepancy into ``missing_information``. That is free text nothing can
+    weigh, so it bypassed the severity system entirely -- the resolution came
+    back with no open questions and a single asserted instant, and the reader
+    was never told there had been a choice.
+
+    The distinction the prompt now draws is between evidence that is *absent*
+    and evidence that *disagrees*. Only the first is a gap.
+    """
+
+    def competing(self, *times: str, extra_notes: tuple[str, ...] = ()) -> dict[str, Any]:
+        claim = merge_story_claim(
+            missing_information=list(extra_notes),
+            ambiguities=[
+                question(
+                    "Which instant counts as the transition?",
+                    affects="Ethereum mainnet Merge",
+                    times=times,
+                )
+            ],
+        )
+        return claim
+
+    def resolved(self, *times: str, extra_notes: tuple[str, ...] = ()) -> Any:
+        concept, _ = resolve(
+            "Ethereum Merge",
+            research=MERGE_STORY_SEARCH,
+            extraction=self.competing(*times, extra_notes=extra_notes),
+        )
+        return concept
+
+    def test_rival_instants_in_different_buckets_block(self) -> None:
+        """12:04:55 and 12:05:05 price from different candles, so which one is
+        meant changes the anchor and the reader has to say."""
+        concept = self.resolved("12:04:55", "12:05:05")
+        assert len(concept.ambiguities) == 1
+        assert concept.blocking_ambiguities
+        assert not concept.is_runnable
+
+    def test_rival_instants_in_one_bucket_are_disclosed_not_blocking(self) -> None:
+        """06:42:42 and 06:42:59 price from the same candle. The reader is told
+        there was a choice; the study does not wait for them to make it."""
+        concept = self.resolved("06:42:42", "06:42:59")
+        assert len(concept.ambiguities) == 1
+        assert concept.informational_ambiguities
+        assert concept.blocking_ambiguities == ()
+        assert concept.is_runnable
+        assert concept.informational_ambiguities[0].timing_slack == dt.timedelta(
+            seconds=17
+        )
+
+    def test_the_study_still_compiles_with_the_disclosure_open(self) -> None:
+        concept = self.resolved("06:42:42", "06:42:59")
+        compiled = compile_event_set(concept)
+        assert len(compiled.events) == 1
+
+    def test_a_note_about_the_same_discrepancy_cannot_swallow_it(self) -> None:
+        """The defect, from the other direction: writing the discrepancy into
+        the notes as well must not cost it its place among the questions."""
+        concept = self.resolved(
+            "06:42:42",
+            "06:42:59",
+            extra_notes=(
+                "Verification of whether 06:42:42 or 06:42:59 marks the "
+                "transition instant",
+            ),
+        )
+        assert len(concept.ambiguities) == 1
+        assert concept.informational_ambiguities[0].timing_slack is not None
+        # The note survives too -- weighing the question does not delete the
+        # prose, and a reader may want both.
+        assert any("06:42:42" in note for note in concept.missing_information)
+
+    def test_a_blocking_rival_instant_is_not_softened_by_a_note(self) -> None:
+        concept = self.resolved(
+            "12:04:55",
+            "12:05:05",
+            extra_notes=("Which block marks the crossing is unverified",),
+        )
+        assert concept.blocking_ambiguities
+        assert not concept.is_runnable
+
+    def test_absent_evidence_is_still_a_gap_not_a_question(self) -> None:
+        """The limit of the rule. No source states a time, so there are no
+        rival readings to weigh -- that is missing information, and inventing a
+        question out of it would ask the reader something unanswerable."""
+        research = search_response(
+            results=listed(EF_URL),
+            cited=[(EF_URL, "The Merge", "The Merge was completed on September 15, 2022.")],
+        )
+        claim = merge_story_claim(
+            missing_information=["No source states a time of day for the transition"],
+        )
+        claim["events"] = [claim["events"][0]]
+        concept, _ = resolve(
+            "Ethereum Merge", research=research, extraction=claim
+        )
+        assert concept.ambiguities == ()
+        assert concept.primary_events[0].precision is TemporalPrecision.DATE_ONLY
+        assert any("No source states a time" in m for m in concept.missing_information)
+        assert concept.is_runnable
+
+    def test_the_instruction_says_where_a_disagreement_goes(self) -> None:
+        assert "Competing instants belong here" in EXTRACTION_SYSTEM
+        assert "Do not file it under `missing_information` instead" in EXTRACTION_SYSTEM
+
+    def test_the_instruction_distinguishes_absent_from_disagreeing(self) -> None:
+        """Without the distinction the rule would sweep every gap into the
+        questions, which is the opposite failure."""
+        assert "evidence that is **absent**" in EXTRACTION_SYSTEM
+        assert "genuine gap" in EXTRACTION_SYSTEM
+
+    def test_the_field_itself_says_so_too(self) -> None:
+        """A model reads the field description even when it skims the prompt."""
+        description = ResolutionClaim.model_fields["missing_information"].description
+        assert description is not None
+        assert "ABSENT" in description
+        assert "not evidence that disagrees" in description
+
+
 class TestStructuralBoundary:
     """Stage B cannot search, and has no field for an instruction."""
 
@@ -2172,7 +2500,16 @@ class TestResolverStaysInItsLane:
         assert "blocked_domains" not in search_tool()
 
     def test_the_search_budget_is_capped(self) -> None:
-        assert search_tool()["max_uses"] == 4
+        assert search_tool()["max_uses"] == MAX_SEARCHES
+
+    def test_the_budget_stays_small(self) -> None:
+        """A ceiling that has to be raised deliberately.
+
+        Every result a search returns is re-read on each later tool iteration,
+        so the fourth search costs more than the first three imply. Raising
+        this should be a decision somebody makes, not a default that drifts.
+        """
+        assert MAX_SEARCHES <= 2
 
     def test_a_malformed_extraction_is_refused(self) -> None:
         with pytest.raises(AIError, match="did not match the expected shape"):

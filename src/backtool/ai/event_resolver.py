@@ -76,20 +76,53 @@ logger = logging.getLogger(__name__)
 #: the client, so changing it is a line here and nothing else.
 SEARCH_TOOL_TYPE = "web_search_20250305"
 
-#: Searches allowed per resolution. Each is billed, so this is a cost ceiling
-#: as much as a scope one: finding when an election happened should not take
-#: ten queries, and a concept that needs more than this is usually ambiguous
-#: rather than obscure.
-MAX_SEARCHES = 4
+#: Searches allowed per resolution.
+#:
+#: A cost ceiling far more than a scope one, and not because of the per-search
+#: fee. Every result a search returns joins the context, and the model re-reads
+#: the accumulated pile each time it decides what to look for next -- so the
+#: snippets are paid for several times over, and a fourth search is dearer than
+#: the first three suggest. Measured on one concept, four searches put ~64k
+#: tokens of input through a single request for ~20 usable excerpts.
+#:
+#: Two is enough for the job this does. Establishing when something happened is
+#: not researching its history: one query usually finds the organisation's own
+#: record, and a second confirms it or exposes a disagreement. A concept that
+#: still is not settled after two is normally ambiguous rather than obscure,
+#: and saying so is the right answer rather than searching harder.
+MAX_SEARCHES = 2
 
 #: Effort for each stage. Research benefits from care; extraction is copying
 #: settled facts into fields.
+#:
+#: Extraction asks for none at all, and for no extended thinking either. It
+#: spent zero thinking tokens when it was allowed them, because transcribing
+#: established facts into a schema earns nothing from deliberation -- and a
+#: step that needs neither should not demand both, which is also what keeps the
+#: smallest models available for it.
 RESEARCH_EFFORT = "high"
-EXTRACTION_EFFORT = "low"
+EXTRACTION_EFFORT: str | None = None
+EXTRACTION_THINKS = False
 
-#: Model override for this module alone, so resolution can run somewhere
-#: cheaper than planning without touching either.
-RESOLVER_MODEL_ENV = "BACKTOOL_RESOLVER_MODEL"
+#: Model for each stage, chosen per job and overridable independently.
+#:
+#: The two stages are not the same kind of work. Stage A reads pages nobody
+#: vetted, judges what published them, and notices when sources disagree; that
+#: is the judgement this module exists for. Stage B copies settled facts into
+#: fields against a strict schema, at the lowest effort setting, and spends no
+#: thinking tokens at all -- it is transcription.
+#:
+#: Paying the same rate for both is how a date lookup came to cost more than
+#: the study it feeds. Nothing here inherits the planner's model, and changing
+#: these does not touch the planner or the interpreter.
+SEARCH_MODEL_ENV = "BACKTOOL_RESOLVER_SEARCH_MODEL"
+EXTRACTION_MODEL_ENV = "BACKTOOL_RESOLVER_EXTRACTION_MODEL"
+
+#: Defaults, set to the cheapest model that can be trusted with each job rather
+#: than to the project default. Override either with the variables above if a
+#: concept turns out to need more.
+DEFAULT_SEARCH_MODEL = "claude-sonnet-5-5"
+DEFAULT_EXTRACTION_MODEL = "claude-haiku-4-5-20251001"
 
 
 def search_tool(*, max_uses: int = MAX_SEARCHES) -> dict[str, Any]:
@@ -274,7 +307,12 @@ class ResolutionClaim(BaseModel):
         )
     )
     missing_information: list[str] = Field(
-        description="Facts that would have been needed and could not be found"
+        description=(
+            "Facts that would have been needed and could not be found: "
+            "evidence that is ABSENT, not evidence that disagrees. A competing "
+            "date or time for an occurrence you reported is an open question "
+            "with its candidate values, not a missing fact."
+        )
     )
     notes: str = Field(
         description="How the dates were established, in one or two sentences"
@@ -292,8 +330,11 @@ def resolve_event_concept(
 
     Args:
         query: The concept, in the reader's words.
-        client: Optional pre-built client, for testing.
-        max_searches: Cost ceiling. Each search is billed separately.
+        client: Optional pre-built client used for *both* stages, for testing.
+            Left unset, each stage gets its own client on its own model.
+        max_searches: Cost ceiling. Every result a search returns is re-read on
+            each subsequent tool iteration, so this bounds input as well as the
+            per-search fee.
         now: Override for the retrieval timestamp, for deterministic tests.
 
     Returns:
@@ -305,17 +346,44 @@ def resolve_event_concept(
         AIError: on transport failure, refusal, or an extraction that does not
             validate. A web page can cause this; it cannot cause anything else.
     """
-    resolved = client or AIClient(model=os.getenv(RESOLVER_MODEL_ENV) or None)
     retrieved_at = now or dt.datetime.now(tz=UTC)
+    search, extraction, owned = _clients(client)
 
-    logger.info("Resolving event concept: %s", query[:120])
-    outcome = _research(query, resolved, max_searches)
-    # Ids are assigned here, from what the search actually returned. Everything
-    # downstream refers to evidence by id, so a source the model invents has no
-    # handle and cannot be cited.
-    records = build_evidence(outcome.citations)
-    claim = _extract(query, outcome, records, resolved)
-    return _build(query, claim, outcome, records, retrieved_at)
+    try:
+        logger.info(
+            "Resolving event concept: %s (search %s, extraction %s)",
+            query[:120],
+            search.model,
+            extraction.model,
+        )
+        outcome = _research(query, search, max_searches)
+        # Ids are assigned here, from what the search actually returned.
+        # Everything downstream refers to evidence by id, so a source the model
+        # invents has no handle and cannot be cited.
+        records = build_evidence(outcome.citations)
+        claim = _extract(query, outcome, records, extraction)
+        return _build(query, claim, outcome, records, retrieved_at)
+    finally:
+        for owned_client in owned:
+            owned_client.close()
+
+
+def _clients(
+    client: AIClient | None,
+) -> tuple[AIClient, AIClient, tuple[AIClient, ...]]:
+    """One client per stage, or a caller's client for both.
+
+    Returns the two clients and whichever of them this function created, so a
+    resolution closes the connections it opened and leaves an injected one
+    alone.
+    """
+    if client is not None:
+        return client, client, ()
+    search = AIClient(model=os.getenv(SEARCH_MODEL_ENV) or DEFAULT_SEARCH_MODEL)
+    extraction = AIClient(
+        model=os.getenv(EXTRACTION_MODEL_ENV) or DEFAULT_EXTRACTION_MODEL
+    )
+    return search, extraction, (search, extraction)
 
 
 def _research(query: str, client: AIClient, max_searches: int) -> ServerToolOutcome:
@@ -354,6 +422,10 @@ def _extract(
     excerpt the search tool quoted. The research prose follows it, labelled as
     an aid to reading rather than as evidence -- it is one model's summary of
     those pages, and a summary is not a source.
+
+    Serialised compactly rather than indented. The indentation was for a human
+    reader who never sees this, and whitespace in a payload of several thousand
+    tokens is billed at the same rate as the evidence.
     """
     payload = {
         "concept": query,
@@ -371,9 +443,10 @@ def _extract(
     }
     return client.structured(
         system=EXTRACTION_SYSTEM,
-        user=json.dumps(payload, indent=2),
+        user=json.dumps(payload, separators=(",", ":")),
         schema=ResolutionClaim,
         effort=EXTRACTION_EFFORT,
+        thinking=EXTRACTION_THINKS,
     )
 
 
@@ -1025,19 +1098,37 @@ once the dates are established.
 
 ## What to find
 
-For the concept given, find every occurrence that is relevant, and for each \
-one: the calendar date, the time of day **only if a source states one**, the \
-timezone, and the page that establishes it.
+The occurrences of the concept itself, and for each one: the calendar date, the \
+time of day **only if a source states one**, the timezone, and the page that \
+establishes it.
 
 Some concepts are recurring -- elections, scheduled meetings -- and have many \
 occurrences. Some happened once. Both are normal; report what you find.
 
-Separate the occurrences of the concept itself from the milestones around it. \
-A protocol upgrade has preparatory steps and rehearsals; a collapse has a run \
-of announcements, filings and closures; a ruling has a hearing and an appeal. \
-Give the dates of all of them, and say plainly which are the concept and which \
-are its context -- a reader asking what happened after an event means the \
-event, not every step that led to it.
+Milestones around the concept are a means, not the goal. A protocol upgrade has \
+preparatory steps and rehearsals; a collapse has a run of announcements, \
+filings and closures; a ruling has a hearing and an appeal. Mention one **only \
+when it does a job**: it tells the concept apart from something it is confused \
+with, it explains an ambiguity a reader would have to settle, or it accounts \
+for a date in the evidence that would otherwise look like a contradiction. Do \
+not catalogue the rest. A reader asking what happened after an event means the \
+event, and researching every precursor costs them money for dates nothing will \
+measure.
+
+## When to stop searching
+
+As soon as the concept is established, which is usually after one search and \
+almost always after two. You have enough when all of this holds:
+
+* an official or primary source gives the date, and the time if one exists;
+* nothing retrieved contradicts it about the same occurrence;
+* any remaining question is one a reader must answer, not one more search \
+would settle.
+
+Searching past that point buys nothing. If two searches leave the concept \
+genuinely unsettled -- several different events share the name, or no \
+trustworthy source dates it -- that *is* the finding. Report it as unsettled \
+rather than searching for a cleaner answer that does not exist.
 
 ## Sources
 
@@ -1065,10 +1156,18 @@ evidence does not establish that the event happened, say that it does not.
 
 ## Output
 
-Write plainly: what the concept turned out to be, each occurrence with its date \
-and evidence, which sources you relied on, and anything that remains unsettled. \
-Quote the wording that establishes each date. Another step will structure this; \
-you only have to be accurate and complete.
+**Brief notes, not a write-up.** A dozen lines at most, and fewer is better:
+
+* what the concept turned out to be, in one line;
+* each occurrence, as a date and a one-line note saying which source has it;
+* anything genuinely unsettled, in one line each.
+
+Do not narrate the search, do not explain background, do not re-quote the pages \
+at length, and do not pad with context nobody asked for. The evidence is \
+already being carried separately as the search results themselves, with their \
+own quoted text and urls -- the next step reads **those** for the facts and \
+reads your notes only to find its way around them. Prose here is not evidence \
+and is not treated as any, so length in it costs money and buys nothing.
 """
 
 
@@ -1141,6 +1240,24 @@ else, including any disagreement about the calendar day. Report the times \
 themselves; what the difference between them amounts to is not yours to work \
 out.
 
+### Competing instants belong here
+
+If the evidence offers more than one plausible instant for an occurrence you \
+reported -- two sources giving different times, or one source describing the \
+boundary two ways -- that is an open question about that occurrence. Record it \
+here: `affects_event` naming the occurrence, `candidate_times` listing every \
+value, and a question a reader could answer in a line.
+
+Do not file it under `missing_information` instead. That field is for evidence \
+that is **absent**: no source states a time at all, a date nobody published, a \
+record you could not reach. Evidence that *disagrees* is not missing, and \
+writing a disagreement up as a gap buries the one thing a reader might have to \
+settle -- and buries it somewhere nothing can weigh it.
+
+This applies only when the occurrence itself is established and the candidates \
+are rival readings of its instant. If no source gives a time at all, that is a \
+genuine gap and belongs in `missing_information` as before.
+
 ## Status
 
 * `resolved` -- the dates are established and the sources agree.
@@ -1183,11 +1300,15 @@ instead of silently resolved.
 
 __all__ = [
     "EXTRACTION_EFFORT",
+    "EXTRACTION_THINKS",
     "EXTRACTION_SYSTEM",
     "MAX_SEARCHES",
     "RESEARCH_EFFORT",
     "RESEARCH_SYSTEM",
-    "RESOLVER_MODEL_ENV",
+    "DEFAULT_EXTRACTION_MODEL",
+    "DEFAULT_SEARCH_MODEL",
+    "EXTRACTION_MODEL_ENV",
+    "SEARCH_MODEL_ENV",
     "SEARCH_TOOL_TYPE",
     "AmbiguityClaim",
     "EventClaim",

@@ -308,8 +308,9 @@ class AIClient:
         system: str,
         user: str,
         schema: type[T],
-        effort: str = "medium",
+        effort: str | None = "medium",
         cache_system: bool = True,
+        thinking: bool = True,
     ) -> T:
         """Request a response constrained to ``schema`` and return it validated.
 
@@ -317,15 +318,24 @@ class AIClient:
             system: System prompt defining the role.
             user: The request content.
             schema: Pydantic model the response must conform to.
-            effort: Thinking depth -- ``low`` through ``max``. Defaults to
+            effort: Reasoning depth -- ``low`` through ``max``. Defaults to
                 ``medium``: this client only ever asks for a structured object
                 against a fixed schema, and the deep-reasoning setting bills
-                for thinking that translation does not need.
+                for thinking that translation does not need. ``None`` omits the
+                setting, which is right when ``thinking`` is off and there is no
+                reasoning to budget for.
             cache_system: Whether to mark the system prompt cacheable. Worth it
                 whenever the same prompt is used more than once in a few
                 minutes, which is every batch run -- the prompt is identical
                 across calls and only the question changes, so paying full
                 price for it each time is pure waste.
+            thinking: Whether to request extended thinking. Off for work that
+                is transcription rather than reasoning -- copying established
+                facts into fields earns nothing from deliberation, and asking
+                for it bills for tokens the task does not use. Also what makes
+                the smallest models usable for such a step: several support
+                neither extended thinking nor a reasoning effort, and a job
+                that needs neither should not be demanding both.
 
         Returns:
             A validated instance of ``schema``.
@@ -342,17 +352,21 @@ class AIClient:
         if cache_system:
             system_blocks[0]["cache_control"] = {"type": "ephemeral"}
 
-        body = {
+        output_config: dict[str, Any] = {
+            "format": {"type": "json_schema", "schema": strict_json_schema(schema)}
+        }
+        if effort is not None:
+            output_config["effort"] = effort
+
+        body: dict[str, Any] = {
             "model": self._model,
             "max_tokens": MAX_TOKENS,
             "system": system_blocks,
-            "thinking": {"type": "adaptive"},
-            "output_config": {
-                "effort": effort,
-                "format": {"type": "json_schema", "schema": strict_json_schema(schema)},
-            },
+            "output_config": output_config,
             "messages": [{"role": "user", "content": user}],
         }
+        if thinking:
+            body["thinking"] = {"type": "adaptive"}
 
         payload = self._post(body)
         return self._parse(payload, schema)

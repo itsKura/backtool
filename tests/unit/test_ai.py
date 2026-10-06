@@ -213,6 +213,45 @@ class TestRequestShape:
 
         assert json.loads(captured[0].content)["output_config"]["effort"] == "medium"
 
+    def test_a_reasoning_request_asks_for_thinking(self) -> None:
+        """The planner and the interpreter want it, and must keep getting it."""
+        captured: list[httpx.Request] = []
+        client = mock_client(valid_plan_payload(), capture=captured)
+        client.structured(system="s", user="u", schema=PlannedStudy)
+
+        body = json.loads(captured[0].content)
+        assert body["thinking"] == {"type": "adaptive"}
+
+    def test_a_transcription_request_asks_for_neither(self) -> None:
+        """Copying established facts into a schema earns nothing from
+        deliberation, and a step that asks for it bills for tokens it will not
+        use. Stated as a property of the request, not of the model -- which is
+        also what keeps the smallest models usable for such a step, since
+        several support neither extended thinking nor a reasoning effort.
+        """
+        captured: list[httpx.Request] = []
+        client = mock_client(valid_plan_payload(), capture=captured)
+        client.structured(
+            system="s", user="u", schema=PlannedStudy, effort=None, thinking=False
+        )
+
+        body = json.loads(captured[0].content)
+        assert "thinking" not in body
+        assert "effort" not in body["output_config"]
+
+    def test_the_schema_survives_without_effort_or_thinking(self) -> None:
+        """The constraint that matters is the schema. Dropping the reasoning
+        settings must not drop that with them."""
+        captured: list[httpx.Request] = []
+        client = mock_client(valid_plan_payload(), capture=captured)
+        client.structured(
+            system="s", user="u", schema=PlannedStudy, effort=None, thinking=False
+        )
+
+        fmt = json.loads(captured[0].content)["output_config"]["format"]
+        assert fmt["type"] == "json_schema"
+        assert fmt["schema"]["additionalProperties"] is False
+
     def test_sends_authentication_headers(self) -> None:
         captured: list[httpx.Request] = []
         client = mock_client(valid_plan_payload(), capture=captured)
