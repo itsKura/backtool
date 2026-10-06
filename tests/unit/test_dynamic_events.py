@@ -37,6 +37,8 @@ from backtool.events.calendar import load_events, select_last_n
 from backtool.events.models import MarketEvent, SourceAuthority, SourceRef, TemporalPrecision
 from backtool.events.releases import SCENARIO_RULES
 from backtool.events.resolution import (
+    Ambiguity,
+    AmbiguitySeverity,
     AnchorPolicy,
     CandidateEvent,
     DayAnchor,
@@ -360,6 +362,94 @@ class TestOnlyPrimaryOccurrencesAreMeasured:
         assert event.is_primary
 
 
+class TestOpenQuestionsAreWeighedBeforeBlocking:
+    """Compilation waits for questions that could change what it measures.
+
+    Not for the others. A resolution of any real concept arrives carrying
+    things a reader should know -- a disagreement about a milestone, a detail
+    too fine for the data to resolve -- and treating each as a precondition
+    meant nothing could ever be measured.
+    """
+
+    def test_an_informational_question_does_not_stop_compilation(self) -> None:
+        concept = midterms(
+            ambiguities=(
+                Ambiguity(
+                    question="Do runoffs count as part of the cycle?",
+                    severity=AmbiguitySeverity.INFORMATIONAL,
+                ),
+            )
+        )
+        assert concept.is_runnable
+        compiled = compile_event_set(
+            concept, anchor=DayAnchor(policy=AnchorPolicy.DAY_END)
+        )
+        assert len(compiled.events) == 2
+
+    def test_a_blocking_question_still_stops_compilation(self) -> None:
+        concept = midterms(
+            ambiguities=(Ambiguity(question="Which midterms?"),)
+        )
+        assert not concept.is_runnable
+        with pytest.raises(ValueError, match="still has open questions"):
+            compile_event_set(concept, anchor=DayAnchor())
+
+    def test_an_unlabelled_question_blocks(self) -> None:
+        """The default, and the safe direction. A question nobody has weighed
+        is one nobody has decided the consequence of."""
+        assert Ambiguity(question="?").is_blocking
+
+    def test_the_refusal_names_only_the_blocking_ones(self) -> None:
+        """A reader told to answer five questions when one of them matters
+        learns less than a reader told to answer one."""
+        concept = midterms(
+            ambiguities=(
+                Ambiguity(
+                    question="A detail nobody needs to settle.",
+                    severity=AmbiguitySeverity.INFORMATIONAL,
+                ),
+                Ambiguity(question="Which cycle did you mean?"),
+            )
+        )
+        with pytest.raises(ValueError) as caught:
+            compile_event_set(concept, anchor=DayAnchor())
+        assert "Which cycle did you mean?" in str(caught.value)
+        assert "A detail nobody needs" not in str(caught.value)
+
+    def test_both_kinds_stay_on_the_concept(self) -> None:
+        """Weighing them is not filtering them. Everything the resolver found
+        still reaches a report."""
+        concept = midterms(
+            ambiguities=(
+                Ambiguity(
+                    question="informational",
+                    severity=AmbiguitySeverity.INFORMATIONAL,
+                ),
+                Ambiguity(question="blocking"),
+            )
+        )
+        assert len(concept.ambiguities) == 2
+        assert [a.question for a in concept.blocking_ambiguities] == ["blocking"]
+        assert [a.question for a in concept.informational_ambiguities] == [
+            "informational"
+        ]
+
+    def test_an_anchor_is_still_required_separately(self) -> None:
+        """Runnability is about questions for the reader; an anchor is a
+        decision for the caller. The two must not collapse into each other."""
+        concept = midterms(
+            ambiguities=(
+                Ambiguity(
+                    question="context only",
+                    severity=AmbiguitySeverity.INFORMATIONAL,
+                ),
+            )
+        )
+        assert concept.is_runnable
+        with pytest.raises(ValueError, match="needs a decision"):
+            compile_event_set(concept)
+
+
 class TestCompilationRefusesWhatCannotBeMeasured:
     """An open question is for the reader, not for the engine."""
 
@@ -373,8 +463,6 @@ class TestCompilationRefusesWhatCannotBeMeasured:
 
     def test_a_resolved_concept_with_open_questions_does_not_compile(self) -> None:
         """Status alone is not enough -- an unanswered question still blocks."""
-        from backtool.events.resolution import Ambiguity
-
         with pytest.raises(ValueError, match="still has open questions"):
             compile_event_set(
                 midterms(

@@ -35,6 +35,7 @@ from backtool.ai.event_resolver import (
     EXTRACTION_SYSTEM,
     RESEARCH_SYSTEM,
     SEARCH_TOOL_TYPE,
+    AmbiguityClaim,
     EventClaim,
     ResolutionClaim,
     SourceAssessment,
@@ -42,13 +43,18 @@ from backtool.ai.event_resolver import (
     search_tool,
 )
 from backtool.ai.evidence import excerpt_dates
+from backtool.core.time import floor_to_interval
+from backtool.core.types import Interval
 from backtool.events.models import SourceAuthority, TemporalPrecision
 from backtool.events.resolution import (
+    FINEST_MEASURABLE_SPAN,
+    AmbiguitySeverity,
     AnchorPolicy,
     DayAnchor,
     EventRole,
     ResolutionStatus,
     compile_event_set,
+    resolves_to_one_candle,
 )
 
 NOW = dt.datetime(2026, 10, 5, 12, 0, tzinfo=dt.UTC)
@@ -1072,6 +1078,534 @@ class TestUnusedSourcesDoNotBlockTheAnswer:
         assert "merge" in goerli.lower() and "merge" in lie.lower()
 
 
+def question(
+    text: str,
+    *,
+    affects: str = "",
+    blocks: bool = False,
+    times: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """One open question as the extraction reports it.
+
+    ``times`` are candidate times of day in dispute, reported and not
+    interpreted: no field here carries a duration, because the extraction does
+    not get to decide what the difference between two instants amounts to.
+    """
+    return {
+        "question": text,
+        "affects_event": affects,
+        "blocks_research": blocks,
+        "candidate_times": list(times),
+    }
+
+
+class TestAmbiguitySeverity:
+    """Which open questions a study waits for, and which it merely discloses.
+
+    Every open question used to stop a study. That made the resolver unusable
+    on any real concept: resolving one turns up milestones, rehearsals and
+    namesakes, sources disagree about them, and none of that can change what an
+    anchor on the concept measures. What decides is consequence -- whether
+    answering the question would move an occurrence being measured.
+    """
+
+    def test_a_question_about_a_related_milestone_does_not_block(self) -> None:
+        """The case that motivated this. A disputed rehearsal date three months
+        before the event cannot change a study anchored to the event."""
+        claim = merge_story_claim(
+            ambiguities=[
+                question(
+                    "Sources differ on the Ropsten testnet merge date: 8 or 9 June?",
+                    affects="Ropsten testnet merge",
+                )
+            ]
+        )
+        concept, _ = resolve(
+            "Ethereum Merge", research=MERGE_STORY_SEARCH, extraction=claim
+        )
+        assert concept.status is ResolutionStatus.RESOLVED
+        assert concept.is_runnable
+        assert len(concept.informational_ambiguities) == 1
+        assert concept.blocking_ambiguities == ()
+
+    def test_a_question_about_the_measured_occurrence_blocks(self) -> None:
+        claim = merge_story_claim(
+            ambiguities=[
+                question(
+                    "Does this mean the mainnet transition or something else?",
+                    affects="Ethereum mainnet Merge",
+                )
+            ]
+        )
+        concept, _ = resolve(
+            "Ethereum Merge", research=MERGE_STORY_SEARCH, extraction=claim
+        )
+        assert not concept.is_runnable
+        assert len(concept.blocking_ambiguities) == 1
+
+    def test_the_model_cannot_wave_away_a_question_about_a_primary(self) -> None:
+        """It attributes; Python decides. A question naming an occurrence being
+        measured blocks even when the model says research can proceed."""
+        claim = merge_story_claim(
+            ambiguities=[
+                question(
+                    "Which instant counts as the transition?",
+                    affects="Ethereum mainnet Merge",
+                    blocks=False,
+                )
+            ]
+        )
+        # No candidate times, so nothing can release the block.
+        concept, _ = resolve(
+            "Ethereum Merge", research=MERGE_STORY_SEARCH, extraction=claim
+        )
+        assert concept.blocking_ambiguities
+        assert not concept.is_runnable
+
+    def test_an_unattributed_question_can_still_block(self) -> None:
+        """The other direction: a question the model cannot tie to any single
+        occurrence, because the concept itself is not settled."""
+        claim = merge_story_claim(
+            ambiguities=[question("Which event is meant by this phrase?", blocks=True)]
+        )
+        concept, _ = resolve(
+            "Ethereum Merge", research=MERGE_STORY_SEARCH, extraction=claim
+        )
+        assert not concept.is_runnable
+
+    def test_a_question_about_nothing_measured_is_informational(self) -> None:
+        """Attributed to a milestone that was never reported as an event, which
+        is the shape the live Sepolia disagreement took."""
+        claim = merge_story_claim(
+            ambiguities=[
+                question("Sepolia testnet merge date disputed: 6 vs 7 July 2022")
+            ]
+        )
+        concept, _ = resolve(
+            "Ethereum Merge", research=MERGE_STORY_SEARCH, extraction=claim
+        )
+        assert concept.is_runnable
+        assert len(concept.informational_ambiguities) == 1
+
+    def test_the_informational_question_stays_on_the_concept(self) -> None:
+        """Not blocking is not the same as not reported."""
+        claim = merge_story_claim(
+            ambiguities=[question("Sepolia testnet merge date disputed")]
+        )
+        concept, _ = resolve(
+            "Ethereum Merge", research=MERGE_STORY_SEARCH, extraction=claim
+        )
+        assert [a.question for a in concept.ambiguities] == [
+            "Sepolia testnet merge date disputed"
+        ]
+        assert concept.ambiguities[0].severity is AmbiguitySeverity.INFORMATIONAL
+
+    def test_it_still_compiles_with_an_informational_question_open(self) -> None:
+        claim = merge_story_claim(
+            ambiguities=[question("Sepolia testnet merge date disputed")]
+        )
+        concept, _ = resolve(
+            "Ethereum Merge", research=MERGE_STORY_SEARCH, extraction=claim
+        )
+        compiled = compile_event_set(concept)
+        assert len(compiled.events) == 1
+
+
+class TestTimingAmbiguityIsJudgedByCandleBucket:
+    """Whether the engine could act on the answer, not how close the times are.
+
+    Elapsed time is the wrong question and gets real cases wrong in both
+    directions: 12:04:55 and 12:05:05 are ten seconds apart and price from
+    different five-minute candles, while 12:01 and 12:04 are three minutes
+    apart and price from the same one. So the test is bucket identity, computed
+    with the helper the data layer uses to find the last closed candle.
+
+    The occurrence supplies the date and the timezone; the extraction supplies
+    only the candidate times. Nothing it says is arithmetic.
+    """
+
+    def claim_with(self, *times: str, label: str = "Ethereum mainnet Merge") -> dict[str, Any]:
+        return merge_story_claim(
+            ambiguities=[
+                question(
+                    "Which instant counts as the transition?",
+                    affects=label,
+                    blocks=True,
+                    times=times,
+                )
+            ]
+        )
+
+    def resolved(self, *times: str) -> Any:
+        concept, _ = resolve(
+            "Ethereum Merge",
+            research=MERGE_STORY_SEARCH,
+            extraction=self.claim_with(*times),
+        )
+        return concept
+
+    def test_seventeen_seconds_inside_one_bucket_does_not_block(self) -> None:
+        """The live case: 06:42:42 and 06:42:59 both price from 06:40."""
+        concept = self.resolved("06:42:42", "06:42:59")
+        assert concept.is_runnable
+        assert concept.informational_ambiguities[0].timing_slack == dt.timedelta(
+            seconds=17
+        )
+
+    def test_ten_seconds_across_a_boundary_blocks(self) -> None:
+        """Closer together than the pair above, and the answer is the opposite,
+        because 12:04:55 and 12:05:05 price from different candles."""
+        concept = self.resolved("12:04:55", "12:05:05")
+        assert not concept.is_runnable
+        assert len(concept.blocking_ambiguities) == 1
+
+    def test_minutes_apart_inside_one_bucket_does_not_block(self) -> None:
+        """Three minutes apart, same candle. Duration says block; the bucket
+        says the engine cannot tell them apart, and the bucket is right."""
+        concept = self.resolved("12:01:00", "12:04:00")
+        assert concept.is_runnable
+
+    def test_minutes_apart_across_a_boundary_blocks(self) -> None:
+        concept = self.resolved("12:01:00", "12:06:00")
+        assert not concept.is_runnable
+
+    def test_an_instant_exactly_on_a_boundary_is_its_own_bucket(self) -> None:
+        """12:05:00 prices from the candle that closed at 12:05; 12:04:59 from
+        the one before it. One second apart, and a different anchor."""
+        assert not self.resolved("12:04:59", "12:05:00").is_runnable
+        assert self.resolved("12:00:00", "12:04:59").is_runnable
+
+    def test_three_candidates_must_all_share_the_bucket(self) -> None:
+        assert self.resolved("12:00:30", "12:02:00", "12:04:59").is_runnable
+        assert not self.resolved("12:00:30", "12:02:00", "12:05:01").is_runnable
+
+    def test_an_unreadable_candidate_blocks(self) -> None:
+        for bad in ("half past six", "25:99", "06:42:42Z+", ""):
+            assert not self.resolved("06:42:42", bad).is_runnable, bad
+
+    def test_a_single_candidate_blocks(self) -> None:
+        """One time is not two readings, so there is nothing to compare and
+        nothing to release the block."""
+        assert not self.resolved("06:42:42").is_runnable
+
+    def test_no_candidates_at_all_blocks(self) -> None:
+        assert not self.resolved().is_runnable
+
+    def test_the_reason_names_the_shared_candle(self) -> None:
+        """A reader should be able to check the judgement, which means seeing
+        which candle both instants landed in."""
+        why = self.resolved("06:42:42", "06:42:59").informational_ambiguities[0]
+        assert "17 seconds apart" in why.why_it_matters
+        assert "06:40 UTC" in why.why_it_matters
+
+    def test_the_times_are_dated_by_the_occurrence_not_by_today(self) -> None:
+        """The candidates are times of day; the occurrence supplies the date
+        and the zone, so the instants compared are the real ones."""
+        concept = self.resolved("06:42:42", "06:42:59")
+        assert concept.primary_events[0].local_date == dt.date(2022, 9, 15)
+        assert concept.informational_ambiguities[0].timing_slack is not None
+
+    def test_candidates_for_a_milestone_cannot_create_a_block(self) -> None:
+        """A question about something not being measured stays informational
+        however far apart its candidates are -- the release valve only ever
+        releases, it never escalates.
+
+        (``blocks_research`` is false here on purpose: that flag is the model
+        saying the concept is unsettled, and it blocks whatever it names.)
+        """
+        concept, _ = resolve(
+            "Ethereum Merge",
+            research=MERGE_STORY_SEARCH,
+            extraction=merge_story_claim(
+                ambiguities=[
+                    question(
+                        "Which instant counts as the rehearsal?",
+                        affects="Ropsten testnet merge",
+                        times=("01:00:00", "23:00:00"),
+                    )
+                ]
+            ),
+        )
+        assert concept.is_runnable
+        assert len(concept.informational_ambiguities) == 1
+
+
+class TestTheBucketRuleFollowsTheEnginesData:
+    """The threshold is read off the interval enum, not written down."""
+
+    def instants(self, *times: str) -> list[dt.datetime]:
+        return [
+            dt.datetime.fromisoformat(f"2022-09-15T{value}+00:00")
+            for value in times
+        ]
+
+    def test_the_finest_span_is_derived_from_the_intervals(self) -> None:
+        assert min(
+            interval.duration for interval in Interval
+        ) == FINEST_MEASURABLE_SPAN
+
+    def test_a_finer_grid_separates_what_the_coarse_one_merges(self) -> None:
+        """The property the brief asked for: shrink the finest interval and the
+        same pair stops being indistinguishable. Nothing in the rule changes.
+        """
+        pair = self.instants("06:42:42", "06:42:59")
+        assert resolves_to_one_candle(pair, span=dt.timedelta(minutes=5))
+        assert resolves_to_one_candle(pair, span=dt.timedelta(minutes=1))
+        assert not resolves_to_one_candle(pair, span=dt.timedelta(seconds=1))
+
+    def test_a_coarser_grid_merges_what_the_fine_one_separates(self) -> None:
+        pair = self.instants("12:04:55", "12:05:05")
+        assert not resolves_to_one_candle(pair, span=dt.timedelta(minutes=5))
+        assert resolves_to_one_candle(pair, span=dt.timedelta(hours=1))
+
+    def test_it_uses_the_engines_own_flooring(self) -> None:
+        """Not a second implementation of bucketing. Same helper, same answer
+        as the data layer's anchor lookup."""
+        for value in ("06:42:42", "12:05:00", "00:00:01"):
+            instant = self.instants(value)[0]
+            assert resolves_to_one_candle(
+                [instant, floor_to_interval(instant, FINEST_MEASURABLE_SPAN)]
+            )
+
+
+class TestTheModelSuppliesNoArithmetic:
+    """Correctness numbers are computed here, so there is nowhere to put one."""
+
+    def test_the_claim_has_no_duration_field(self) -> None:
+        fields = set(AmbiguityClaim.model_fields)
+        assert "timing_slack_seconds" not in fields
+        assert not any("second" in name or "slack" in name for name in fields)
+        assert "candidate_times" in fields
+
+    def test_the_reported_span_is_computed_from_the_candidates(self) -> None:
+        """Whatever the sources said, the span on the record is the one the
+        timestamps imply."""
+        concept, _ = resolve(
+            "Ethereum Merge",
+            research=MERGE_STORY_SEARCH,
+            extraction=merge_story_claim(
+                ambiguities=[
+                    question(
+                        "Which instant?",
+                        affects="Ethereum mainnet Merge",
+                        blocks=True,
+                        times=("12:01:00", "12:04:30"),
+                    )
+                ]
+            ),
+        )
+        assert concept.informational_ambiguities[0].timing_slack == dt.timedelta(
+            seconds=210
+        )
+
+
+class TestDisputedMilestonesAreReportedNotEscalated:
+    """A source-level disagreement, weighed by what it is about."""
+
+    SPLIT_SEARCH = search_response(
+        text="The Merge and its rehearsals.",
+        results=listed(EF_URL, BELLATRIX_URL, ROPSTEN_URL, WRONG_URL),
+        cited=[
+            (EF_URL, "The Merge",
+             "The Merge was completed on September 15, 2022 at 06:42 UTC."),
+            (BELLATRIX_URL, "Announcement",
+             "Bellatrix is scheduled for 11:34 UTC on Sept 6, 2022."),
+            (ROPSTEN_URL, "Ropsten",
+             "Ropsten transitioned to proof-of-stake on 8th June 2022."),
+            (WRONG_URL, "Coverage",
+             "The Ropsten rehearsal ran on 9th June 2022."),
+        ],
+    )
+
+    def split_claim(self) -> dict[str, Any]:
+        """Ropsten cited to the page that supports it and the one that does
+        not, which is what a disagreement looks like. One source alone saying
+        otherwise would drop the occurrence instead, by the date guard."""
+        claim = merge_story_claim()
+        claim["events"][2]["evidence_source_ids"] = ["source_3", "source_4"]
+        claim["sources"] = [
+            *claim["sources"],
+            {"source_id": "source_4", "publisher": "A wire service",
+             "authority": "secondary", "dates_event": "Ropsten testnet merge"},
+        ]
+        return claim
+
+    def test_a_disputed_related_milestone_is_informational(self) -> None:
+        """Ropsten is dated the 8th by its own page and the 9th by another.
+        Worth telling a reader; cannot change a study anchored to the Merge."""
+        concept, _ = resolve(
+            "Ethereum Merge",
+            research=self.SPLIT_SEARCH,
+            extraction=self.split_claim(),
+        )
+        assert concept.status is ResolutionStatus.RESOLVED
+        assert concept.is_runnable
+        questions = [a.question for a in concept.informational_ambiguities]
+        assert any("Ropsten" in q and "2022-06-09" in q for q in questions)
+
+    def test_the_disputed_milestone_is_still_reported_as_an_event(self) -> None:
+        """Disputed, not discarded: the date its own page supports stands, and
+        the disagreement travels beside it."""
+        concept, _ = resolve(
+            "Ethereum Merge",
+            research=self.SPLIT_SEARCH,
+            extraction=self.split_claim(),
+        )
+        ropsten = next(
+            c for c in concept.related_events if c.label.startswith("Ropsten")
+        )
+        assert ropsten.local_date == dt.date(2022, 6, 8)
+
+    def test_a_disputed_primary_occurrence_still_blocks(self) -> None:
+        """Unchanged, and it has to be: the same check, on the thing being
+        measured, is the conflict protection."""
+        claim = self.split_claim()
+        claim["events"][0]["evidence_source_ids"] = ["source_1", "source_4"]
+        concept, _ = resolve(
+            "Ethereum Merge", research=self.SPLIT_SEARCH, extraction=claim
+        )
+        assert concept.status is ResolutionStatus.CONFLICTING
+        assert not concept.is_runnable
+        assert concept.blocking_ambiguities
+
+
+class TestNoEventSpecificLogic:
+    """The rule is about consequence, not about any particular event.
+
+    Enforced rather than asserted in prose: no name of any concept the resolver
+    has been tested against may appear in executable code. Docstrings and
+    prompts are exempt -- worked examples are how the reasoning gets explained,
+    and a prompt is text for a model, not a branch.
+    """
+
+    #: Distinctive names only. "merge" is a verb in this codebase and "paris"
+    #: is a city; a check that flagged those would be measuring English rather
+    #: than event-specific logic.
+    NAMES = (
+        "ethereum", "sepolia", "goerli", "ropsten", "bellatrix",
+        "ftx", "svb", "midterm", "cpi", "fomc",
+    )
+
+    MODULES = (
+        "src/backtool/ai/event_resolver.py",
+        "src/backtool/ai/evidence.py",
+        "src/backtool/events/resolution.py",
+    )
+
+    def test_no_concept_name_appears_in_executable_code(self) -> None:
+        import ast
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[2]
+        offenders: list[str] = []
+        for relative in self.MODULES:
+            tree = ast.parse((root / relative).read_text(encoding="utf-8"))
+            docstrings = {
+                id(node.body[0].value)
+                for node in ast.walk(tree)
+                if isinstance(
+                    node, ast.Module | ast.ClassDef | ast.FunctionDef
+                )
+                and node.body
+                and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+                and isinstance(node.body[0].value.value, str)
+            }
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Constant):
+                    continue
+                if not isinstance(node.value, str) or id(node) in docstrings:
+                    continue
+                # Prompts are text handed to a model, not control flow. They
+                # are long; nothing else in these modules comes close.
+                if len(node.value) > 400:
+                    continue
+                lowered = node.value.lower()
+                offenders.extend(
+                    f"{relative}:{node.lineno} {name!r}"
+                    for name in self.NAMES
+                    if name in lowered
+                )
+        assert offenders == []
+
+    def test_severity_is_decided_without_naming_an_event(self) -> None:
+        """The same question text, attributed two ways, lands two ways -- which
+        is only possible because the text is not what is being read."""
+        text = "Is the date of this occurrence right?"
+        blocking = merge_story_claim(
+            ambiguities=[question(text, affects="Ethereum mainnet Merge")]
+        )
+        informational = merge_story_claim(
+            ambiguities=[question(text, affects="Ropsten testnet merge")]
+        )
+        first, _ = resolve(
+            "Ethereum Merge", research=MERGE_STORY_SEARCH, extraction=blocking
+        )
+        second, _ = resolve(
+            "Ethereum Merge", research=MERGE_STORY_SEARCH, extraction=informational
+        )
+        assert not first.is_runnable
+        assert second.is_runnable
+
+
+class TestSeverityInARecurringSet:
+    """Many primary occurrences, one of them uncertain.
+
+    A recurring concept has no single event to protect, so "does it change the
+    primary" has to mean "does it change an occurrence that will be measured".
+    Every primary occurrence enters the study, so a question about any one of
+    them blocks -- and a question about something not in the set does not.
+    """
+
+    def test_a_question_about_one_occurrence_blocks_the_set(self) -> None:
+        claim = midterm_claim(
+            ambiguities=[
+                question(
+                    "Was the 2018 election day the 6th or the 7th of November?",
+                    affects="2018 United States midterm elections",
+                )
+            ]
+        )
+        concept, _ = resolve(extraction=claim)
+        assert len(concept.primary_events) == 2
+        assert not concept.is_runnable
+        assert len(concept.blocking_ambiguities) == 1
+
+    def test_a_question_about_an_occurrence_outside_the_set_does_not(self) -> None:
+        """The set resolved to two elections. A question about a year that is
+        not in it cannot change either of them."""
+        claim = midterm_claim(
+            ambiguities=[
+                question(
+                    "Should the 2014 cycle be included?",
+                    affects="2014 United States midterm elections",
+                )
+            ]
+        )
+        concept, _ = resolve(extraction=claim)
+        assert concept.is_runnable
+        assert len(concept.informational_ambiguities) == 1
+
+    def test_a_question_about_the_set_s_membership_blocks(self) -> None:
+        """Which occurrences belong is the one thing a reader must settle, and
+        it attributes to no single occurrence -- so the model's own flag is
+        what carries it."""
+        claim = midterm_claim(
+            ambiguities=[
+                question(
+                    "Should special elections count as midterms?", blocks=True
+                )
+            ]
+        )
+        concept, _ = resolve(extraction=claim)
+        assert not concept.is_runnable
+
+    def test_a_clean_recurring_resolution_is_still_runnable(self) -> None:
+        concept, _ = resolve()
+        assert concept.ambiguities == ()
+        assert concept.is_runnable
+
+
 class TestStructuralBoundary:
     """Stage B cannot search, and has no field for an instruction."""
 
@@ -1448,8 +1982,20 @@ class TestBankingCrisisDemo:
         "events": [],
         "sources": [],
         "ambiguities": [
-            "Which banking crisis: the 2023 US regional bank failures, or 2008?",
-            "A crisis is a period rather than an announcement -- which dates count?",
+            {
+                "question": "Which banking crisis: the 2023 US regional bank "
+                "failures, or 2008?",
+                "affects_event": "",
+                "blocks_research": True,
+                "candidate_times": [],
+            },
+            {
+                "question": "A crisis is a period rather than an announcement "
+                "-- which dates count?",
+                "affects_event": "",
+                "blocks_research": True,
+                "candidate_times": [],
+            },
         ],
         "missing_information": ["No single announcement instant exists for a period."],
         "notes": "The phrase matches several distinct episodes.",

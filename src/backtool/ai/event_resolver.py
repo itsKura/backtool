@@ -38,6 +38,7 @@ import json
 import logging
 import os
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -51,14 +52,17 @@ from backtool.ai.evidence import (
     supports_time,
     unused_contradictions,
 )
-from backtool.core.time import UTC
+from backtool.core.time import UTC, LocalTimeError, floor_to_interval, local_to_utc
 from backtool.events.models import SourceAuthority, SourceRef
 from backtool.events.resolution import (
+    FINEST_MEASURABLE_SPAN,
     Ambiguity,
+    AmbiguitySeverity,
     CandidateEvent,
     EventRole,
     ResolutionStatus,
     ResolvedEventConcept,
+    resolves_to_one_candle,
 )
 
 logger = logging.getLogger(__name__)
@@ -176,6 +180,60 @@ class EventClaim(BaseModel):
     )
 
 
+class AmbiguityClaim(BaseModel):
+    """An open question, with what it would change if answered.
+
+    The consequence is asked for separately from the question because that is
+    what decides whether a study waits. A model asked only for "ambiguities"
+    reports everything it noticed at one weight, and every resolution then
+    arrives unrunnable over a disagreement about something nobody is measuring.
+
+    What the model supplies is attribution, not a verdict: which occurrence
+    moves, whether a reader has to answer, and which instants are in dispute.
+    Whether that blocks is decided in Python, against the resolution's own
+    events and the candle grid the engine measures on.
+
+    Note what is deliberately absent: any arithmetic. The model names the
+    candidate times and nothing more. Working out how far apart they are, and
+    whether that difference is one the engine could act on, is a correctness
+    question, and a correctness question answered by a model is a guess with a
+    number attached.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    question: str = Field(
+        description="The question a reader would have to answer, specifically"
+    )
+    affects_event: str = Field(
+        description=(
+            "The label of the occurrence whose identity, date or time would "
+            "change if this were answered, copied exactly from events. Empty "
+            "when answering it changes none of them -- for example a "
+            "disagreement about a milestone you did not report, or about a "
+            "detail that leaves every date as it stands."
+        )
+    )
+    blocks_research: bool = Field(
+        description=(
+            "True when a reader must answer this before the concept can be "
+            "measured at all, because until they do it is not settled which "
+            "event is being studied."
+        )
+    )
+    candidate_times: list[str] = Field(
+        description=(
+            "Only for a question about which instant an occurrence happened "
+            "at: every candidate time of day, as HH:MM or HH:MM:SS, in the "
+            "occurrence's own timezone, exactly as the sources state them -- "
+            "for example ['06:42:42', '06:42:59']. Empty for every other kind "
+            "of question, including any disagreement about the calendar day. "
+            "Report the times; do not work out what the difference between "
+            "them means."
+        )
+    )
+
+
 class ResolutionClaim(BaseModel):
     """Stage B's structured reading of stage A's evidence.
 
@@ -209,10 +267,10 @@ class ResolutionClaim(BaseModel):
             "source whose excerpt states a date, each rated"
         )
     )
-    ambiguities: list[str] = Field(
+    ambiguities: list[AmbiguityClaim] = Field(
         description=(
-            "Questions a reader must answer before this can be measured, each "
-            "one specific. Empty when the concept is settled."
+            "Open questions, each one specific, each with what answering it "
+            "would change. Empty when the concept is settled."
         )
     )
     missing_information: list[str] = Field(
@@ -368,13 +426,15 @@ def _build(
 
     candidates = _deduplicate([candidate for candidate, _ in built])
     primary = [candidate for candidate in candidates if candidate.is_primary]
-    status = _status(claim.status, primary, disputes)
+    # Only a disagreement about something being measured can make the concept
+    # conflicting. A disputed related milestone is reported, not escalated.
+    status = _status(
+        claim.status, primary, [item for item in disputes if item[0].is_primary]
+    )
 
-    ambiguities = [
-        Ambiguity(question=question)
-        for question in claim.ambiguities
-        if question.strip()
-    ]
+    ambiguities = _reader_questions(
+        claim.ambiguities, {candidate.label: candidate for candidate in primary}
+    )
     ambiguities.extend(_dispute_questions(disputes))
 
     missing = [item for item in claim.missing_information if item.strip()]
@@ -594,19 +654,21 @@ def _disputes(
     associated: dict[str, list[EvidenceRecord]],
     accounted: set[dt.date],
 ) -> list[tuple[CandidateEvent, EvidenceRecord]]:
-    """Sources that dispute the date of an occurrence being measured.
+    """Sources that dispute the date of an occurrence.
 
-    Scoped to the occurrence, which is the whole point. Only primary
-    occurrences are checked, because a related milestone is context and will
-    not anchor anything; and each is checked against the sources that bear on
-    *it* -- the ones it cites, plus the ones the extraction says give a date for
-    it. A page that merely turned up in the same search is not a rival claim,
-    however much of the concept's vocabulary it happens to contain.
+    Scoped to the occurrence, which is the whole point: each is checked against
+    the sources that bear on *it* -- the ones it cites, plus the ones the
+    extraction says give a date for it. A page that merely turned up in the
+    same search is not a rival claim, however much of the concept's vocabulary
+    it happens to contain.
+
+    Every occurrence is checked, related ones included, because a disagreement
+    about a milestone is still worth telling a reader. What differs is the
+    consequence: the caller escalates a dispute over something being measured
+    and reports one over context.
     """
     found: list[tuple[CandidateEvent, EvidenceRecord]] = []
     for candidate, cited in built:
-        if not candidate.is_primary:
-            continue
         bearing = {record.source_id: record for record in cited}
         for record in associated.get(candidate.label, ()):
             bearing.setdefault(record.source_id, record)
@@ -615,6 +677,126 @@ def _disputes(
         ):
             found.append((candidate, record))
     return found
+
+
+def _reader_questions(
+    raw: list[AmbiguityClaim], measured: dict[str, CandidateEvent]
+) -> list[Ambiguity]:
+    """The model's open questions, each weighed against what it would change.
+
+    Two rules, and neither is about any particular kind of event:
+
+    * A question that would move an occurrence being measured blocks. So does
+      one the model says a reader must answer before the concept is settled at
+      all.
+    * Anything else is informational: a disagreement about a milestone nobody
+      is measuring, or a detail that leaves every date standing.
+
+    Then one release valve, and only for questions caught by the first rule: if
+    the question is about *which instant* an occurrence happened at, and the
+    candidate instants all price from the same candle, the engine could not act
+    on the answer however it came out. See :func:`_one_candle_apart`.
+
+    The model attributes, Python decides. An attribution naming an occurrence
+    being measured blocks whatever the model thought, and the one thing that
+    releases a block is a fact about the candle grid rather than a judgement
+    about the question.
+    """
+    questions: list[Ambiguity] = []
+    for item in raw:
+        question = item.question.strip()
+        if not question:
+            continue
+
+        occurrence = measured.get(item.affects_event.strip())
+        if occurrence is None and not item.blocks_research:
+            questions.append(
+                Ambiguity(
+                    question=question, severity=AmbiguitySeverity.INFORMATIONAL
+                )
+            )
+            continue
+
+        # It would block. The only thing that releases it is the engine being
+        # unable to tell the candidates apart in the first place.
+        indistinguishable = _one_candle_apart(item.candidate_times, occurrence)
+        if indistinguishable is None:
+            questions.append(
+                Ambiguity(question=question, severity=AmbiguitySeverity.BLOCKING)
+            )
+            continue
+
+        span, boundary = indistinguishable
+        questions.append(
+            Ambiguity(
+                question=question,
+                severity=AmbiguitySeverity.INFORMATIONAL,
+                timing_slack=span,
+                why_it_matters=(
+                    "The candidate instants are "
+                    f"{span.total_seconds():.0f} seconds apart and both price "
+                    f"from the candle at {boundary:%Y-%m-%d %H:%M} UTC, the "
+                    "finest the engine has data for, so no study it can run "
+                    "would measure them differently."
+                ),
+            )
+        )
+    return questions
+
+
+def _one_candle_apart(
+    times: list[str], occurrence: CandidateEvent | None
+) -> tuple[dt.timedelta, dt.datetime] | None:
+    """Whether the disputed instants are one the engine cannot distinguish.
+
+    Everything here is computed, not read: the times are parsed, combined with
+    the occurrence's own date and timezone into real instants, and bucketed with
+    the same helper the data layer uses. The model supplies candidates and no
+    arithmetic, because "ten seconds apart" and "the same candle" are different
+    claims -- 12:04:55 and 12:05:05 are the former and not the latter.
+
+    Refuses rather than guesses. No occurrence to date the times against, fewer
+    than two distinct readable candidates, a time that will not parse, a
+    wall-clock time that does not exist in the zone: each returns ``None``, and
+    ``None`` means the question keeps whatever severity it had.
+
+    Returns:
+        The span between the outermost candidates and the shared candle
+        boundary, or ``None`` if they are distinguishable or uncheckable.
+    """
+    if occurrence is None:
+        return None
+
+    parsed: set[dt.time] = set()
+    for raw in times:
+        try:
+            parsed.add(dt.time.fromisoformat(raw.strip()))
+        except ValueError:
+            logger.warning("Unreadable candidate time %r", raw)
+            return None
+    if len(parsed) < 2:
+        return None
+
+    try:
+        zone = ZoneInfo(occurrence.timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+
+    instants: list[dt.datetime] = []
+    for value in sorted(parsed):
+        try:
+            instants.append(local_to_utc(occurrence.local_date, value, zone))
+        except LocalTimeError:
+            return None
+
+    if not resolves_to_one_candle(instants):
+        return None
+    # The boundary, not the earliest candidate: what a reader needs to see is
+    # which candle both instants priced from.
+    return (
+        max(instants) - min(instants),
+        floor_to_interval(min(instants), FINEST_MEASURABLE_SPAN),
+    )
 
 
 def _dispute_questions(
@@ -626,13 +808,18 @@ def _dispute_questions(
     on; "this page says the 14th, these say the 15th" is a question they can
     answer in one line.
 
+    Blocking for an occurrence being measured, informational for a milestone
+    that is only context: sources disagreeing about when a rehearsal happened
+    is worth reporting and cannot change what an anchor on the concept
+    measures.
     """
-    grouped: dict[tuple[str, dt.date], list[EvidenceRecord]] = {}
+    grouped: dict[tuple[str, dt.date, bool], list[EvidenceRecord]] = {}
     for candidate, record in disputes:
-        grouped.setdefault((candidate.label, candidate.local_date), []).append(record)
+        key = (candidate.label, candidate.local_date, candidate.is_primary)
+        grouped.setdefault(key, []).append(record)
 
     questions: list[Ambiguity] = []
-    for (label, claimed), records in grouped.items():
+    for (label, claimed, is_primary), records in grouped.items():
         said = "; ".join(
             f"{record.url} states "
             + ", ".join(sorted(d.isoformat() for d in record.dates()))
@@ -644,10 +831,19 @@ def _dispute_questions(
                     f"{label} is dated {claimed.isoformat()} here, but {said}. "
                     "Which is right?"
                 ),
+                severity=(
+                    AmbiguitySeverity.BLOCKING
+                    if is_primary
+                    else AmbiguitySeverity.INFORMATIONAL
+                ),
                 why_it_matters=(
                     "Choosing between sources that disagree about the same "
                     "occurrence decides the answer, so it is not a choice this "
                     "step makes."
+                    if is_primary
+                    else "This milestone is context rather than something being "
+                    "measured, so the disagreement is reported and does not "
+                    "hold up the study."
                 ),
             )
         )
@@ -924,6 +1120,27 @@ around it `related`.
 If you are unsure, answer `related`. A primary occurrence becomes a \
 measurement anchor, and a wrong one answers a question nobody asked.
 
+## Open questions
+
+Report what a reader would have to decide, and for each one say what answering \
+it would change. That second part is what decides whether a study waits for \
+them, so it matters as much as the question.
+
+* `affects_event` -- the occurrence whose identity, date or time would move. \
+Copy the label exactly. Leave it empty when answering the question leaves \
+every occurrence you reported exactly as it stands: a disagreement about a \
+milestone you did not report, a definitional aside, a detail about something \
+adjacent.
+* `blocks_research` -- true when the concept is not settled until a reader \
+answers. "Which crisis do you mean" is such a question; "sources differ about \
+a rehearsal three months earlier" is not.
+* `candidate_times` -- only for a question about which instant an occurrence \
+happened at, and then every candidate time of day as HH:MM or HH:MM:SS in that \
+occurrence's timezone, exactly as the sources give them. Empty for everything \
+else, including any disagreement about the calendar day. Report the times \
+themselves; what the difference between them amounts to is not yours to work \
+out.
+
 ## Status
 
 * `resolved` -- the dates are established and the sources agree.
@@ -972,6 +1189,7 @@ __all__ = [
     "RESEARCH_SYSTEM",
     "RESOLVER_MODEL_ENV",
     "SEARCH_TOOL_TYPE",
+    "AmbiguityClaim",
     "EventClaim",
     "ResolutionClaim",
     "SourceAssessment",

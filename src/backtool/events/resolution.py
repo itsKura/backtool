@@ -38,12 +38,13 @@ import datetime as dt
 import hashlib
 import json
 import re
+from collections.abc import Iterable
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
-from backtool.core.time import UTC
-from backtool.core.types import EventType
+from backtool.core.time import UTC, floor_to_interval
+from backtool.core.types import EventType, Interval
 from backtool.events.models import MarketEvent, SourceRef, TemporalPrecision
 
 #: Prefix for the identity of a set that was resolved rather than compiled in.
@@ -54,6 +55,44 @@ DYNAMIC_PREFIX = "dynamic"
 #: How many characters of the digest to keep. Long enough that two genuinely
 #: different event sets will not collide; short enough to print in a report.
 FINGERPRINT_LENGTH = 16
+
+#: The finest candle the engine has data for.
+#:
+#: Derived from :class:`~backtool.core.types.Interval` rather than written down,
+#: so it follows the data the engine actually has. Add a finer interval to that
+#: enum and every judgement built on this tightens by itself.
+FINEST_MEASURABLE_SPAN = min(interval.duration for interval in Interval)
+
+
+def resolves_to_one_candle(
+    instants: Iterable[dt.datetime], *, span: dt.timedelta = FINEST_MEASURABLE_SPAN
+) -> bool:
+    """Whether every instant is priced from the same candle.
+
+    The question "could the engine tell these apart" is about buckets, not
+    about duration, and the difference is not academic: 12:04:55 and 12:05:05
+    are ten seconds apart and anchor to different five-minute candles, while
+    12:01 and 12:04 are three minutes apart and anchor to the same one. A rule
+    comparing elapsed time to the candle length gets both of those wrong.
+
+    Uses :func:`~backtool.core.time.floor_to_interval`, which is what the data
+    layer uses to find the last closed candle boundary, so this agrees with how
+    a study actually resolves a price rather than approximating it. One
+    implementation, one answer.
+
+    Args:
+        instants: Timezone-aware instants. Fewer than two is not a comparison
+            and trivially shares a bucket; a caller deciding whether two
+            candidates differ must check that it has two.
+        span: Candle length to bucket by. Defaults to the finest the engine
+            has, which is the only span at which a difference could ever
+            matter -- anything coarser buckets more things together.
+
+    Returns:
+        ``True`` when all of them fall in one bucket.
+    """
+    return len({floor_to_interval(instant, span) for instant in instants}) == 1
+
 
 class ResolutionStatus(StrEnum):
     """How far a resolution got.
@@ -110,6 +149,27 @@ class EventRole(StrEnum):
     RELATED = "related"
 
 
+class AmbiguitySeverity(StrEnum):
+    """Whether an open question has to be answered before measuring.
+
+    Resolving a public concept raises questions of very different weight, and
+    treating them alike makes the resolver useless. "Which banking crisis?"
+    decides what gets measured. "Two sources disagree about a testnet rehearsal
+    three months earlier" does not, and blocking a study over it wastes the
+    reader's time on a question whose answer cannot change the result.
+
+    The distinction is about consequence, not confidence. An open question
+    blocks when answering it could change which occurrence is measured, or when
+    it is measured; otherwise it is something the reader should be told and not
+    something they must adjudicate first.
+    """
+
+    #: Answering it could change what gets measured. The study waits.
+    BLOCKING = "blocking"
+    #: Worth disclosing, cannot change the measurement. The study proceeds.
+    INFORMATIONAL = "informational"
+
+
 class Ambiguity(BaseModel):
     """Something the question leaves open that changes which events qualify.
 
@@ -122,6 +182,20 @@ class Ambiguity(BaseModel):
     question: str
     options: tuple[str, ...] = ()
     why_it_matters: str = ""
+    #: Defaults to blocking. An unlabelled question is one nobody has decided
+    #: the consequence of, and the safe reading of that is "ask the reader":
+    #: a spurious question costs one answer, a skipped one costs a wrong study.
+    severity: AmbiguitySeverity = AmbiguitySeverity.BLOCKING
+    #: How far apart the candidate instants were, when the question was about
+    #: which instant an occurrence happened at. Computed from the candidates,
+    #: never supplied: it is reported so a reader can see the size of what was
+    #: set aside, and it is not what decided the severity -- see
+    #: :func:`resolves_to_one_candle`.
+    timing_slack: dt.timedelta | None = None
+
+    @property
+    def is_blocking(self) -> bool:
+        return self.severity is AmbiguitySeverity.BLOCKING
 
 
 class CandidateEvent(BaseModel):
@@ -254,12 +328,39 @@ class ResolvedEventConcept(BaseModel):
         return tuple(c for c in self.candidate_events if not c.is_primary)
 
     @property
+    def blocking_ambiguities(self) -> tuple[Ambiguity, ...]:
+        """Questions a reader must answer before anything can be measured."""
+        return tuple(item for item in self.ambiguities if item.is_blocking)
+
+    @property
+    def informational_ambiguities(self) -> tuple[Ambiguity, ...]:
+        """Questions to disclose, which cannot change the measurement.
+
+        Kept on the concept rather than folded into the notes, so a report can
+        show them as the open questions they are without a reader having to
+        answer them first.
+        """
+        return tuple(item for item in self.ambiguities if not item.is_blocking)
+
+    @property
     def is_runnable(self) -> bool:
-        """Whether this can be measured without asking the reader anything."""
+        """Whether this can be measured without asking the reader anything.
+
+        Three conditions, and no more: the concept resolved, at least one
+        occurrence of it survived validation, and nothing is left open that
+        could change what gets measured. Informational questions do not appear
+        here -- they are disclosed alongside the result, which is what they are
+        for.
+
+        Note what this does *not* cover: a date-only occurrence still needs an
+        anchor, and :func:`compile_event_set` refuses without one. That is a
+        decision the caller makes rather than a question the reader answers, so
+        it belongs there and not in this property.
+        """
         return (
             self.status.is_usable
             and bool(self.primary_events)
-            and not self.ambiguities
+            and not self.blocking_ambiguities
         )
 
 
@@ -450,6 +551,10 @@ def compile_event_set(
     milestones a resolution turns up are real and dated, and measuring them
     would answer a question nobody asked.
 
+    Informational questions do not stop compilation. They travel with the
+    resolution to be disclosed beside the result, because a disagreement about
+    a related milestone cannot change what an anchor on the concept measures.
+
     Args:
         concept: A resolution. Must be runnable; an ambiguous or conflicting
             one is a question for the reader, not an input to a measurement.
@@ -482,10 +587,11 @@ def compile_event_set(
                 else "."
             )
         )
-    if concept.ambiguities:
+    blocking = concept.blocking_ambiguities
+    if blocking:
         raise ValueError(
             f"{concept.canonical_name!r} still has open questions: "
-            + "; ".join(item.question for item in concept.ambiguities)
+            + "; ".join(item.question for item in blocking)
         )
 
     undated = [c.label for c in concept.primary_events if c.is_date_only]
@@ -562,8 +668,10 @@ def _all_sources(concept: ResolvedEventConcept) -> list[SourceRef]:
 
 __all__ = [
     "DYNAMIC_PREFIX",
+    "FINEST_MEASURABLE_SPAN",
     "FINGERPRINT_LENGTH",
     "Ambiguity",
+    "AmbiguitySeverity",
     "AnchorPolicy",
     "CandidateEvent",
     "DayAnchor",
@@ -575,5 +683,6 @@ __all__ = [
     "compile_event_set",
     "curated_set_key",
     "fingerprint",
+    "resolves_to_one_candle",
     "slugify",
 ]
