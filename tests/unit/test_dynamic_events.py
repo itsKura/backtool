@@ -41,6 +41,7 @@ from backtool.events.resolution import (
     CandidateEvent,
     DayAnchor,
     ResolutionStatus,
+    ResolvedEventConcept,
     compile_event_set,
     curated_set_key,
     fingerprint,
@@ -50,7 +51,13 @@ from backtool.research.runner import run_study
 from backtool.research.spec import ResearchSpec
 from backtool.research.vocabulary import CONDITION_FIELDS
 from backtool.research.windows import REACTION_WINDOWS
-from fixtures.dynamic_events import eth_merge, midterms, unresolvable
+from fixtures.dynamic_events import (
+    FEC,
+    collapse,
+    eth_merge,
+    midterms,
+    unresolvable,
+)
 
 CUTOFF = dt.datetime(2026, 10, 1, tzinfo=dt.UTC)
 
@@ -257,6 +264,102 @@ class TestSetIdentity:
         assert slugify("???") == "unnamed"
 
 
+class TestOnlyPrimaryOccurrencesAreMeasured:
+    """The concept, separated from its story.
+
+    Resolving a concept turns up more dates than the concept has: ask about a
+    collapse and the sources also date the rescue announcement, the withdrawal
+    freeze and the resignation. Each is real, dated and cited, and measuring
+    all four would answer a question nobody asked -- so only the occurrences of
+    the concept itself become study anchors.
+    """
+
+    def test_the_concept_and_its_milestones_are_distinguished(self) -> None:
+        concept = collapse()
+        assert [c.label for c in concept.primary_events] == [
+            "Example Exchange files for bankruptcy protection"
+        ]
+        assert len(concept.related_events) == 3
+
+    def test_only_the_primary_occurrence_compiles(self) -> None:
+        compiled = compile_event_set(
+            collapse(), anchor=DayAnchor(policy=AnchorPolicy.DAY_END)
+        )
+        assert len(compiled.events) == 1
+        assert compiled.events[0].local_date == dt.date(2022, 11, 11)
+
+    def test_a_milestone_on_the_same_day_is_still_not_measured(self) -> None:
+        """The resignation shares the filing's date. Sharing a day does not
+        make it the event, and the calendar must not acquire a duplicate."""
+        compiled = compile_event_set(
+            collapse(), anchor=DayAnchor(policy=AnchorPolicy.DAY_END)
+        )
+        assert len(compiled.calendar) == 1
+
+    def test_the_milestones_stay_in_the_provenance(self) -> None:
+        """Excluded from measurement, not from the record. A reader has to be
+        able to see what the resolution rests on."""
+        compiled = compile_event_set(
+            collapse(), anchor=DayAnchor(policy=AnchorPolicy.DAY_END)
+        )
+        urls = {source.url for source in compiled.sources}
+        assert "https://news.example/exchange-collapse" in urls
+        assert collapse().related_events[0].sources[0].url in urls
+
+    def test_a_milestone_does_not_move_the_fingerprint(self) -> None:
+        """Identity is what gets measured. Learning that a rescue was announced
+        three days earlier does not make it a different study."""
+        bare = collapse()
+        without = ResolvedEventConcept(
+            query=bare.query,
+            canonical_name=bare.canonical_name,
+            status=bare.status,
+            candidate_events=bare.primary_events,
+            sources=bare.sources,
+            retrieved_at=bare.retrieved_at,
+        )
+        anchor = DayAnchor(policy=AnchorPolicy.DAY_END)
+        assert (
+            compile_event_set(bare, anchor=anchor).fingerprint
+            == compile_event_set(without, anchor=anchor).fingerprint
+        )
+
+    def test_a_resolution_of_nothing_but_context_does_not_compile(self) -> None:
+        """Three dated milestones and no event. That is not a measurable
+        answer, and the refusal says which."""
+        bare = collapse()
+        context_only = ResolvedEventConcept(
+            query=bare.query,
+            canonical_name=bare.canonical_name,
+            status=bare.status,
+            candidate_events=bare.related_events,
+            retrieved_at=bare.retrieved_at,
+        )
+        assert not context_only.is_runnable
+        with pytest.raises(ValueError, match="related milestone"):
+            compile_event_set(context_only, anchor=DayAnchor())
+
+    def test_a_recurring_concept_has_many_primary_occurrences(self) -> None:
+        """No flag distinguishes one-time from recurring: it falls out of how
+        many occurrences the sources establish."""
+        concept = midterms()
+        assert len(concept.primary_events) == 2
+        assert concept.related_events == ()
+
+    def test_an_anchor_is_judged_on_the_primary_occurrences(self) -> None:
+        """The collapse filing is date-only, so it needs an anchor -- and the
+        requirement must come from what is measured, not from a milestone."""
+        with pytest.raises(ValueError, match="needs a decision"):
+            compile_event_set(collapse())
+
+    def test_a_candidate_is_primary_unless_it_says_otherwise(self) -> None:
+        """A caller building the occurrences themselves says nothing."""
+        event = CandidateEvent(
+            label="x", local_date=dt.date(2022, 1, 1), sources=(FEC,)
+        )
+        assert event.is_primary
+
+
 class TestCompilationRefusesWhatCannotBeMeasured:
     """An open question is for the reader, not for the engine."""
 
@@ -265,7 +368,7 @@ class TestCompilationRefusesWhatCannotBeMeasured:
             compile_event_set(unresolvable())
 
     def test_a_concept_with_no_dates_does_not_compile(self) -> None:
-        with pytest.raises(ValueError, match="no dates"):
+        with pytest.raises(ValueError, match="no occurrence of the concept"):
             compile_event_set(midterms(dates=()))
 
     def test_a_resolved_concept_with_open_questions_does_not_compile(self) -> None:

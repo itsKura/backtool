@@ -55,7 +55,6 @@ DYNAMIC_PREFIX = "dynamic"
 #: different event sets will not collide; short enough to print in a report.
 FINGERPRINT_LENGTH = 16
 
-
 class ResolutionStatus(StrEnum):
     """How far a resolution got.
 
@@ -80,6 +79,35 @@ class ResolutionStatus(StrEnum):
     @property
     def is_usable(self) -> bool:
         return self is ResolutionStatus.RESOLVED
+
+
+class EventRole(StrEnum):
+    """Whether an occurrence *is* the concept, or merely belongs to its story.
+
+    Resolving a public concept turns up more dates than the concept has. Ask
+    about the Ethereum Merge and the sources also date Bellatrix, three testnet
+    rehearsals and the Beacon Chain genesis; ask about a bank failure and they
+    date the deposit run, the regulator's closure and the receivership. Each of
+    those is real, dated and worth showing -- and none of them is the thing the
+    reader asked about.
+
+    Measuring them all would answer a question nobody asked, so the distinction
+    is carried in the schema rather than left to whoever reads the output.
+    :func:`compile_event_set` measures from :attr:`PRIMARY` occurrences only,
+    while :attr:`RELATED` ones stay attached to the resolution as the context
+    and provenance that explain it.
+
+    Nothing here is domain-specific, because the distinction is not: it is the
+    difference between an occurrence of the concept and a milestone around it,
+    and that holds for an election, a protocol upgrade and a collapse alike. A
+    recurring concept simply has many primary occurrences.
+    """
+
+    #: An occurrence of the concept itself. These become measurable events.
+    PRIMARY = "primary"
+    #: A milestone that led up to, followed from, or forms part of the story.
+    #: Kept for explanation; never a study anchor unless asked for by name.
+    RELATED = "related"
 
 
 class Ambiguity(BaseModel):
@@ -115,6 +143,10 @@ class CandidateEvent(BaseModel):
     #: and cross-checked against it either way, so a resolver cannot claim a
     #: precision it did not supply a time for.
     precision: TemporalPrecision | None = None
+    #: Whether this is an occurrence of the concept or a milestone around it.
+    #: Defaults to ``PRIMARY`` so a caller that knows it is building the
+    #: occurrences themselves -- a pasted list, a fixture -- says nothing.
+    role: EventRole = EventRole.PRIMARY
     #: Where this specific date came from. Required: a date with no source is
     #: exactly what this module exists to prevent reaching a study.
     sources: tuple[SourceRef, ...]
@@ -162,6 +194,10 @@ class CandidateEvent(BaseModel):
     def is_date_only(self) -> bool:
         return self.precision is TemporalPrecision.DATE_ONLY
 
+    @property
+    def is_primary(self) -> bool:
+        return self.role is EventRole.PRIMARY
+
 
 class ResolvedEventConcept(BaseModel):
     """What was asked for, what was found, and what is still open.
@@ -198,11 +234,31 @@ class ResolvedEventConcept(BaseModel):
         return f"{DYNAMIC_PREFIX}:{self.slug}"
 
     @property
+    def primary_events(self) -> tuple[CandidateEvent, ...]:
+        """The occurrences of the concept itself -- what a study measures.
+
+        One for a one-time concept, many for a recurring one, and that
+        difference needs no flag: it falls out of how many occurrences the
+        sources establish.
+        """
+        return tuple(c for c in self.candidate_events if c.is_primary)
+
+    @property
+    def related_events(self) -> tuple[CandidateEvent, ...]:
+        """Dated milestones around the concept.
+
+        Kept, cited and reportable, but never measured by default. They are
+        here so a reader can see what the resolution rests on and ask for one
+        by name, not so a study silently acquires six extra anchors.
+        """
+        return tuple(c for c in self.candidate_events if not c.is_primary)
+
+    @property
     def is_runnable(self) -> bool:
         """Whether this can be measured without asking the reader anything."""
         return (
             self.status.is_usable
-            and bool(self.candidate_events)
+            and bool(self.primary_events)
             and not self.ambiguities
         )
 
@@ -390,12 +446,16 @@ def compile_event_set(
     default, compilation **refuses** until the caller states an anchor, and
     then records the anchor on every event it applied to.
 
+    Only :attr:`EventRole.PRIMARY` occurrences are compiled. The related
+    milestones a resolution turns up are real and dated, and measuring them
+    would answer a question nobody asked.
+
     Args:
         concept: A resolution. Must be runnable; an ambiguous or conflicting
             one is a question for the reader, not an input to a measurement.
         anchor: How to turn a calendar day into an instant. Required if any
-            candidate is date-only, ignored otherwise -- a sourced timestamp is
-            never overridden.
+            primary occurrence is date-only, ignored otherwise -- a sourced
+            timestamp is never overridden.
 
     Returns:
         A :class:`DynamicEventSet` whose ``calendar`` goes straight into
@@ -410,10 +470,17 @@ def compile_event_set(
             f"{concept.canonical_name!r} resolved as {concept.status.value}, "
             "which is something to tell the reader rather than to measure."
         )
-    if not concept.candidate_events:
+    if not concept.primary_events:
+        related = len(concept.related_events)
         raise ValueError(
-            f"{concept.canonical_name!r} resolved with no dates, so there is "
-            "nothing to measure."
+            f"{concept.canonical_name!r} resolved with no occurrence of the "
+            "concept itself, so there is nothing to measure"
+            + (
+                f" -- only {related} related milestone(s), which are context "
+                "rather than study anchors."
+                if related
+                else "."
+            )
         )
     if concept.ambiguities:
         raise ValueError(
@@ -421,7 +488,7 @@ def compile_event_set(
             + "; ".join(item.question for item in concept.ambiguities)
         )
 
-    undated = [c.label for c in concept.candidate_events if c.is_date_only]
+    undated = [c.label for c in concept.primary_events if c.is_date_only]
     if undated and anchor is None:
         raise ValueError(
             "These were established only to a calendar date, so measuring them "
@@ -432,9 +499,11 @@ def compile_event_set(
 
     slug = concept.slug
     key = concept.event_set_key
+    # Primary occurrences only. A related milestone keeps its place in the
+    # resolution's provenance and stays out of the calendar the engine measures.
     events = tuple(
         _compile_one(slug, key, candidate, anchor)
-        for candidate in concept.candidate_events
+        for candidate in concept.primary_events
     )
 
     return DynamicEventSet(
@@ -498,6 +567,7 @@ __all__ = [
     "AnchorPolicy",
     "CandidateEvent",
     "DayAnchor",
+    "EventRole",
     "DynamicEventSet",
     "ResolutionStatus",
     "ResolvedEventConcept",

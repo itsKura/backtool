@@ -19,6 +19,7 @@ from backtool.events.models import SourceAuthority, SourceRef
 from backtool.events.resolution import (
     Ambiguity,
     CandidateEvent,
+    EventRole,
     ResolutionStatus,
     ResolvedEventConcept,
 )
@@ -119,6 +120,75 @@ def eth_merge() -> ResolvedEventConcept:
     )
 
 
+def collapse() -> ResolvedEventConcept:
+    """A one-time concept that arrives with a story around it.
+
+    Deliberately not a protocol upgrade. The distinction between an occurrence
+    of a concept and the milestones around it is not a crypto phenomenon: a
+    firm's collapse comes with a rescue announcement, a withdrawal freeze and a
+    bankruptcy filing, each real and dated, and none of them the thing a reader
+    asking "what happened after the collapse" means.
+
+    One primary occurrence, three related milestones -- which is the shape that
+    must not become four study anchors.
+    """
+    filing = SourceRef(
+        url="https://www.sec.gov/litigation/complaints/2022/example.pdf",
+        title="Commission complaint",
+        publisher="Securities and Exchange Commission",
+        authority=SourceAuthority.OFFICIAL,
+        retrieved_at=RETRIEVED,
+    )
+    press = SourceRef(
+        url="https://news.example/exchange-collapse",
+        title="Exchange collapse timeline",
+        publisher="A news agency",
+        authority=SourceAuthority.SECONDARY,
+        retrieved_at=RETRIEVED,
+    )
+    return ResolvedEventConcept(
+        query="the exchange collapse",
+        canonical_name="Example Exchange collapse",
+        status=ResolutionStatus.RESOLVED,
+        candidate_events=(
+            CandidateEvent(
+                label="Example Exchange files for bankruptcy protection",
+                local_date=dt.date(2022, 11, 11),
+                timezone="America/New_York",
+                role=EventRole.PRIMARY,
+                sources=(filing,),
+            ),
+            CandidateEvent(
+                label="Rescue announcement",
+                local_date=dt.date(2022, 11, 8),
+                timezone="America/New_York",
+                role=EventRole.RELATED,
+                sources=(press,),
+            ),
+            CandidateEvent(
+                label="Withdrawals halted",
+                local_date=dt.date(2022, 11, 9),
+                timezone="America/New_York",
+                role=EventRole.RELATED,
+                sources=(press,),
+            ),
+            CandidateEvent(
+                label="Chief executive resigns",
+                local_date=dt.date(2022, 11, 11),
+                timezone="America/New_York",
+                role=EventRole.RELATED,
+                sources=(press,),
+            ),
+        ),
+        sources=(press,),
+        resolution_notes=(
+            "The bankruptcy filing is the collapse; the announcement, the "
+            "withdrawal halt and the resignation are its milestones."
+        ),
+        retrieved_at=RETRIEVED,
+    )
+
+
 def unresolvable() -> ResolvedEventConcept:
     """Something real with no single public date -- the shape a period takes."""
     return ResolvedEventConcept(
@@ -145,4 +215,12 @@ def unresolvable() -> ResolvedEventConcept:
     )
 
 
-__all__ = ["EAC", "FEC", "RETRIEVED", "eth_merge", "midterms", "unresolvable"]
+__all__ = [
+    "EAC",
+    "FEC",
+    "RETRIEVED",
+    "collapse",
+    "eth_merge",
+    "midterms",
+    "unresolvable",
+]
