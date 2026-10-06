@@ -92,7 +92,7 @@ def _summary(
         '<div class="section-head">'
         "<h2>Historical reaction</h2>"
         f'<p class="section-sub">Last {len(study.events)} '
-        f"{escape(spec.event_type.value)} releases &middot; "
+        f"{escape(spec.event_label)} releases &middot; "
         f'<span class="mono">{escape(spec.symbol)}</span> &middot; '
         f"{escape(spec.interval.value)} candles</p>"
         "</div>"

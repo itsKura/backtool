@@ -516,11 +516,15 @@ def _context(
     """
     surprises: dict[str, str] = {}
     values = load_releases()
-    rule = SCENARIO_RULES[thesis.event_type]
-    for event in study.events:
-        verdict = rule(values.get(event.event_id))
-        if verdict is not None:
-            surprises[event.event_id] = verdict[0]
+    # `.get`, not `[]`. A dynamically resolved set has no classifier and never
+    # will -- nobody publishes a consensus for an election -- so the absence is
+    # ordinary rather than an error.
+    rule = SCENARIO_RULES.get(thesis.event_type)
+    if rule is not None:
+        for event in study.events:
+            verdict = rule(values.get(event.event_id))
+            if verdict is not None:
+                surprises[event.event_id] = verdict[0]
 
     regimes: dict[str, dict[str, str]] = {}
     readings: dict[str, dict[str, float]] = {}

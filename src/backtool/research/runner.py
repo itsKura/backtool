@@ -43,8 +43,15 @@ def run_study(
     current = ensure_utc(now) if now is not None else dt.datetime.now(tz=UTC)
     cutoff = ensure_utc(spec.as_of) if spec.as_of is not None else current
 
+    # Both filters, because a spec identifies its events by whichever it has.
+    # A curated spec carries a type; a dynamic one carries only a set key, and
+    # passing both means neither kind can select an event from the other.
     selected = select_last_n(
-        calendar, spec.event_count, before=cutoff, event_type=spec.event_type
+        calendar,
+        spec.event_count,
+        before=cutoff,
+        event_type=spec.event_type,
+        event_set_key=spec.event_set.split("@", 1)[0],
     )
     logger.info(
         "Running spec %s over %d event(s) at %s",

@@ -134,7 +134,7 @@ VISIBLE_CAVEATS = 1
 
 def render_event_header(event: MarketEvent, *, now: dt.datetime) -> str:
     """Title, timing, impact, and one line on what the release is."""
-    meta = meta_for(event.event_type)
+    meta = meta_for(event.curated_type)
     local = utc_to_local(event.timestamp_utc, NEW_YORK)
     delta = event.timestamp_utc - now
     upcoming = delta.total_seconds() > 0
@@ -220,7 +220,7 @@ def render_event_explainer(event: MarketEvent) -> str:
     roughly what CPI is; they came for the price. This is background, so it
     reads as prose rather than as a specification.
     """
-    meta = meta_for(event.event_type)
+    meta = meta_for(event.curated_type)
     watch = "".join(f"<li>{escape(item)}</li>" for item in meta.what_to_watch)
 
     return (
@@ -536,7 +536,7 @@ def render_upcoming_notice(event: MarketEvent) -> str:
     return (
         '<p class="note"><strong>This release has not happened yet.</strong> '
         "Everything below describes how "
-        f"{escape(meta_for(event.event_type).label)} releases behaved in the "
+        f"{escape(meta_for(event.curated_type).label)} releases behaved in the "
         "past. It is a record, not a forecast.</p>"
     )
 

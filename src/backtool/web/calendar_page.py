@@ -52,7 +52,7 @@ def _event_list(events: list[MarketEvent], now: dt.datetime, *, empty: str) -> s
 
 
 def _event_card(event: MarketEvent, now: dt.datetime) -> str:
-    meta = meta_for(event.event_type)
+    meta = meta_for(event.curated_type)
     local = utc_to_local(event.timestamp_utc, NEW_YORK)
     delta = event.timestamp_utc - now
     upcoming = delta.total_seconds() > 0

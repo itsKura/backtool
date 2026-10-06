@@ -404,8 +404,19 @@ class FieldSpec:
     def display(self, value: str) -> str:
         return self.values.get(value, value)
 
-    def applies_to(self, event_type: EventType) -> bool:
-        return not self.event_types or event_type in self.event_types
+    def applies_to(self, event_type: EventType | None) -> bool:
+        """Whether this field can be tested against a given event set.
+
+        ``None`` means a dynamically resolved set, which belongs to no curated
+        family. An event-agnostic field -- the BTC regime conditions, which
+        describe the market rather than the event -- still applies. A field
+        tied to specific families does not: there is no CPI surprise for a
+        midterm election, and offering one would produce a cohort of zero that
+        reads like a result.
+        """
+        if not self.event_types:
+            return True
+        return event_type is not None and event_type in self.event_types
 
     @property
     def is_numeric(self) -> bool:

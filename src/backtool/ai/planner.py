@@ -77,7 +77,7 @@ def plan_study(
         "Planned %d window(s) over %d %s event(s) at %s (spec %s)",
         len(spec.windows),
         spec.event_count,
-        spec.event_type.value,
+        spec.event_label,
         spec.interval.value,
         spec.fingerprint,
     )

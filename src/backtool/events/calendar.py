@@ -127,6 +127,7 @@ def select_last_n(
     *,
     before: dt.datetime | None = None,
     event_type: EventType | None = None,
+    event_set_key: str = "",
 ) -> list[MarketEvent]:
     """Return the ``n`` most recent events that had already occurred.
 
@@ -139,7 +140,12 @@ def select_last_n(
         n: Maximum number of events to return.
         before: Cutoff instant; events at or after it are excluded. Defaults to
             the current time. Pass an explicit value to make a run reproducible.
-        event_type: Optional filter on event type.
+        event_type: Optional filter on curated event type.
+        event_set_key: Optional filter on set identity, which is what a
+            dynamically resolved set has instead of a type. Stricter than the
+            type filter and usable by both: passing it keeps a study from
+            quietly measuring events from another set that happened to be in
+            the same list.
 
     Returns:
         Up to ``n`` events, sorted ascending by announcement instant. Fewer than
@@ -156,6 +162,7 @@ def select_last_n(
         for event in events
         if event.timestamp_utc < cutoff
         and (event_type is None or event.event_type == event_type)
+        and (not event_set_key or event.event_set_key == event_set_key)
     ]
     candidates.sort(key=lambda event: event.timestamp_utc)
 

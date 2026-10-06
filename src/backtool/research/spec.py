@@ -28,7 +28,17 @@ class ResearchSpec(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     symbol: str = "BTCUSDT"
-    event_type: EventType = EventType.FOMC
+    #: The curated family being studied, or ``None`` when the events were
+    #: resolved at runtime and belong to no family.
+    event_type: EventType | None = EventType.FOMC
+    #: Which set of events this measured, and which resolution of it.
+    #: ``"curated:cpi"``, or ``"dynamic:us-midterm-elections@a1b2c3"``.
+    #:
+    #: Part of the fingerprint, and the reason a dynamic study is cacheable at
+    #: all: the slug alone would let two different resolutions of the same
+    #: question share an identity, so a study built when "midterms" meant two
+    #: dates could be served for a resolution that found three.
+    event_set: str = ""
     event_count: int = Field(default=20, ge=1, le=200)
     interval: Interval = Interval.M5
     windows: tuple[WindowSpec, ...] = DEFAULT_WINDOWS
@@ -68,6 +78,19 @@ class ResearchSpec(BaseModel):
         return max(window.end_offset for window in self.windows)
 
     @property
+    def event_label(self) -> str:
+        """What these events are called, for a heading.
+
+        The curated family's name where there is one, the resolved set's slug
+        otherwise. Exists so display code never reaches into an enum that a
+        dynamic study does not have.
+        """
+        if self.event_type is not None:
+            return self.event_type.value
+        key = self.event_set.split("@", 1)[0]
+        return key.removeprefix("dynamic:") or "events"
+
+    @property
     def fingerprint(self) -> str:
         """Short content hash identifying this exact specification.
 
@@ -95,7 +118,7 @@ class ResearchSpec(BaseModel):
 
         items = [
             ("symbol", self.symbol),
-            ("event type", self.event_type.value),
+            ("event type", self.event_type.value if self.event_type else "dynamic"),
             ("events", f"last {self.event_count}, {cutoff}"),
             ("interval", self.interval.value),
             (

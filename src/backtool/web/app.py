@@ -223,7 +223,7 @@ def _event_explain(*, event: MarketEvent, symbol: str, interval: str) -> str:
     now = dt.datetime.now(tz=UTC)
     spec = ResearchSpec(
         symbol=symbol,
-        event_type=event.event_type,
+        event_type=event.curated_type,
         event_count=DEFAULT_HISTORY_EVENTS,
         interval=Interval(interval.lower()),
         windows=DEFAULT_WINDOWS,
@@ -234,7 +234,7 @@ def _event_explain(*, event: MarketEvent, symbol: str, interval: str) -> str:
 
     question = (
         f"Summarise how {symbol} behaved around the last "
-        f"{DEFAULT_HISTORY_EVENTS} {event.event_type.value} releases, for a "
+        f"{DEFAULT_HISTORY_EVENTS} {event.curated_type.value} releases, for a "
         f"reader looking at the {event.local_date.isoformat()} release."
     )
     return render_key_findings(interpret_study(study, question=question))
@@ -356,7 +356,7 @@ def _event_setups(*, event: MarketEvent, symbol: str, interval: str) -> str:
     as_of = min(event.timestamp_utc, now)
 
     match, measurable = build_setup_match(
-        event_type=event.event_type,
+        event_type=event.curated_type,
         symbol=symbol,
         as_of=as_of,
         interval=Interval(interval.lower()),
@@ -392,13 +392,13 @@ def _event_scenarios(*, event: MarketEvent, symbol: str, interval: str) -> str:
     """Build and render the scenario split. Runs off the event loop."""
     now = dt.datetime.now(tz=UTC)
     split = build_scenarios(
-        event_type=event.event_type,
+        event_type=event.curated_type,
         symbol=symbol,
         as_of=min(event.timestamp_utc, now),
         interval=Interval(interval.lower()),
     )
     return render_scenarios_section(
-        split, event_type=event.event_type, symbol=symbol
+        split, event_type=event.curated_type, symbol=symbol
     )
 
 
@@ -442,7 +442,7 @@ def _event_history(*, event: MarketEvent, symbol: str, interval: str) -> str:
 
     spec = ResearchSpec(
         symbol=symbol,
-        event_type=event.event_type,
+        event_type=event.curated_type,
         event_count=DEFAULT_HISTORY_EVENTS,
         interval=Interval(interval.lower()),
         windows=DEFAULT_WINDOWS,

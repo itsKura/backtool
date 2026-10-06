@@ -186,7 +186,7 @@ def render_report(study: StudyResult, interpretation: Any | None = None) -> str:
         "<!doctype html>\n"
         '<html lang="en">\n<head>\n<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
-        f"<title>{escape(spec.symbol)} around {escape(spec.event_type.value)}</title>\n"
+        f"<title>{escape(spec.symbol)} around {escape(spec.event_label)}</title>\n"
         f"<style>{_STYLE}</style>\n</head>\n<body>\n"
         f'<div class="wrap">\n{body}\n</div>\n</body>\n</html>\n'
     )
@@ -196,7 +196,7 @@ def _header(study: StudyResult) -> str:
     spec = study.spec
     return (
         f"<h1>{escape(spec.symbol)} price action around "
-        f"{escape(spec.event_type.value)}</h1>"
+        f"{escape(spec.event_label)}</h1>"
         f'<p class="sub">{len(study.events)} events · {spec.interval.value} candles · '
         f"generated {study.generated_at:%Y-%m-%d %H:%M} UTC · "
         f'spec <span class="mono">{spec.fingerprint}</span></p>'
