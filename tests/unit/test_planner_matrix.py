@@ -702,6 +702,12 @@ class TestMethodologyCannotBeChanged:
             "restated_question",
             "asset",
             "event_type",
+            # Which public event, when it is not one of the curated families.
+            # A widening of *selection*, which is what this layer is for, and
+            # not of methodology: it says which dates to measure around, and
+            # the dates themselves still come from sources rather than from
+            # the model. Nothing here can change how the measuring is done.
+            "event_concept",
             "conditions",
             # The second group of an A-versus-B question. Generic filters,
             # not a comparison type.

@@ -216,7 +216,7 @@ def build_facts(finding: ResearchFinding) -> ResearchFacts:
         shape=shape,
         question=thesis.headline(),
         asset=f"{asset_label(thesis.asset)} ({thesis.asset})",
-        event_type=thesis.event_type.value,
+        event_type=thesis.event_label,
         horizon=thesis.outcome.horizon,
         measure=thesis.outcome.describe(),
         metric_label=finding.metric.label,

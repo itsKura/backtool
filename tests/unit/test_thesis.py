@@ -293,7 +293,9 @@ class TestComparisonGroups:
     """A baseline is a group with no filters, not a separate concept."""
 
     def test_an_unfiltered_group_is_every_usable_release(self) -> None:
-        assert Comparison().describe(EventType.CPI) == "All usable CPI releases"
+        assert (
+            Comparison().describe("CPI releases") == "All usable CPI releases"
+        )
         assert Comparison().is_baseline
 
     def test_a_filtered_group_is_named_by_its_filters(self) -> None:

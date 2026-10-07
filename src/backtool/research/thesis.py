@@ -33,6 +33,12 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backtool.core.types import EventType
+from backtool.events.resolution import (
+    DayAnchor,
+    ResolvedEventConcept,
+    compile_event_set,
+    curated_set_key,
+)
 from backtool.research.vocabulary import (
     CONDITION_FIELDS,
     DEFAULT_HORIZON,
@@ -391,8 +397,8 @@ class Comparison(BaseModel):
         """Whether this group is 'everything', rather than a named selection."""
         return not self.conditions
 
-    def describe(self, event_type: EventType) -> str:
-        return describe_group(self.conditions, event_type)
+    def describe(self, event_phrase: str) -> str:
+        return describe_group(self.conditions, event_phrase)
 
     def with_condition(self, condition: Condition) -> Comparison:
         """A copy with one more filter, under the same rule the left side uses.
@@ -405,15 +411,20 @@ class Comparison(BaseModel):
         return Comparison(conditions=(*kept, condition))
 
 
-def describe_group(conditions: tuple[Condition, ...], event_type: EventType) -> str:
+def describe_group(conditions: tuple[Condition, ...], event_phrase: str) -> str:
     """What a filtered group is called, from its filters alone.
 
     Used for both sides, which is what stops one of them being labelled
     "baseline" or "typical" when the reader named two groups. Only a group with
     no filters can be described as everything, because only that group is.
+
+    Takes how the events are referred to rather than which family they are,
+    because a study can now be anchored to something that has no family. "All
+    usable CPI releases" and "All usable United States midterm elections" come
+    out of the same sentence.
     """
     if not conditions:
-        return f"All usable {event_type.value} releases"
+        return f"All usable {event_phrase}"
     return " and ".join(condition.describe() for condition in conditions)
 
 
@@ -425,7 +436,19 @@ class Thesis(BaseModel):
     #: The question as asked, kept verbatim so the result can be shown beside it.
     question: str = ""
     asset: str = "BTCUSDT"
-    event_type: EventType = EventType.CPI
+    #: The curated family being studied, or ``None`` when the question is about
+    #: a public event resolved at runtime. Exactly one of this and
+    #: :attr:`resolution` is set.
+    event_type: EventType | None = EventType.CPI
+    #: A public event concept, already resolved into dated and cited
+    #: occurrences. Carried on the thesis rather than fetched during the run so
+    #: that what the reader confirmed is what gets measured -- and so a
+    #: resolution is paid for once per question, not once per attempt.
+    resolution: ResolvedEventConcept | None = None
+    #: How a date-only occurrence becomes an instant to measure from. Required
+    #: by, and only by, a resolution that established days rather than times;
+    #: a sourced timestamp is never overridden.
+    anchor: DayAnchor | None = None
     conditions: tuple[Condition, ...] = ()
     outcome: Outcome = Outcome()
     #: The group this one is measured against, when that question makes sense.
@@ -443,6 +466,37 @@ class Thesis(BaseModel):
     #: whole layer exists to prevent.
     unresolved: tuple[str, ...] = ()
 
+    @model_validator(mode="after")
+    def _one_target(self) -> Thesis:
+        """A family or a resolved concept, and exactly one of them.
+
+        Both would be ambiguous about what gets measured; neither leaves the
+        engine nothing to select from. The curated default means the common
+        case says nothing, and a dynamic thesis has to clear it deliberately.
+        """
+        if (self.event_type is None) == (self.resolution is None):
+            raise ValueError(
+                "A thesis measures either a curated event family or a resolved "
+                "public event concept. "
+                + (
+                    "Both were given."
+                    if self.event_type is not None
+                    else "Neither was given."
+                )
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _anchor_belongs_to_a_resolution(self) -> Thesis:
+        """An anchor without dates to anchor is a setting nothing reads."""
+        if self.anchor is not None and self.resolution is None:
+            raise ValueError(
+                "An anchor says where in a calendar day to measure from, which "
+                "only a resolved concept can need. A curated family publishes "
+                "its own release times."
+            )
+        return self
+
     @field_validator("asset")
     @classmethod
     def _known_asset(cls, value: str) -> str:
@@ -456,12 +510,29 @@ class Thesis(BaseModel):
 
     @model_validator(mode="after")
     def _conditions_apply(self) -> Thesis:
+        """Every filter has to mean something for the events being measured.
+
+        A family-specific field is one computed from a calendar this engine
+        maintains -- a consensus, a prior print. A resolved concept has none of
+        that and never will, because nobody publishes a consensus for an
+        election, so such a field is refused rather than silently read as
+        missing. Market-state fields are computed from price and apply to
+        anything with a timestamp.
+        """
+        family = self.event_type
         for condition in self.conditions:
             spec = CONDITION_FIELDS[condition.field]
-            if not spec.applies_to(self.event_type):
+            if family is None:
+                if spec.event_types:
+                    raise ValueError(
+                        f"{spec.label} is derived from a curated calendar, so "
+                        f"it cannot be tested against {self.event_label}."
+                    )
+                continue
+            if not spec.applies_to(family):
                 raise ValueError(
                     f"{spec.label} cannot be tested against "
-                    f"{self.event_type.value} releases."
+                    f"{family.value} releases."
                 )
         return self
 
@@ -489,11 +560,18 @@ class Thesis(BaseModel):
                 )
             raise ValueError(
                 "Both sides select the same releases "
-                f"({describe_group(self.conditions, self.event_type)}), so the "
+                f"({describe_group(self.conditions, self.event_phrase)}), so the "
                 "difference would be zero by construction. Change one side."
             )
         for condition in self.versus.conditions:
             spec = CONDITION_FIELDS[condition.field]
+            if self.event_type is None:
+                if spec.event_types:
+                    raise ValueError(
+                        f"{spec.label} is derived from a curated calendar, so "
+                        f"it cannot be tested against {self.event_label}."
+                    )
+                continue
             if not spec.applies_to(self.event_type):
                 raise ValueError(
                     f"{spec.label} cannot be tested against "
@@ -518,7 +596,52 @@ class Thesis(BaseModel):
     @property
     def is_runnable(self) -> bool:
         """Whether this can be executed, or still needs the reader."""
-        return not self.unresolved
+        if self.unresolved:
+            return False
+        if self.resolution is not None:
+            return self.resolution.is_runnable and not self._needs_an_anchor
+        return True
+
+    @property
+    def event_label(self) -> str:
+        """What the events are called, for prose and group labels."""
+        if self.resolution is not None:
+            return self.resolution.canonical_name or self.resolution.query
+        assert self.event_type is not None  # guaranteed by the validator
+        return self.event_type.value
+
+    @property
+    def event_phrase(self) -> str:
+        """How the events are referred to in a sentence.
+
+        A curated family publishes releases on a schedule; a resolved concept
+        is called whatever the sources call it. Keeping the noun here rather
+        than at each call site is what lets one sentence serve both.
+        """
+        if self.resolution is not None:
+            return self.event_label
+        return f"{self.event_label} releases"
+
+    @property
+    def event_set(self) -> str:
+        """Which set of events this measures, and which resolution of it.
+
+        The identity a cached study would be keyed by. A curated family is its
+        own identity; a resolved concept is identified by the events it
+        actually resolved to, so a study of "midterms" meaning two dates can
+        never be served for a resolution that found three.
+        """
+        if self.resolution is not None:
+            return compile_event_set(self.resolution, anchor=self.anchor).identity
+        assert self.event_type is not None  # guaranteed by the validator
+        return curated_set_key(self.event_type)
+
+    @property
+    def _needs_an_anchor(self) -> bool:
+        """Whether a measurable instant is still a decision nobody has made."""
+        if self.resolution is None or self.anchor is not None:
+            return False
+        return any(event.is_date_only for event in self.resolution.primary_events)
 
     @property
     def shape(self) -> ResultShape:
@@ -574,7 +697,7 @@ class Thesis(BaseModel):
         )
         items = [
             ("Asset", f"{asset_label(self.asset)} ({self.asset})"),
-            ("Event", f"{self.event_type.value} releases"),
+            ("Event", self.event_phrase),
         ]
         # Two named groups are shown as two rows rather than as a cohort and a
         # baseline, because the reader asked about both and neither is the
@@ -582,12 +705,17 @@ class Thesis(BaseModel):
         if self.versus is not None and not self.versus.is_baseline:
             items.append(("Left group", conditions))
             items.append(
-                ("Right group", describe_group(self.versus.conditions, self.event_type))
+                (
+                    "Right group",
+                    describe_group(self.versus.conditions, self.event_phrase),
+                )
             )
         else:
             items.append(("Condition", conditions))
             if self.versus is not None:
-                items.append(("Compared with", self.versus.describe(self.event_type)))
+                items.append(
+                    ("Compared with", self.versus.describe(self.event_phrase))
+                )
         items.append(("Measure", f"{self.outcome.describe()} for {self.asset}"))
         items.append(("Sample", f"up to the last {self.event_count} releases"))
         return items
@@ -603,7 +731,7 @@ class Thesis(BaseModel):
         )
         return (
             f"{asset_label(self.asset)} {self.outcome.describe()} after "
-            f"{self.event_type.value} releases{where}"
+            f"{self.event_phrase}{where}"
         )
 
     def with_condition(self, condition: Condition) -> Thesis:

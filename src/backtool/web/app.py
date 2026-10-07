@@ -32,6 +32,7 @@ from backtool.core.types import EventType, Interval
 from backtool.data.service import MarketDataService
 from backtool.events import load_events
 from backtool.events.models import MarketEvent
+from backtool.events.resolution import DayAnchor, ResolvedEventConcept
 from backtool.reporting.html import render_body
 from backtool.research.results import StudyResult
 from backtool.research.runner import run_study
@@ -62,10 +63,12 @@ from backtool.web.history_panel import HISTORY_SCRIPT, render_history
 from backtool.web.page import render_error, render_page, shell
 from backtool.web.research_page import (
     RESEARCH_SCRIPT,
+    render_anchor_needed,
     render_clarification,
     render_finding,
     render_research_page,
     render_spec_card,
+    render_unresolved_event,
     render_unsupported,
 )
 from backtool.web.scenario_panel import (
@@ -505,7 +508,17 @@ async def research_interpret(payload: dict[str, Any]) -> HTMLResponse:
 
 
 def _interpret_question(question: str, previous: Thesis | None) -> str:
-    """Plan, validate against the vocabulary, and render. Off the event loop."""
+    """Plan, look up any public event, validate, and render. Off the event loop.
+
+    The lookup sits between planning and conversion because of what each step
+    can know. The planner can tell that a question is about the Ethereum Merge;
+    it cannot tell when the Merge happened, and must not guess. The engine needs
+    dated events and nothing else. So the concept is established from published
+    sources in between, and the reader sees those sources on the same card as
+    the specification -- for a looked-up event the dates *are* the research, and
+    confirming a specification without them would be confirming the uninteresting
+    half.
+    """
     from backtool.ai.thesis_planner import plan_thesis
 
     planned = plan_thesis(question, previous=previous)
@@ -515,14 +528,57 @@ def _interpret_question(question: str, previous: Thesis | None) -> str:
     if planned.clarifications:
         return render_clarification(planned)
 
+    resolution: ResolvedEventConcept | None = None
+    anchor: DayAnchor | None = None
+    if planned.needs_resolution:
+        resolution = _resolution_for(planned.concept, previous)
+        if not resolution.is_runnable:
+            # Not an error. Several different outcomes land here -- a name that
+            # matches more than one event, sources that disagree, nothing found
+            # -- and each is something to tell the reader rather than something
+            # to resolve by picking.
+            return render_unresolved_event(resolution)
+        if any(event.is_date_only for event in resolution.primary_events):
+            # The sources gave days, not instants. Nothing here invents one.
+            #
+            # Midnight local is not a neutral reading of "the day of the
+            # election" -- it puts the entire trading day *after* the event,
+            # and a 1h or 24h window measured from it answers a different
+            # question than one measured from the close. Picking it silently
+            # would be the engine deciding the result, and disclosing the pick
+            # afterwards does not make it the right one.
+            return render_anchor_needed(resolution)
+
     # Conversion is where the vocabulary is enforced. A field or value the
     # planner invented fails here rather than reaching the engine.
     try:
-        thesis = planned.to_thesis(question)
+        thesis = planned.to_thesis(question, resolution=resolution, anchor=anchor)
     except ValueError as exc:
         return render_error(f"That reading does not fit what Backtool measures: {exc}")
 
     return render_spec_card(thesis, planned)
+
+
+def _resolution_for(
+    concept: str, previous: Thesis | None
+) -> ResolvedEventConcept:
+    """Establish the concept's dates, or reuse what is already on screen.
+
+    A lookup is a paid web search, and a follow-up about the same event is the
+    common case -- "and what about ETH?" must not buy the same dates twice. The
+    comparison is on the concept as asked, so a genuinely different event still
+    gets its own lookup.
+    """
+    if previous is not None and previous.resolution is not None:
+        already = previous.resolution
+        if already.query.strip().lower() == concept.strip().lower():
+            logger.info("Reusing the resolution already on screen for %r", concept)
+            return already
+
+    from backtool.ai.event_resolver import resolve_event_concept
+
+    logger.info("Resolving %r for a research question", concept)
+    return resolve_event_concept(concept)
 
 
 def _previous_thesis(raw: object) -> Thesis | None:

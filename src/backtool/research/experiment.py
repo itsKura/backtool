@@ -29,10 +29,12 @@ from pydantic import BaseModel, ConfigDict
 
 from backtool.config import Settings
 from backtool.core.time import UTC
-from backtool.core.types import EventType, Interval
+from backtool.core.types import Interval
 from backtool.data.service import MarketDataService
 from backtool.events import load_events
+from backtool.events.models import MarketEvent
 from backtool.events.releases import SCENARIO_RULES, load_releases
+from backtool.events.resolution import compile_event_set, curated_set_key
 from backtool.research.aggregate import (
     MetricReading,
     WindowAggregate,
@@ -363,9 +365,11 @@ def run_thesis(thesis: Thesis, *, as_of: dt.datetime | None = None) -> ResearchF
     now = dt.datetime.now(tz=UTC)
     cutoff = as_of or now
 
+    calendar, event_set = _calendar(thesis)
     spec = ResearchSpec(
         symbol=thesis.asset,
         event_type=thesis.event_type,
+        event_set=event_set,
         event_count=thesis.event_count,
         interval=THESIS_INTERVAL,
         windows=reaction_windows(),
@@ -373,7 +377,7 @@ def run_thesis(thesis: Thesis, *, as_of: dt.datetime | None = None) -> ResearchF
     )
 
     with MarketDataService.from_settings(Settings.from_env()) as service:
-        study = run_study(spec, service, load_events(thesis.event_type), now=now)
+        study = run_study(spec, service, calendar, now=now)
         context = _context(study, service, thesis, cutoff)
 
     # Both sides are selected the same way, from the same study, by the same
@@ -385,8 +389,8 @@ def run_thesis(thesis: Thesis, *, as_of: dt.datetime | None = None) -> ResearchF
     cohort = build_cohort(
         study,
         key="left",
-        label=describe_group(thesis.conditions, thesis.event_type),
-        description=_group_description(thesis.conditions, thesis.event_type),
+        label=describe_group(thesis.conditions, thesis.event_phrase),
+        description=_group_description(thesis.conditions, thesis.event_phrase),
         members=members,
     )
     comparison: Cohort | None = None
@@ -396,9 +400,9 @@ def run_thesis(thesis: Thesis, *, as_of: dt.datetime | None = None) -> ResearchF
         comparison = build_cohort(
             study,
             key="right",
-            label=thesis.versus.describe(thesis.event_type),
+            label=thesis.versus.describe(thesis.event_phrase),
             description=_group_description(
-                thesis.versus.conditions, thesis.event_type
+                thesis.versus.conditions, thesis.event_phrase
             ),
             members=comparison_members,
         )
@@ -502,6 +506,24 @@ def _ordered(
     ]
 
 
+def _calendar(thesis: Thesis) -> tuple[list[MarketEvent], str]:
+    """The events this thesis measures, and the identity of that set.
+
+    One crossing point for both kinds of question. A curated family loads its
+    calendar file; a resolved concept is compiled here, which is where every
+    date is validated and where a day-only occurrence meets the anchor the
+    reader chose. Either way what comes back is a plain list of
+    ``MarketEvent``, because the engine below this knows nothing about where a
+    calendar came from -- and that is the whole claim the dynamic event work
+    was making.
+    """
+    if thesis.resolution is not None:
+        compiled = compile_event_set(thesis.resolution, anchor=thesis.anchor)
+        return compiled.calendar, compiled.identity
+    assert thesis.event_type is not None  # guaranteed by the thesis validator
+    return load_events(thesis.event_type), curated_set_key(thesis.event_type)
+
+
 def _context(
     study: StudyResult,
     service: MarketDataService,
@@ -519,7 +541,11 @@ def _context(
     # `.get`, not `[]`. A dynamically resolved set has no classifier and never
     # will -- nobody publishes a consensus for an election -- so the absence is
     # ordinary rather than an error.
-    rule = SCENARIO_RULES.get(thesis.event_type)
+    rule = (
+        None
+        if thesis.event_type is None
+        else SCENARIO_RULES.get(thesis.event_type)
+    )
     if rule is not None:
         for event in study.events:
             verdict = rule(values.get(event.event_id))
@@ -670,13 +696,13 @@ def _horizon_windows() -> dict[str, str]:
 
 
 def _group_description(
-    conditions: tuple[Condition, ...], event_type: EventType
+    conditions: tuple[Condition, ...], event_phrase: str
 ) -> str:
     """One sentence saying what a group holds. Used for both sides."""
     if not conditions:
-        return f"Every {event_type.value} release with usable price data."
+        return f"All {event_phrase} with usable price data."
     return (
-        f"{event_type.value} releases where "
+        f"{event_phrase} where "
         + " and ".join(condition.describe() for condition in conditions)
     )
 

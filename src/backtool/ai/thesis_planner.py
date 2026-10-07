@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from backtool.ai.client import AIClient
 from backtool.core.types import EventType
+from backtool.events.resolution import DayAnchor, ResolvedEventConcept
 from backtool.research.thesis import Comparison, Condition, Outcome, Thesis
 from backtool.research.vocabulary import (
     DEFAULT_HORIZON,
@@ -132,7 +133,28 @@ class PlannedThesis(BaseModel):
         description="The question as understood, in one sentence"
     )
     asset: str = Field(description="BTCUSDT or ETHUSDT")
-    event_type: str = Field(description="CPI or FOMC")
+    event_type: str = Field(
+        description=(
+            "CPI or FOMC when the question is about one of those curated "
+            "families. Empty when it is about any other public dated event, "
+            "which goes in event_concept instead."
+        )
+    )
+    event_concept: str = Field(
+        # Defaulted so that answers recorded before this field existed still
+        # validate. The wire schema is unaffected -- `strict_json_schema`
+        # requires every property and strips defaults, so the model is still
+        # obliged to answer; what this buys is that a cassette does not become
+        # unreadable the moment the schema grows a field.
+        default="",
+        description=(
+            "The public event the question is about, when it is not CPI or "
+            "FOMC: an election, a protocol upgrade, a collapse, a ruling. Name "
+            "the event as a source would -- 'Ethereum Merge', not 'what "
+            "happened after the Ethereum Merge' -- because a separate step "
+            "looks it up. Empty for CPI and FOMC questions."
+        )
+    )
     conditions: list[PlannedCondition] = Field(
         description="Filters selecting the cohort. Empty means every release."
     )
@@ -203,19 +225,69 @@ class PlannedThesis(BaseModel):
     )
     unsupported: list[str] = Field(
         description=(
-            "Concepts the question needs that are not in the vocabulary, each "
-            "named plainly. Non-empty means the question cannot be run."
+            "Data the question needs that is not connected -- a different "
+            "asset, funding, open interest, equities, yields -- each named "
+            "plainly. Non-empty means the question cannot be run. A public "
+            "event with no local calendar does NOT belong here: that goes in "
+            "event_concept, which is supported."
         )
     )
 
-    def to_thesis(self, question: str) -> Thesis:
+    @property
+    def concept(self) -> str:
+        """The public event to look up, or empty for a curated family."""
+        return self.event_concept.strip()
+
+    @property
+    def needs_resolution(self) -> bool:
+        """Whether a lookup has to happen before this can become a thesis.
+
+        The planner can name a public event but cannot date one: establishing
+        when something happened is a research step with its own sources, its
+        own grounding and its own cost. So a question about anything outside
+        the curated families arrives here incomplete on purpose, and the caller
+        resolves the concept before converting.
+        """
+        return bool(self.concept) and not self.event_type.strip()
+
+    def to_thesis(
+        self,
+        question: str,
+        *,
+        resolution: ResolvedEventConcept | None = None,
+        anchor: DayAnchor | None = None,
+    ) -> Thesis:
         """Convert to the engine's contract, enforcing the vocabulary.
+
+        Args:
+            question: The reader's words, kept verbatim on the thesis.
+            resolution: The looked-up event concept, when the planner named one
+                rather than a curated family. Required in that case: a thesis
+                has to know which dates it measures, and this layer does not
+                get to guess them.
+            anchor: Where in a calendar day to measure from, for a resolution
+                that established days rather than instants.
 
         Raises:
             ValueError: if the planner produced an asset, event, field, value,
-                metric or horizon outside what the engine supports. Validation
-                happens here rather than being trusted from the model.
+                metric or horizon outside what the engine supports, or named
+                both a family and a concept, or named a concept that nothing
+                has looked up. Validation happens here rather than being
+                trusted from the model.
         """
+        family = self.event_type.strip().upper()
+        if family and self.concept:
+            raise ValueError(
+                f"The question was read as being about both the {family} "
+                f"family and the event {self.concept!r}. It has to be one."
+            )
+        if self.concept and resolution is None:
+            raise ValueError(
+                f"{self.concept!r} has to be looked up before it can be "
+                "measured, and no resolution was supplied."
+            )
+        if not family and resolution is None:
+            raise ValueError("The question names no event to measure around.")
         aggregation = _aggregation(self.aggregation)
         ranked = aggregation is Aggregation.ROWS
         frequency = aggregation is Aggregation.FREQUENCY
@@ -251,7 +323,9 @@ class PlannedThesis(BaseModel):
         return Thesis(
             question=question or self.restated_question,
             asset=self.asset,
-            event_type=EventType(self.event_type.strip().upper()),
+            event_type=EventType(family) if resolution is None else None,
+            resolution=resolution,
+            anchor=anchor,
             conditions=conditions,
             outcome=outcome,
             versus=versus,
@@ -462,7 +536,12 @@ def plan_thesis(
     if previous is not None:
         payload["current_thesis"] = {
             "asset": previous.asset,
-            "event_type": previous.event_type.value,
+            "event_type": (
+                previous.event_type.value if previous.event_type else ""
+            ),
+            "event_concept": (
+                "" if previous.event_type else previous.event_label
+            ),
             "conditions": [
                 {"field": c.field, "operator": c.operator.value, "value": c.value}
                 for c in previous.conditions
@@ -502,15 +581,40 @@ exchange data after you are done.
 
 ## What you may use
 
-You are given a `vocabulary` object. It is the complete set of things this \
-system can measure. Every asset, event, condition field, condition value, \
-metric and horizon you emit must come from it verbatim.
+You are given a `vocabulary` object. Every asset, condition field, condition \
+value, metric and horizon you emit must come from it verbatim.
 
-If the question needs anything outside that set -- a different asset, funding \
-rates, open interest, equities, yields, an event type not listed -- put it in \
-`unsupported`, named plainly. A question with anything in `unsupported` will \
-not be run, and that is the correct outcome. Refusing is better than \
-substituting something adjacent and labelling it as what was asked for.
+## Two different kinds of 'no'
+
+Keep these apart. Confusing them either refuses a question this system can \
+answer, or accepts one it cannot.
+
+**Cannot be measured at all.** The data is not connected: a different \
+asset, funding rates, open interest, equities, yields, order-book depth, \
+anything about a company's fundamentals. Name it in `unsupported`. A \
+question with anything in `unsupported` will not be run, and that is the \
+correct outcome -- refusing beats substituting something adjacent and \
+labelling it as what was asked for.
+
+**A public event this system has no calendar for.** This is *supported*, \
+and it does not belong in `unsupported`. The vocabulary's event list is the \
+curated families only -- the ones with a calendar file and a classifier \
+behind them. Any other public event with a date can be measured: name it in \
+`event_concept`, leave `event_type` empty, and a separate step establishes \
+its dates from published sources before anything runs.
+
+An election, a protocol upgrade, a bankruptcy filing, a bank failure, a \
+court ruling, a rate decision by a central bank that is not on the list: \
+all of these take `event_concept`.
+
+The test is about the *data*, not about the event. ETH's price around an \
+obscure protocol upgrade is measurable, because the price is connected and \
+the date can be looked up. Treasury yields around CPI are not, because the \
+yields are not connected -- and that stays `unsupported` however well known \
+the event is.
+
+A question can need both answers at once. Name the unsupported part in \
+`unsupported` even when the event itself is fine.
 
 ## What is measured, and how it is reported
 
@@ -579,6 +683,26 @@ the nearest bucket would answer a different question.
 A range is two conditions on the same field, one lower bound and one upper. \
 "Down between 2% and 5% over the week" is `btc_return_7d >= -5` together with \
 `btc_return_7d <= -2`.
+
+## Events with no calendar here
+
+`event_type` is for the curated families only -- the ones with a \
+calendar file, metadata and a classifier behind them. A question about \
+any other public dated event leaves it empty and names the event in \
+`event_concept` instead: an election, a protocol upgrade, a bankruptcy, \
+a decision by a central bank that is not on the list.
+
+Name the event, not the question. "Ethereum Merge", not "what happened \
+after the Ethereum Merge". A separate step establishes its dates from \
+published sources and needs something it can look up.
+
+Exactly one of the two is ever set, and a question about a curated \
+family leaves `event_concept` empty.
+
+A field derived from a curated calendar cannot be tested against such \
+an event, because there is no published consensus or prior print to \
+compare against. Conditions computed from price apply to anything with \
+a date, so a question about the trend going in is fine either way.
 
 ## Defaults versus clarifications
 

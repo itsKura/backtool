@@ -21,6 +21,13 @@ from __future__ import annotations
 from xml.sax.saxutils import escape
 
 from backtool.ai.thesis_planner import PlannedThesis
+from backtool.events.models import SourceAuthority, SourceRef
+from backtool.events.resolution import (
+    CandidateEvent,
+    DayAnchor,
+    ResolutionStatus,
+    ResolvedEventConcept,
+)
 from backtool.reporting.charts import BarItem, distribution_chart, diverging_bar_chart
 from backtool.research.experiment import ResearchFinding
 from backtool.research.thesis import Thesis
@@ -98,12 +105,243 @@ def render_spec_card(thesis: Thesis, planned: PlannedThesis) -> str:
         f'<p class="spec-head">{escape(planned.restated_question)}</p>'
         f'<div class="spec-card">{rows}</div>'
         f"{assumptions}"
+        f"{render_event_provenance(thesis)}"
         '<div class="spec-actions">'
         '<button type="button" class="btn" data-run="1">Run research</button>'
         '<button type="button" class="btn-quiet" data-edit="1">Edit question</button>'
         "</div>"
         f'<script type="application/json" class="thesis">{thesis.model_dump_json()}'
         "</script></div>"
+    )
+
+
+def render_event_provenance(thesis: Thesis) -> str:
+    """Where a resolved event's dates came from, beside the dates themselves.
+
+    A curated family needs none of this: its calendar is in the repository and
+    its methodology page explains it. A concept looked up from the web is
+    different in kind -- the dates are the research, and a reader who cannot
+    see which page established them is being asked to take the interesting part
+    on trust.
+
+    Returns an empty string for a curated thesis, so the caller can include it
+    unconditionally.
+    """
+    resolution = thesis.resolution
+    if resolution is None:
+        return ""
+
+    rows = "".join(
+        f'<div class="spec-row"><span class="spec-label">{escape(event.label)}</span>'
+        f'<span class="spec-value">{escape(_timing(event, thesis.anchor))}</span>'
+        "</div>"
+        for event in resolution.primary_events
+    )
+
+    sources = "".join(
+        f'<li><a href="{escape(source.url)}" target="_blank" rel="noreferrer">'
+        f"{escape(source.title or source.url)}</a> "
+        f'<span class="muted">({escape(source.authority.value)}'
+        + (f", {escape(source.publisher)}" if source.publisher else "")
+        + ")</span></li>"
+        for source in _cited_sources(resolution)
+    )
+
+    related = resolution.related_events
+    context = (
+        '<p class="muted">Also found, and deliberately not measured: '
+        + ", ".join(
+            f"{escape(event.label)} ({event.local_date.isoformat()})"
+            for event in related
+        )
+        + ". These are milestones around the event, not occurrences of it.</p>"
+        if related
+        else ""
+    )
+
+    open_questions = (
+        "<p><strong>Worth knowing:</strong></p>"
+        + '<ul class="findings-list">'
+        + "".join(
+            f"<li>{escape(item.question)}"
+            + (f' <span class="muted">{escape(item.why_it_matters)}</span>'
+               if item.why_it_matters else "")
+            + "</li>"
+            for item in resolution.informational_ambiguities
+        )
+        + "</ul>"
+        if resolution.informational_ambiguities
+        else ""
+    )
+
+    caveats = (
+        '<p class="muted">'
+        + " ".join(escape(note) for note in resolution.missing_information)
+        + "</p>"
+        if resolution.missing_information
+        else ""
+    )
+
+    return (
+        '<div class="spec-provenance">'
+        f'<p class="spec-head">Dates established from published sources</p>'
+        f'<div class="spec-card">{rows}</div>'
+        f"{context}"
+        f"{open_questions}"
+        "<p><strong>Sources</strong></p>"
+        f'<ul class="findings-list">{sources}</ul>'
+        f"{caveats}"
+        "</div>"
+    )
+
+
+def _timing(event: CandidateEvent, anchor: DayAnchor | None) -> str:
+    """One occurrence's instant, saying whether it was published or chosen.
+
+    The distinction a reader needs most: a sourced timestamp is a fact, while a
+    date measured from the start of its day is a decision somebody made, and
+    the two must not look alike.
+    """
+    if event.local_time is not None:
+        return (
+            f"{event.local_date.isoformat()} "
+            f"{event.local_time.strftime('%H:%M')} {event.timezone}, as published"
+        )
+    where = anchor.describe(event.timezone) if anchor is not None else "no anchor set"
+    return f"{event.local_date.isoformat()} ({event.timezone}), measured from {where}"
+
+
+def _cited_sources(resolution: ResolvedEventConcept) -> list[SourceRef]:
+    """The pages behind the occurrences being measured, best first.
+
+    Only the ones an occurrence actually cites. The search returns plenty the
+    answer never relied on, and listing those beside the evidence would make
+    the provenance look stronger than it is.
+    """
+    seen: dict[str, SourceRef] = {}
+    for event in resolution.primary_events:
+        for source in event.sources:
+            seen.setdefault(source.url, source)
+    order = {
+        SourceAuthority.OFFICIAL: 0,
+        SourceAuthority.PRIMARY: 1,
+        SourceAuthority.SECONDARY: 2,
+    }
+    return sorted(seen.values(), key=lambda s: order.get(s.authority, 3))
+
+
+def render_unresolved_event(resolution: ResolvedEventConcept) -> str:
+    """A lookup that did not settle, as a question rather than a failure.
+
+    Four different outcomes arrive here and they are not the same thing: a name
+    that matches several events, sources that disagree, nothing found at all,
+    and something real with no published date. Each needs a different sentence,
+    and none of them is an error the reader caused.
+    """
+    questions = "".join(
+        f"<li>{escape(item.question)}"
+        + (f' <span class="muted">{escape(item.why_it_matters)}</span>'
+           if item.why_it_matters else "")
+        + "</li>"
+        for item in resolution.blocking_ambiguities
+    )
+    found = (
+        '<p class="muted">What was found: '
+        + ", ".join(
+            f"{escape(event.label)} ({event.local_date.isoformat()})"
+            for event in resolution.candidate_events
+        )
+        + ".</p>"
+        if resolution.candidate_events
+        else ""
+    )
+    notes = (
+        '<p class="muted">'
+        + " ".join(escape(note) for note in resolution.missing_information)
+        + "</p>"
+        if resolution.missing_information
+        else ""
+    )
+    return (
+        '<div class="turn turn-clarify">'
+        f'<p class="spec-head">{escape(resolution.canonical_name or resolution.query)}</p>'
+        f"<p>{escape(_status_sentence(resolution))}</p>"
+        + (f'<ul class="findings-list">{questions}</ul>' if questions else "")
+        + f"{found}{notes}"
+        '<p class="muted">Answer in a follow-up and I will measure it.</p>'
+        "</div>"
+    )
+
+
+def _status_sentence(resolution: ResolvedEventConcept) -> str:
+    """Why this could not be measured, in the reader's terms."""
+    if resolution.status is ResolutionStatus.AMBIGUOUS:
+        return (
+            "That name matches more than one event, and which one is meant "
+            "changes the answer."
+        )
+    if resolution.status is ResolutionStatus.CONFLICTING:
+        return (
+            "The sources disagree about when this happened, and choosing "
+            "between them would decide the result."
+        )
+    if resolution.status is ResolutionStatus.NOT_FOUND:
+        return (
+            "I could not establish that this happened from any source I would "
+            "trust with a date."
+        )
+    if resolution.status is ResolutionStatus.NOT_RESOLVABLE:
+        return (
+            "That is real but has no single published instant -- it happened "
+            "over a period rather than at a moment."
+        )
+    if not resolution.primary_events:
+        return "Nothing was found that is an occurrence of this, as opposed to context."
+    return "One thing has to be settled before this can be measured."
+
+
+def render_anchor_needed(resolution: ResolvedEventConcept) -> str:
+    """Dates established, but no instant to measure from.
+
+    The sources settled which day something happened and published no time,
+    which is ordinary -- an election day has no announcement instant, and a
+    ruling often has no stated hour. What is not ordinary is choosing one
+    anyway. Midnight local is not a neutral reading: it places the whole
+    trading day after the event, so a 1h or 24h window measured from it answers
+    a different question than one measured from the close.
+
+    So the study stops here. This is the same refusal
+    :func:`~backtool.events.resolution.compile_event_set` makes, surfaced
+    before the reader presses a button rather than after.
+
+    What it must not do is invite a follow-up. :class:`DayAnchor` exists and
+    the thesis carries one, but nothing reads an anchor out of a question --
+    the planner has no field for it -- so "tell me which instant and I will run
+    it" would be a promise this cannot keep, and the reader would find that out
+    by being refused twice. Saying plainly that the case is not supported yet
+    is worth more than an invitation into a loop.
+    """
+    days = "".join(
+        f'<div class="spec-row"><span class="spec-label">{escape(event.label)}</span>'
+        f'<span class="spec-value">{escape(event.local_date.isoformat())} '
+        f"({escape(event.timezone)}), no published time</span></div>"
+        for event in resolution.primary_events
+        if event.is_date_only
+    )
+    return (
+        '<div class="turn turn-clarify">'
+        f'<p class="spec-head">{escape(resolution.canonical_name or resolution.query)}</p>'
+        "<p>I established the dates, but no source gives a time of day, so "
+        "there is no instant to measure from:</p>"
+        f'<div class="spec-card">{days}</div>'
+        "<p>Measuring would need one more decision, and it changes the answer: "
+        "a window starting at midnight puts the whole trading day after the "
+        "event, while one starting at the close puts it before. Picking for "
+        "you would decide the result, so I will not.</p>"
+        '<p class="muted">Events dated to the day but not the hour cannot be '
+        "measured yet -- choosing that instant is not something this version "
+        "supports. Events with a published time, such as a scheduled release "
+        "or a timestamped upgrade, work normally.</p></div>"
     )
 
 
@@ -130,8 +368,9 @@ def render_unsupported(planned: PlannedThesis) -> str:
         "connected:</p>"
         f'<ul class="findings-list">{items}</ul>'
         '<p class="muted">Backtool measures BTC and ETH around CPI and FOMC '
-        "releases today. Everything else would be a guess dressed as a result."
-        "</p></div>"
+        "releases, and around public events whose dates it can establish from "
+        "published sources. Everything else would be a guess dressed as a "
+        "result.</p></div>"
     )
 
 
@@ -535,7 +774,7 @@ def _methodology(finding: ResearchFinding) -> str:
     thesis = finding.thesis
     rows = [
         ("Asset", f"{asset_label(thesis.asset)} ({thesis.asset})"),
-        ("Event", f"{thesis.event_type.value} releases"),
+        ("Event", thesis.event_phrase),
         (
             "Condition",
             " and ".join(c.describe() for c in thesis.conditions) or "none",
@@ -543,7 +782,7 @@ def _methodology(finding: ResearchFinding) -> str:
         ("Measure", f"{thesis.outcome.describe()}, from the release price"),
     ]
     if thesis.versus is not None:
-        rows.append(("Compared with", thesis.versus.describe(thesis.event_type)))
+        rows.append(("Compared with", thesis.versus.describe(thesis.event_phrase)))
     rows += [
         (
             "Anchoring",
@@ -789,6 +1028,9 @@ RESEARCH_STYLE = """
 
 
 __all__ = [
+    "render_anchor_needed",
+    "render_event_provenance",
+    "render_unresolved_event",
     "EXAMPLE_QUESTIONS",
     "RESEARCH_SCRIPT",
     "RESEARCH_STYLE",

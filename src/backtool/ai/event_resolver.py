@@ -729,11 +729,20 @@ def _disputes(
 ) -> list[tuple[CandidateEvent, EvidenceRecord]]:
     """Sources that dispute the date of an occurrence.
 
-    Scoped to the occurrence, which is the whole point: each is checked against
-    the sources that bear on *it* -- the ones it cites, plus the ones the
-    extraction says give a date for it. A page that merely turned up in the
-    same search is not a rival claim, however much of the concept's vocabulary
-    it happens to contain.
+    Only the sources the extraction says give a date **for that occurrence**.
+    Being cited is not enough and used to be, which was wrong in a way that
+    showed up the first time the resolver ran inside the product: a page can be
+    cited for one event and date several. The Beacon Chain page is cited for the
+    Merge, mentions both, and reading its Beacon Chain date as a rival claim
+    about the Merge made a correct, officially sourced answer come back
+    conflicting.
+
+    The distinction is the whole of the fix. A citation says "this occurrence
+    rests on that page". An attribution says "that page gives a date for this
+    occurrence". Only the second can make a date a competing one, and nothing
+    else in the evidence can supply it -- a 150-character excerpt does not say
+    which event its dates belong to, which is the same wall this hit when the
+    question was whether an uncited page contradicted anything.
 
     Every occurrence is checked, related ones included, because a disagreement
     about a milestone is still worth telling a reader. What differs is the
@@ -741,12 +750,10 @@ def _disputes(
     and reports one over context.
     """
     found: list[tuple[CandidateEvent, EvidenceRecord]] = []
-    for candidate, cited in built:
-        bearing = {record.source_id: record for record in cited}
-        for record in associated.get(candidate.label, ()):
-            bearing.setdefault(record.source_id, record)
+    for candidate, _cited in built:
+        bearing = associated.get(candidate.label, ())
         for record in disagreeing_sources(
-            list(bearing.values()), candidate.local_date, accounted=accounted
+            list(bearing), candidate.local_date, accounted=accounted
         ):
             found.append((candidate, record))
     return found
@@ -1288,13 +1295,21 @@ you relied on. For each, `dates_event` says which of your occurrences that \
 date belongs to, copied exactly from the occurrence's label, or is empty if \
 the date belongs to something else.
 
-Be exact about this. A page dating a different thing -- a test network, a \
-preparatory upgrade, an unrelated namesake, the article's own publication -- \
-has an empty `dates_event`, and saying otherwise invents a disagreement. A \
-page giving a **different date for an occurrence you reported** must name that \
-occurrence, even if you think the page is wrong, especially if you think the \
-page is wrong: that is how a disagreement between sources gets recorded \
-instead of silently resolved.
+Be exact about this, because it is the only thing that can mark two dates \
+as rivals. A page dating a different thing -- a test network, a preparatory \
+upgrade, a predecessor, an unrelated namesake, the article's own publication \
+date -- has an empty `dates_event`, and saying otherwise invents a \
+disagreement that was never there.
+
+A page often dates several events at once. Attribute it to the occurrence \
+whose date it actually gives. If it gives dates for two of your occurrences, \
+name the one it is primarily about; if it gives a date for none of them, leave \
+it empty.
+
+And the case that matters most: a page giving a **different date for an \
+occurrence you reported** must name that occurrence -- even if you think the \
+page is wrong, especially if you think it is wrong. That is how a disagreement \
+between sources gets recorded instead of quietly resolved.
 """
 
 
