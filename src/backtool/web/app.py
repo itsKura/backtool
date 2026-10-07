@@ -46,6 +46,7 @@ from backtool.research.thesis import (
 from backtool.research.windows import DEFAULT_WINDOWS, WindowSpec, window_title
 from backtool.web.calendar_page import render_calendar
 from backtool.web.event_page import (
+    CANDLE_CHART_JS,
     CHART_SPAN,
     LIGHTWEIGHT_CHARTS_CDN,
     ai_summary_script,
@@ -202,7 +203,12 @@ async def event_detail(event_id: str, symbol: str = "BTCUSDT") -> HTMLResponse:
         + scenarios_load_script(event.event_id, chosen)
         + SCENARIO_SCRIPT
         + HISTORY_SCRIPT
-        + ("" if upcoming else price_chart_script(event.event_id, chosen))
+        + (
+            ""
+            if upcoming
+            # The chart body, then the four lines that mount it.
+            else CANDLE_CHART_JS + price_chart_script(event.event_id, chosen)
+        )
         + ai_summary_script(event.event_id, chosen)
     )
 
@@ -329,8 +335,6 @@ def _event_candles(
     arithmetic so the result does not depend on the frame's backing
     resolution -- the mistake that cost a debugging session earlier.
     """
-    import pandas as pd
-
     resolved = Interval(interval.lower())
     start = event.timestamp_utc - CHART_SPAN
     end = event.timestamp_utc + CHART_SPAN
@@ -339,25 +343,7 @@ def _event_candles(
         frame = service.get_candles(symbol, resolved, start, end)
 
     bands = chart_window_bands(event.timestamp_utc, frame, resolved)
-
-    seconds: list[int] = (
-        (frame["open_time"] - pd.Timestamp(0, tz="UTC"))
-        .dt.total_seconds()
-        .astype("int64")
-        .tolist()
-    )
-    shaped = [
-        {"time": t, "open": o, "high": h, "low": low, "close": c}
-        for t, o, h, low, c in zip(
-            seconds,
-            frame["open"].astype("float64").tolist(),
-            frame["high"].astype("float64").tolist(),
-            frame["low"].astype("float64").tolist(),
-            frame["close"].astype("float64").tolist(),
-            strict=True,
-        )
-    ]
-    return shaped, bands
+    return _shaped_candles(frame), bands
 
 
 @app.get("/api/event/{event_id}/setups", response_class=HTMLResponse)
@@ -500,7 +486,10 @@ async def research() -> HTMLResponse:
             "backtool - research",
             render_research_page(),
             active="research",
-            script=RESEARCH_SCRIPT,
+            # The chart body first, then the page script that mounts it on
+            # whatever answers the thread gains.
+            script=CANDLE_CHART_JS + RESEARCH_SCRIPT,
+            head_scripts=(LIGHTWEIGHT_CHARTS_CDN,),
         )
     )
 
@@ -678,6 +667,133 @@ def _previous_thesis(raw: object) -> Thesis | None:
     except ValueError:
         logger.info("Ignoring unreadable thesis payload")
         return None
+
+
+@app.post("/api/research/chart")
+async def research_chart(payload: dict[str, Any]) -> dict[str, Any]:
+    """Candles around one event of a thesis, and the window it measures.
+
+    A POST because the event is not in any calendar. A resolved concept exists
+    only inside the thesis that carries it -- nothing here stores one -- so the
+    thesis is what identifies the event, and it is far too large for a query
+    string.
+
+    Everything comes from the same places the answer did: the calendar from
+    :func:`thesis_calendar`, the candles from the cache the statistics were
+    computed over, and the shaded window from the horizon the question asked
+    for. A chart that fetched its own data would be a second account of the
+    same run, and the one a reader looks at would be the one nobody checked.
+    """
+    thesis = _previous_thesis(payload.get("thesis"))
+    if thesis is None:
+        return {"candles": [], "message": "That specification could not be read."}
+
+    try:
+        data = await asyncio.to_thread(
+            _thesis_candles,
+            thesis=thesis,
+            event_id=str(payload.get("event_id") or ""),
+            interval=str(payload.get("interval") or Interval.M5.value),
+        )
+    except ValueError as exc:
+        return {"candles": [], "message": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - the chart shows the reason
+        logger.exception("Research chart failed")
+        return {"candles": [], "message": f"{type(exc).__name__}: {exc}"}
+    return data
+
+
+def _measured_window(thesis: Thesis) -> WindowSpec | None:
+    """The window the answer's headline number comes from.
+
+    Looked up by the horizon the question named, through the same mapping the
+    engine uses, so the box cannot describe a different span than the figure
+    beside it. ``None`` when the horizon has no window, which is a question
+    this chart has nothing to shade rather than an error.
+    """
+    from backtool.research.vocabulary import reaction_windows, window_for
+
+    name = window_for(thesis.outcome.horizon)
+    return next((w for w in reaction_windows() if w.name == name), None)
+
+
+def _thesis_candles(
+    *, thesis: Thesis, event_id: str, interval: str
+) -> dict[str, Any]:
+    """Fetch the candles around one of a thesis's events, and shade its window.
+
+    Raises:
+        ValueError: when the thesis has no measurable event, or the one named
+            is not among them.
+    """
+    from backtool.research.experiment import thesis_calendar
+
+    calendar, _identity = thesis_calendar(thesis)
+    now = dt.datetime.now(tz=UTC)
+    past = [event for event in calendar if event.timestamp_utc <= now]
+    if not past:
+        raise ValueError("None of these events has happened yet, so there are no candles.")
+
+    if event_id:
+        chosen = next((e for e in past if e.event_id == event_id), None)
+        if chosen is None:
+            raise ValueError(f"{event_id} is not one of the events this question measures.")
+    else:
+        chosen = max(past, key=lambda event: event.timestamp_utc)
+
+    resolved = Interval(interval.lower())
+    start = chosen.timestamp_utc - CHART_SPAN
+    end = chosen.timestamp_utc + CHART_SPAN
+
+    with MarketDataService.from_settings(Settings.from_env()) as service:
+        frame = service.get_candles(thesis.asset, resolved, start, end)
+
+    window = _measured_window(thesis)
+    bands = (
+        chart_window_bands(
+            chosen.timestamp_utc, frame, resolved, windows=(window,)
+        )
+        if window is not None
+        else []
+    )
+
+    return {
+        "symbol": thesis.asset,
+        "interval": resolved.value,
+        "event_id": chosen.event_id,
+        "event_label": chosen.notes or chosen.event_id,
+        "event_time": int(chosen.timestamp_utc.timestamp()),
+        "candles": _shaped_candles(frame),
+        "windows": bands,
+    }
+
+
+def _shaped_candles(frame: Any) -> list[dict[str, float | int]]:
+    """A candle frame in the shape Lightweight Charts expects.
+
+    Times are UNIX seconds via ``timestamp()`` rather than integer epoch
+    arithmetic, so the result does not depend on the frame's backing
+    resolution -- the mistake that cost a debugging session earlier.
+    """
+    import pandas as pd
+
+    seconds: list[int] = (
+        (frame["open_time"] - pd.Timestamp(0, tz="UTC"))
+        .dt.total_seconds()
+        .astype("int64")
+        .tolist()
+    )
+    return [
+        {"time": t, "open": o, "high": h, "low": low, "close": c}
+        for t, o, h, low, c in zip(
+            seconds,
+            frame["open"].astype("float64").tolist(),
+            frame["high"].astype("float64").tolist(),
+            frame["low"].astype("float64").tolist(),
+            frame["close"].astype("float64").tolist(),
+            strict=True,
+        )
+    ]
 
 
 @app.post("/api/research/run", response_class=HTMLResponse)

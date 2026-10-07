@@ -18,6 +18,7 @@ not something a model wrote.
 
 from __future__ import annotations
 
+import datetime as dt
 from collections.abc import Sequence
 from xml.sax.saxutils import escape, quoteattr
 
@@ -38,8 +39,9 @@ from backtool.research.vocabulary import (
     ResultShape,
     asset_label,
 )
-from backtool.research.windows import REACTION_WINDOWS
+from backtool.research.windows import REACTION_WINDOWS, window_title
 from backtool.web.cohort_view import render_cohort_table, render_sample_badge
+from backtool.web.event_page import CHART_SPAN, CHART_ZOOMS
 
 #: Starting points, chosen to show the three shapes a question can take: a
 #: cohort comparison, a plain event study, and a conditional follow-up.
@@ -481,6 +483,85 @@ def render_unsupported(planned: PlannedThesis, *, question: str = "") -> str:
     )
 
 
+def _price_zone(finding: ResearchFinding) -> str:
+    """The candles around a measured event, with the question's window shaded.
+
+    The picture of the thing the answer is about. An event page already charts
+    a release this way; what differs here is which box is drawn -- the window
+    the reader's own question measures, rather than the four a release page
+    reports -- because a shaded region describing a statistic that is not on
+    the page is one the reader has to decode.
+
+    One event at a time. A question over forty releases has forty charts in it
+    and no useful way to draw them at once, so the most recent is shown and the
+    rest are a list. A question about a single event, which is most of what the
+    resolved-concept work is for, simply shows it.
+
+    The card carries the thesis and no behaviour: see
+    :data:`RESEARCH_SCRIPT`.
+    """
+    past = [
+        observation
+        for observation in finding.observations
+        if observation.event_date <= dt.date.today()
+    ]
+    if not past:
+        return ""
+
+    # Most recent first, which is the one a reader means by "the chart".
+    ordered = sorted(past, key=lambda o: o.event_date, reverse=True)
+    picker = ""
+    if len(ordered) > 1:
+        options = "".join(
+            f"<option value={quoteattr(observation.event_id)}>"
+            f"{escape(observation.event_date.isoformat())}</option>"
+            for observation in ordered
+        )
+        picker = (
+            '<label class="chart-pick">Event '
+            f'<select class="chart-event">{options}</select></label>'
+        )
+
+    zooms = "".join(
+        f'<button type="button" data-hours="{hours}" '
+        f'aria-selected="{str(hours == CHART_ZOOMS[0]).lower()}">'
+        f"&plusmn;{hours}h</button>"
+        for hours in CHART_ZOOMS
+    )
+    window = window_title_for(finding.thesis.outcome.horizon)
+    return (
+        '<div class="chart-block" data-chart>'
+        '<p class="finding-sub">Price around the event</p>'
+        f'<p class="chart-note">{escape(finding.thesis.asset)} &middot; '
+        f"{int(CHART_SPAN.total_seconds() // 3600)}h either side"
+        + (f" &middot; shaded: {escape(window)}" if window else "")
+        + "</p>"
+        '<div class="chart-toolbar">'
+        f"{picker}"
+        f'<div class="chart-range" role="group" aria-label="Zoom">{zooms}</div>'
+        "</div>"
+        '<div class="chart-canvas"><div class="chart-bands" aria-hidden="true">'
+        "</div></div>"
+        '<p class="status chart-status">'
+        '<span class="spinner"></span>Loading candles&hellip;</p>'
+        + _state_block("thesis", finding.thesis.model_dump_json())
+        + "</div>"
+    )
+
+
+def window_title_for(horizon: str) -> str:
+    """What the shaded box is, in the reader's words.
+
+    Read through the same mapping the engine uses, so the caption and the box
+    cannot name different spans.
+    """
+    from backtool.research.vocabulary import reaction_windows, window_for
+
+    name = window_for(horizon)
+    spec = next((w for w in reaction_windows() if w.name == name), None)
+    return window_title(spec) if spec is not None else ""
+
+
 def render_finding(
     finding: ResearchFinding, interpretation: tuple[str, ...] = ()
 ) -> str:
@@ -516,6 +597,7 @@ def render_finding(
         f'<p class="finding-headline">{escape(finding.verdict())}</p>'
         f"{_interpretation(interpretation)}"
         f"{_hero(finding)}{warnings}"
+        f"{_price_zone(finding)}"
         f"{_distribution(finding)}"
         f"{_observations(finding)}"
         f"{_full_statistics(finding)}"
@@ -1001,6 +1083,61 @@ _RESEARCH_SCRIPT_TEMPLATE = """
     box.value = picked.join('; ');
   }
 
+
+  // A chart arrives as data on a card, never as behaviour. The thread is
+  // inserted with innerHTML, and a script element inserted that way does not
+  // run -- so the card carries its thesis and this picks it up. It is also
+  // what lets several answers in one thread each hold their own chart, which
+  // ids in a shared script could not.
+  function mountCharts(scope) {
+    if (typeof window.backtoolCandleChart !== 'function') return;
+    for (const block of scope.querySelectorAll('[data-chart]')) {
+      if (block.dataset.mounted) continue;
+      block.dataset.mounted = '1';
+
+      const thesis = block.querySelector('script.thesis')?.textContent;
+      const picker = block.querySelector('.chart-event');
+      const status = block.querySelector('.chart-status');
+      if (!thesis) { status?.remove(); continue; }
+
+      const load = () => fetch('/api/research/chart', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          thesis: thesis,
+          event_id: picker ? picker.value : '',
+        }),
+      });
+
+      const mount = () => window.backtoolCandleChart({
+        canvas: block.querySelector('.chart-canvas'),
+        status: block.querySelector('.chart-status'),
+        bands: block.querySelector('.chart-bands'),
+        toolbar: block.querySelector('.chart-range'),
+        zoom: __ZOOM__,
+        marker: 'event',
+        load: load,
+      });
+
+      // Switching event rebuilds the chart rather than re-pointing it: the
+      // library holds the series, the bands and the zoom state together, and
+      // feeding one of them a different event leaves the other two describing
+      // the previous one.
+      picker?.addEventListener('change', () => {
+        const canvas = block.querySelector('.chart-canvas');
+        canvas.innerHTML = '<div class="chart-bands" aria-hidden="true"></div>';
+        if (!block.querySelector('.chart-status')) {
+          canvas.insertAdjacentHTML('afterend',
+            '<p class="status chart-status">' +
+            '<span class="spinner"></span>Loading candles\u2026</p>');
+        }
+        mount();
+      });
+
+      mount();
+    }
+  }
+
   function scrollToEnd() {
     thread.lastElementChild?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
@@ -1033,6 +1170,7 @@ _RESEARCH_SCRIPT_TEMPLATE = """
         { question: question, thesis: currentThesis(),
           conversation: conversation() });
       pending.outerHTML = html;
+      mountCharts(thread);
     } catch (e) {
       pending.outerHTML = '<div class="error"><h3>Could not reach the server</h3><p>'
         + String(e) + '</p></div>';
@@ -1080,6 +1218,7 @@ _RESEARCH_SCRIPT_TEMPLATE = """
     scrollToEnd();
     try {
       pending.outerHTML = await post('/api/research/run', { thesis: thesis });
+      mountCharts(thread);
     } catch (e) {
       pending.outerHTML = '<div class="error"><h3>Could not reach the server</h3><p>'
         + String(e) + '</p></div>';
@@ -1102,7 +1241,7 @@ _RESEARCH_SCRIPT_TEMPLATE = """
 #: of turns the planner will keep, so what is sent is what is read.
 RESEARCH_SCRIPT = _RESEARCH_SCRIPT_TEMPLATE.replace(
     "__MAX_TURNS__", str(MAX_REMEMBERED_EXCHANGES)
-)
+).replace("__ZOOM__", str(CHART_ZOOMS[0]))
 
 
 
@@ -1163,6 +1302,24 @@ RESEARCH_STYLE = """
                                background: var(--surface-2);
                                color: var(--text-primary); }
 .choice-other { color: var(--text-muted); border-style: dashed; }
+
+/* The chart sits inside an answer rather than on a page of its own, so it is
+   sized to be read at a glance beside the figure it explains and borrows the
+   event page's band colours rather than defining a second set. */
+.chart-block { margin: 20px 0 4px; }
+.chart-note { font-size: 12.5px; color: var(--text-muted); margin: 0 0 8px; }
+.chart-block .chart-toolbar { display: flex; justify-content: space-between;
+                              align-items: center; gap: 12px; margin-bottom: 6px;
+                              flex-wrap: wrap; }
+.chart-pick { font-size: 12.5px; color: var(--text-muted);
+              display: inline-flex; align-items: center; gap: 6px; }
+.chart-pick select { background: var(--surface-1); color: var(--text-primary);
+                     border: 1px solid var(--grid); border-radius: 7px;
+                     padding: 4px 8px; font: inherit; font-size: 12.5px; }
+.chart-canvas { position: relative; height: 300px; }
+.chart-bands { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+.chart-block .status { font-size: 12.5px; color: var(--text-muted);
+                       margin: 6px 0 0; }
 .findings-list li.ask { list-style: none; margin-left: -1.1em; }
 
 .compare { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));

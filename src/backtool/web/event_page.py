@@ -23,6 +23,7 @@ one thing rather than two.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape
 
@@ -30,7 +31,12 @@ from backtool.core.time import NEW_YORK, utc_to_local
 from backtool.core.types import Interval
 from backtool.events.meta import meta_for
 from backtool.events.models import MarketEvent
-from backtool.research.windows import DEFAULT_WINDOWS, window_label, window_title
+from backtool.research.windows import (
+    DEFAULT_WINDOWS,
+    WindowSpec,
+    window_label,
+    window_title,
+)
 from backtool.web.calendar_page import format_delta
 
 if TYPE_CHECKING:  # pandas is only needed for the annotation
@@ -61,6 +67,9 @@ def chart_window_bands(
     event_time: dt.datetime,
     candles: pd.DataFrame | None = None,
     interval: Interval = Interval.M5,
+    *,
+    windows: Sequence[WindowSpec] = DEFAULT_WINDOWS,
+    span: dt.timedelta = CHART_SPAN,
 ) -> list[dict[str, object]]:
     """The measurement windows as boxes: a time span and a price range.
 
@@ -82,16 +91,22 @@ def chart_window_bands(
         candles: Normalised candle frame around the event. Without it the bands
             carry time spans only and the client draws them full height.
         interval: Candle interval, needed for the coverage figure.
+        windows: Which windows to draw. Defaults to the four an event page
+            reports. A research answer passes the one window its question
+            measures, because a box describing a statistic the page does not
+            show is a box the reader has to work out the meaning of.
+        span: How far either side of the event the chart reaches, which is what
+            the bands are clipped to.
 
     Returns:
         One entry per window: label, start and end as UNIX seconds, whether it
         sits before or after the release, and ``high``/``low`` when measurable.
     """
-    low_bound = event_time - CHART_SPAN
-    high_bound = event_time + CHART_SPAN
+    low_bound = event_time - span
+    high_bound = event_time + span
     bands: list[dict[str, object]] = []
 
-    for window in DEFAULT_WINDOWS:
+    for window in windows:
         start = max(event_time + window.start_offset, low_bound)
         end = min(event_time + window.end_offset, high_bound)
         if end <= start:
@@ -541,59 +556,63 @@ def render_upcoming_notice(event: MarketEvent) -> str:
     )
 
 
-def price_chart_script(event_id: str, symbol: str) -> str:
-    """Client code that fetches our candles and renders them.
-
-    Colours are read from the page's CSS custom properties rather than
-    hardcoded, so the chart follows the theme instead of being a second source
-    of truth for it.
-    """
-    default_zoom = CHART_ZOOMS[0]
-    return f"""
-(function () {{
-  const el = document.getElementById('price-chart');
-  const status = document.getElementById('price-chart-status');
-  if (!el || typeof LightweightCharts === 'undefined') {{
+#: The candle chart itself, as a function two pages can mount.
+#:
+#: Takes its elements rather than finding them by id, because the research
+#: thread can hold more than one chart and ids are not unique there. Takes its
+#: data as a callback for the same reason the elements are passed in: an event
+#: page knows a calendar id and a research answer knows a whole thesis, and the
+#: chart should have to know neither.
+#:
+#: Everything about how it draws is unchanged -- the band ranking, the
+#: snap-to-candle before asking for a coordinate, the zoom that narrows the
+#: data because this build ignores setVisibleRange, the fit that applies width
+#: before fitting. Each of those is a bug that was found once.
+CANDLE_CHART_JS = """
+window.backtoolCandleChart = function (options) {
+  const el = options.canvas;
+  const status = options.status;
+  if (!el || typeof LightweightCharts === 'undefined') {
     if (status) status.textContent = 'Chart library unavailable.';
     return;
-  }}
+  }
 
   const css = getComputedStyle(document.documentElement);
   const v = (name, fallback) => (css.getPropertyValue(name) || fallback).trim();
   let loaded = false;
 
-  const chart = LightweightCharts.createChart(el, {{
+  const chart = LightweightCharts.createChart(el, {
     height: 340,
-    layout: {{
-      background: {{ color: 'transparent' }},
+    layout: {
+      background: { color: 'transparent' },
       textColor: v('--text-muted', '#8f8e85'),
       fontSize: 11,
-    }},
-    grid: {{
-      vertLines: {{ color: v('--grid', '#343431') }},
-      horzLines: {{ color: v('--grid', '#343431') }},
-    }},
-    rightPriceScale: {{ borderColor: v('--grid', '#343431') }},
+    },
+    grid: {
+      vertLines: { color: v('--grid', '#343431') },
+      horzLines: { color: v('--grid', '#343431') },
+    },
+    rightPriceScale: { borderColor: v('--grid', '#343431') },
     // minBarSpacing is lowered because the default floor (0.5px) refuses to
     // shrink 579 five-minute candles into a narrow pane: the library clamps,
     // the series overflows the width, and the view silently shows only its
     // tail -- which reads as "the chart is wrong" rather than "too narrow".
-    timeScale: {{
+    timeScale: {
       borderColor: v('--grid', '#343431'),
       timeVisible: true,
       minBarSpacing: 0.05,
-    }},
-    crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
-  }});
+    },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  });
 
   const up = v('--up', '#3987e5');
   const down = v('--down', '#e66767');
-  const series = chart.addSeries(LightweightCharts.CandlestickSeries, {{
+  const series = chart.addSeries(LightweightCharts.CandlestickSeries, {
     upColor: up, borderUpColor: up, wickUpColor: up,
     downColor: down, borderDownColor: down, wickDownColor: down,
-  }});
+  });
 
-  const bandLayer = document.getElementById('price-bands');
+  const bandLayer = options.bands;
   const timeScale = chart.timeScale();
   let allBands = [];
   let bands = [];
@@ -601,21 +620,21 @@ def price_chart_script(event_id: str, symbol: str) -> str:
   let candleTimes = [];
   let eventTime = null;
 
-  fetch('/api/event/{event_id}/candles?symbol={symbol}')
+  options.load()
     .then(r => r.json())
-    .then(data => {{
-      if (!data.candles || !data.candles.length) {{
+    .then(data => {
+      if (!data.candles || !data.candles.length) {
         status.textContent = data.message || 'No candles available for this window.';
         return;
-      }}
+      }
       series.setData(data.candles);
-      LightweightCharts.createSeriesMarkers(series, [{{
+      LightweightCharts.createSeriesMarkers(series, [{
         time: data.event_time,
         position: 'aboveBar',
         color: v('--text-primary', '#ffffff'),
         shape: 'arrowDown',
-        text: 'release',
-      }}]);
+        text: options.marker,
+      }]);
 
       eventTime = data.event_time;
       allCandles = data.candles;
@@ -626,37 +645,37 @@ def price_chart_script(event_id: str, symbol: str) -> str:
       );
 
       loaded = true;
-      setZoom({default_zoom});
+      setZoom(options.zoom);
       status.remove();
-    }})
-    .catch(e => {{ status.textContent = 'Could not load candles: ' + e; }});
+    })
+    .catch(e => { status.textContent = 'Could not load candles: ' + e; });
 
   // A band boundary is snapped to a real candle before it is asked for a
   // coordinate. timeToCoordinate answers for points on the data grid; an
   // instant between two candles can come back null, which would silently drop
   // the band rather than misplace it -- harder to notice than a wrong pixel.
-  function nearestIndex(t) {{
+  function nearestIndex(t) {
     if (!candleTimes.length) return null;
     let best = 0;
     let bestGap = Math.abs(t - candleTimes[0]);
-    for (let i = 1; i < candleTimes.length; i++) {{
+    for (let i = 1; i < candleTimes.length; i++) {
       const gap = Math.abs(t - candleTimes[i]);
-      if (gap < bestGap) {{ best = i; bestGap = gap; }}
-    }}
+      if (gap < bestGap) { best = i; bestGap = gap; }
+    }
     return best;
-  }}
+  }
 
-  function nearestCandle(t) {{
+  function nearestCandle(t) {
     const index = nearestIndex(t);
     return index === null ? null : candleTimes[index];
-  }}
+  }
 
-  function buildBands() {{
+  function buildBands() {
     bandLayer.innerHTML = '';
     // Rank within each phase: the longest window of a phase is the outer wash,
     // anything shorter sits inside it and is drawn stronger.
-    const seen = {{}};
-    for (const band of bands) {{
+    const seen = {};
+    for (const band of bands) {
       const depth = seen[band.phase] = (seen[band.phase] || 0) + 1;
       const node = document.createElement('div');
       node.className = 'band band-' + band.phase +
@@ -665,29 +684,29 @@ def price_chart_script(event_id: str, symbol: str) -> str:
       node.querySelector('.band-label').textContent = band.title;
       band.node = node;
       bandLayer.appendChild(node);
-    }}
-  }}
+    }
+  }
 
-  function drawBands() {{
+  function drawBands() {
     if (!bands.length) return;
     const paneWidth = timeScale.width ? timeScale.width() : el.clientWidth;
     const axisHeight = timeScale.height ? timeScale.height() : 28;
     bandLayer.style.width = paneWidth + 'px';
     bandLayer.style.height = Math.max(0, el.clientHeight - axisHeight) + 'px';
 
-    for (const band of bands) {{
+    for (const band of bands) {
       const node = band.node;
       const from = nearestCandle(band.start);
       const to = nearestCandle(band.end);
-      if (from === null || to === null) {{ node.style.display = 'none'; continue; }}
+      if (from === null || to === null) { node.style.display = 'none'; continue; }
       const a = timeScale.timeToCoordinate(from);
       const b = timeScale.timeToCoordinate(to);
-      if (a === null || b === null) {{ node.style.display = 'none'; continue; }}
+      if (a === null || b === null) { node.style.display = 'none'; continue; }
 
       const left = Math.max(0, Math.min(a, b));
       const right = Math.min(paneWidth, Math.max(a, b));
       const width = right - left;
-      if (width <= 1) {{ node.style.display = 'none'; continue; }}
+      if (width <= 1) { node.style.display = 'none'; continue; }
 
       node.style.display = '';
       node.style.left = left + 'px';
@@ -699,14 +718,14 @@ def price_chart_script(event_id: str, symbol: str) -> str:
       const layerHeight = bandLayer.clientHeight;
       let top = 0;
       let height = layerHeight;
-      if (band.high !== null && band.low !== null) {{
+      if (band.high !== null && band.low !== null) {
         const yHigh = series.priceToCoordinate(band.high);
         const yLow = series.priceToCoordinate(band.low);
-        if (yHigh !== null && yLow !== null) {{
+        if (yHigh !== null && yLow !== null) {
           top = Math.min(yHigh, yLow);
           height = Math.abs(yLow - yHigh);
-        }}
-      }}
+        }
+      }
       // Keep the box on the canvas when autoscale puts an extreme off-screen,
       // and keep it thick enough to see when a quiet window is a flat line.
       const clampedTop = Math.max(0, Math.min(top, layerHeight - 2));
@@ -717,8 +736,8 @@ def price_chart_script(event_id: str, symbol: str) -> str:
       // A label wider than its band would overflow into the neighbouring one
       // and read as belonging to it, so it is dropped instead of clipped.
       node.classList.toggle('band-narrow', width < band.title.length * 7 + 18);
-    }}
-  }}
+    }
+  }
 
   // Zoom by changing what the series holds, not by moving the viewport.
   // fitContent, setVisibleRange and setVisibleLogicalRange are all accepted
@@ -729,7 +748,7 @@ def price_chart_script(event_id: str, symbol: str) -> str:
   //
   // The opening view calls this too, so "what the chart shows on load" and
   // "what the 24h button does" are the same code path and cannot drift apart.
-  function setZoom(hours) {{
+  function setZoom(hours) {
     if (eventTime === null) return;
     const low = eventTime - hours * 3600;
     const high = eventTime + hours * 3600;
@@ -751,36 +770,36 @@ def price_chart_script(event_id: str, symbol: str) -> str:
     // container width first: asking for a coordinate from a chart that has not
     // been told how wide it is returns null for every one of them.
     fit();
-  }}
+  }
 
   // fitContent() is accepted and ignored by this build of the library: the
   // chart stays at its default six-pixel bar spacing, showing the last twelve
   // hours of a forty-eight hour series. Sizing the bars to the pane by hand
   // gets there through applyOptions, which does work, and scrollToPosition(0)
   // pins the last bar to the right edge so the series exactly fills the width.
-  function fitAll() {{
+  function fitAll() {
     // Both, deliberately. fitContent is the library's own answer and is what
     // works in a normal browser; sizing the bars by hand is the fallback for
     // builds where it is accepted and ignored. When both work they agree --
     // barSpacing = paneWidth / bars is the definition of fitting -- so running
     // the second after the first costs nothing and removes a dependency on
     // which of them happens to be functional.
-    try {{ timeScale.fitContent(); }} catch (e) {{ /* fall through */ }}
+    try { timeScale.fitContent(); } catch (e) { /* fall through */ }
 
     const count = candleTimes.length;
     const paneWidth = timeScale.width ? timeScale.width() : el.clientWidth;
     if (count < 2 || paneWidth < 2) return;
-    try {{
-      timeScale.applyOptions({{ barSpacing: paneWidth / count, rightOffset: 0 }});
+    try {
+      timeScale.applyOptions({ barSpacing: paneWidth / count, rightOffset: 0 });
       timeScale.scrollToPosition(0, false);
-    }} catch (e) {{ /* fitContent above may already have done it */ }}
-  }}
+    } catch (e) { /* fitContent above may already have done it */ }
+  }
 
   // Width and fit must be applied together. Fitting against a stale width
   // leaves the candles bunched to one side of the canvas, which is what
   // happened when the observer resized the chart after fitting had run.
-  function fit() {{
-    chart.applyOptions({{ width: el.clientWidth }});
+  function fit() {
+    chart.applyOptions({ width: el.clientWidth });
     if (loaded) fitAll();
     drawBands();
     // A chart laid out at zero width -- a collapsed container, a tab that was
@@ -788,21 +807,42 @@ def price_chart_script(event_id: str, symbol: str) -> str:
     // observer re-fires when width appears, and this second pass catches the
     // case where the width lands in the same frame the chart was sized in.
     requestAnimationFrame(drawBands);
-  }}
+  }
 
   timeScale.subscribeVisibleLogicalRangeChange(drawBands);
 
-  for (const btn of document.querySelectorAll('.chart-range button')) {{
-    btn.addEventListener('click', () => {{
-      for (const other of document.querySelectorAll('.chart-range button')) {{
+  for (const btn of options.toolbar.querySelectorAll('button')) {
+    btn.addEventListener('click', () => {
+      for (const other of options.toolbar.querySelectorAll('button')) {
         other.setAttribute('aria-selected', String(other === btn));
-      }}
+      }
       setZoom(Number(btn.dataset.hours));
-    }});
-  }}
+    });
+  }
 
   new ResizeObserver(fit).observe(el);
   fit();
+};
+"""
+
+
+def price_chart_script(event_id: str, symbol: str) -> str:
+    """Mount the shared chart on this page's elements, for one calendar event.
+
+    The chart itself is :data:`CANDLE_CHART_JS`; this is the four lines that
+    say which elements and which data.
+    """
+    return f"""
+(function () {{
+  window.backtoolCandleChart({{
+    canvas: document.getElementById('price-chart'),
+    status: document.getElementById('price-chart-status'),
+    bands: document.getElementById('price-bands'),
+    toolbar: document.querySelector('.chart-range'),
+    zoom: {CHART_ZOOMS[0]},
+    marker: 'release',
+    load: () => fetch('/api/event/{event_id}/candles?symbol={symbol}'),
+  }});
 }})();
 """
 

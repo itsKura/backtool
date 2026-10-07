@@ -506,6 +506,18 @@ def _ordered(
     ]
 
 
+def thesis_calendar(thesis: Thesis) -> tuple[list[MarketEvent], str]:
+    """The events this thesis measures, for a caller outside the engine.
+
+    Public because the chart needs exactly what the study measured: the same
+    dates, compiled the same way, against the same anchor. Anything that built
+    its own calendar from the resolution would be a second definition of which
+    instant an event happened at, and the one drawing the picture would be the
+    one nobody tested.
+    """
+    return _calendar(thesis)
+
+
 def _calendar(thesis: Thesis) -> tuple[list[MarketEvent], str]:
     """The events this thesis measures, and the identity of that set.
 
@@ -773,4 +785,5 @@ __all__ = [
     "Observation",
     "ResearchFinding",
     "run_thesis",
+    "thesis_calendar",
 ]
