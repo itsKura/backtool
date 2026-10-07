@@ -273,6 +273,119 @@ class CandidateEvent(BaseModel):
         return self.role is EventRole.PRIMARY
 
 
+class Recurrence(StrEnum):
+    """Whether the concept denotes one occurrence or a series of them.
+
+    A finding about the concept rather than a category anyone configured. The
+    Ethereum Merge happened once; midterm elections are an institution that
+    happens again every cycle; a central bank's rate decisions happen eight
+    times a year. The difference decides what counts as having answered the
+    question, because finding the most recent occurrence of a series is not
+    finding the series.
+
+    Recorded rather than inferred from how many occurrences turned up, because
+    at the point it matters those are the same number: one. A one-off concept
+    with one occurrence is finished, and a recurring concept with one
+    occurrence has barely started.
+    """
+
+    #: Happened once. One occurrence is the whole of it.
+    ONE_OFF = "one-off"
+    #: Happens repeatedly. The occurrences are the answer, not the latest one.
+    RECURRING = "recurring"
+    #: The evidence did not establish which. Spent against as though one-off:
+    #: not knowing is not a reason to buy another search.
+    UNKNOWN = "unknown"
+
+
+class HistoricalCoverage(StrEnum):
+    """Whether the occurrences found are all of the ones in evidence.
+
+    Separate from :class:`ResolutionStatus` because they answer different
+    questions. The status says whether the dates that came back are sound;
+    this says whether there are more of them. A partial series can be
+    perfectly well sourced and perfectly measurable, and still not be what was
+    asked for -- so it is reported rather than treated as a failure, and never
+    quietly rounded up to complete.
+    """
+
+    #: Every occurrence the evidence points to was dated.
+    COMPLETE = "complete"
+    #: The evidence shows occurrences that were not dated.
+    INCOMPLETE = "incomplete"
+    #: Whether more exist could not be established either way.
+    UNKNOWN = "unknown"
+
+
+class ResearchCoverage(BaseModel):
+    """How far the research got, and what it spent getting there.
+
+    Attached to a resolution so the question "is this all of them?" has an
+    answer that does not depend on counting events and guessing. It carries
+    the spend as well as the finding, because the two are the same decision:
+    another search is bought only when coverage would justify it, and a
+    resolution that stopped short should say whether it stopped because it was
+    done or because it ran out of budget.
+
+    Everything here is set in Python. The research reports what it found; what
+    that entitles it to spend is not its own to decide.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    recurrence: Recurrence = Recurrence.UNKNOWN
+    history: HistoricalCoverage = HistoricalCoverage.UNKNOWN
+    #: What the evidence shows is missing, in one line, when anything is --
+    #: "only the 2026 cycle was dated". Descriptive, like the resolution's own
+    #: notes: it explains the state above rather than being the state.
+    gap: str = ""
+    #: Searches actually performed, across every pass.
+    searches_used: int = 0
+    #: The hard ceiling this resolution ran under. Enforced here and again by
+    #: the search tool's own ``max_uses``, so neither depends on the other.
+    searches_allowed: int = 0
+    #: Whether the normal budget was extended because coverage required it.
+    escalated: bool = False
+    #: Why the research stopped where it did -- one line, always present, and
+    #: the same field whether another search happened or not.
+    why_it_stopped: str = ""
+
+    @property
+    def hard_limit_reached(self) -> bool:
+        """Whether the ceiling, rather than sufficiency, ended the research."""
+        return (
+            self.searches_allowed > 0
+            and self.searches_used >= self.searches_allowed
+        )
+
+    @property
+    def was_recorded(self) -> bool:
+        """Whether a search loop filled this in at all.
+
+        The default is blank, because a resolution can be built without one --
+        from a fixture, or replayed from a stored answer. Blank has to read as
+        "nothing was measured about coverage" rather than as a finding, or the
+        absence of a measurement starts appearing in reports as one.
+        """
+        return self.searches_allowed > 0 or bool(self.why_it_stopped)
+
+    @property
+    def is_sufficient(self) -> bool:
+        return self.history is HistoricalCoverage.COMPLETE
+
+    @property
+    def is_partial_series(self) -> bool:
+        """A recurring concept whose occurrences are known to be partial.
+
+        The one state worth a warning on an otherwise sound resolution: the
+        dates are right, they are cited, and there are more of them somewhere.
+        """
+        return (
+            self.recurrence is Recurrence.RECURRING
+            and self.history is not HistoricalCoverage.COMPLETE
+        )
+
+
 class ResolvedEventConcept(BaseModel):
     """What was asked for, what was found, and what is still open.
 
@@ -296,6 +409,11 @@ class ResolvedEventConcept(BaseModel):
     missing_information: tuple[str, ...] = ()
     #: How the resolution was reached, in one or two sentences, for the report.
     resolution_notes: str = ""
+    #: How much of the concept's history the research reached, and what it
+    #: spent. Defaulted, so a resolution assembled without the search loop --
+    #: a fixture, a replayed answer -- is simply uninformative about coverage
+    #: rather than invalid.
+    coverage: ResearchCoverage = ResearchCoverage()
     retrieved_at: dt.datetime = dt.datetime(1970, 1, 1, tzinfo=UTC)
 
     @property
@@ -341,6 +459,31 @@ class ResolvedEventConcept(BaseModel):
         answer them first.
         """
         return tuple(item for item in self.ambiguities if not item.is_blocking)
+
+    @property
+    def coverage_summary(self) -> str:
+        """One sentence: what was found, whether it is all of it, and why.
+
+        Composed here because it needs both halves -- the occurrences are on
+        the resolution and the sufficiency is on the coverage -- and a reader
+        asking "is this all of them?" wants them in one breath.
+        """
+        if not self.coverage.was_recorded:
+            return ""
+        found = len(self.primary_events)
+        noun = "occurrence" if found == 1 else "occurrences"
+        shape = {
+            Recurrence.RECURRING: "A recurring concept: ",
+            Recurrence.ONE_OFF: "A one-time event: ",
+            Recurrence.UNKNOWN: "",
+        }[self.coverage.recurrence]
+        # The count and the shape here; whether that is all of them in the
+        # reason, which already says it. Saying it in both places produced
+        # "A one-time event: 1 occurrence dated. A one-time event: one round
+        # of searching settles it."
+        return (
+            f"{shape}{found} {noun} dated. {self.coverage.why_it_stopped}"
+        ).strip()
 
     @property
     def is_runnable(self) -> bool:
@@ -677,6 +820,9 @@ __all__ = [
     "DayAnchor",
     "EventRole",
     "DynamicEventSet",
+    "HistoricalCoverage",
+    "Recurrence",
+    "ResearchCoverage",
     "ResolutionStatus",
     "ResolvedEventConcept",
     "TemporalPrecision",

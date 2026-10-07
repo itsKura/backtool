@@ -39,6 +39,9 @@ from backtool.events.resolution import (
     AmbiguitySeverity,
     AnchorPolicy,
     DayAnchor,
+    HistoricalCoverage,
+    Recurrence,
+    ResearchCoverage,
     ResolutionStatus,
     ResolvedEventConcept,
 )
@@ -842,3 +845,82 @@ class TestTheEngineMeasuresIt:
         """A one-off protocol upgrade is not a release, and the engine's own
         vocabulary should not leak into an answer about one."""
         assert "Ethereum Merge" in finding.cohort.label
+class TestThePageSaysWhetherTheDatesAreAllOfThem:
+    """A sample read as a whole set is the quiet failure worth printing against.
+
+    Two dated midterms and twenty in history look identical on a results page:
+    same provenance, same sources, same median. The sentence goes under the
+    dates because it changes how they should be read, and a reader who never
+    scrolls to the caveats still sees it.
+    """
+
+    def recurring(self, **overrides: object) -> ResolvedEventConcept:
+        base = dict(
+            recurrence=Recurrence.RECURRING,
+            history=HistoricalCoverage.INCOMPLETE,
+            searches_used=4,
+            searches_allowed=4,
+            escalated=True,
+            gap="cycles before 2018 were not dated",
+            why_it_stopped=(
+                "The set is still incomplete, and the hard limit of 4 "
+                "searches was reached."
+            ),
+        )
+        base.update(overrides)
+        return midterms().model_copy(
+            update={"coverage": ResearchCoverage(**base)}  # type: ignore[arg-type]
+        )
+
+    def test_a_partial_series_says_so_under_the_dates(self) -> None:
+        thesis = dynamic_thesis(
+            resolution=self.recurring(),
+            anchor=DayAnchor(policy=AnchorPolicy.DAY_END),
+        )
+        html = render_event_provenance(thesis)
+        assert "A recurring concept: 2 occurrences dated." in html
+        assert "still incomplete" in html
+
+    def test_it_says_why_the_search_stopped(self) -> None:
+        thesis = dynamic_thesis(
+            resolution=self.recurring(),
+            anchor=DayAnchor(policy=AnchorPolicy.DAY_END),
+        )
+        assert "hard limit of 4 searches" in render_event_provenance(thesis)
+
+    def test_a_complete_series_says_that_instead(self) -> None:
+        thesis = dynamic_thesis(
+            resolution=self.recurring(
+                history=HistoricalCoverage.COMPLETE,
+                gap="",
+                why_it_stopped="That is every occurrence the evidence points to.",
+            ),
+            anchor=DayAnchor(policy=AnchorPolicy.DAY_END),
+        )
+        html = render_event_provenance(thesis)
+        assert "every occurrence the evidence points to" in html
+        assert "incomplete" not in html
+
+    def test_a_resolution_with_no_coverage_recorded_says_nothing(self) -> None:
+        """The default is blank, and blank is the absence of a measurement.
+        Printing "0 occurrences dated" from it would turn that absence into a
+        finding."""
+        thesis = dynamic_thesis(resolution=eth_merge())
+        html = render_event_provenance(thesis)
+        assert "occurrence dated" not in html
+        assert "occurrences dated" not in html
+
+    def test_a_one_off_is_described_as_one(self) -> None:
+        resolution = eth_merge().model_copy(
+            update={
+                "coverage": ResearchCoverage(
+                    recurrence=Recurrence.ONE_OFF,
+                    history=HistoricalCoverage.COMPLETE,
+                    searches_used=1,
+                    searches_allowed=4,
+                    why_it_stopped="There are no further occurrences to find.",
+                )
+            }
+        )
+        html = render_event_provenance(dynamic_thesis(resolution=resolution))
+        assert "A one-time event: 1 occurrence dated" in html

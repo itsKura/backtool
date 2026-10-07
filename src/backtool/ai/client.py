@@ -150,6 +150,38 @@ class ServerToolOutcome(BaseModel):
     def had_tool_error(self) -> bool:
         return bool(self.tool_errors)
 
+    def merged_with(self, other: ServerToolOutcome) -> ServerToolOutcome:
+        """Two passes over one question, as a single body of evidence.
+
+        A caller that asks a follow-up -- another search round because the
+        first left a gap -- ends up holding two outcomes describing one piece
+        of research, and everything downstream wants one. Counts and usage
+        add, because both were billed; citations and queries keep the order
+        they arrived in, because that order is a record of what was looked up
+        when; and the prose is concatenated rather than replaced, since the
+        second pass answers a narrower question than the first and reads as a
+        continuation of it.
+
+        Duplicate sources are not merged here. One page can legitimately turn
+        up in both passes, and which records describe the same source is a
+        question about urls rather than about requests -- see
+        :func:`backtool.ai.evidence.build_evidence`, which already merges on
+        exactly that.
+        """
+        return ServerToolOutcome(
+            text="\n\n".join(
+                part for part in (self.text, other.text) if part.strip()
+            ),
+            citations=self.citations + other.citations,
+            queries=self.queries + other.queries,
+            search_requests=self.search_requests + other.search_requests,
+            tool_errors=tuple(dict.fromkeys(self.tool_errors + other.tool_errors)),
+            usage={
+                key: self.usage.get(key, 0) + other.usage.get(key, 0)
+                for key in {*self.usage, *other.usage}
+            },
+        )
+
 
 class AIError(RuntimeError):
     """The AI layer could not produce a usable result."""

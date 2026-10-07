@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 from typing import Any
 
 import httpx
@@ -38,9 +39,11 @@ from backtool.ai.event_resolver import (
     EXTRACTION_MODEL_ENV,
     EXTRACTION_SYSTEM,
     EXTRACTION_THINKS,
+    MAX_RESEARCH_PASSES,
     MAX_SEARCHES,
     RESEARCH_EFFORT,
     RESEARCH_SYSTEM,
+    SEARCH_CEILING,
     SEARCH_MODEL_ENV,
     SEARCH_TOOL_TYPE,
     AmbiguityClaim,
@@ -63,6 +66,8 @@ from backtool.events.resolution import (
     AnchorPolicy,
     DayAnchor,
     EventRole,
+    HistoricalCoverage,
+    Recurrence,
     ResolutionStatus,
     compile_event_set,
     resolves_to_one_candle,
@@ -2686,3 +2691,747 @@ class TestResolverStaysInItsLane:
     def test_a_malformed_extraction_is_refused(self) -> None:
         with pytest.raises(AIError, match="did not match the expected shape"):
             resolve(extraction={"canonical_name": "x"})
+# --------------------------------------------------------------------------
+
+
+class Rounds:
+    """Fake transport serving a scripted sequence of rounds.
+
+    The resolver alternates stage A and stage B, so a resolution that
+    escalates makes four requests. Routed on order rather than on content: a
+    fixture that inspected what was asked would be testing its own guess about
+    the prompt, where the thing under test is how many times the resolver asks
+    and with what budget.
+    """
+
+    def __init__(self, *rounds: tuple[dict[str, Any], dict[str, Any] | str]) -> None:
+        self.rounds = list(rounds)
+        self.requests: list[dict[str, Any]] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        self.requests.append(body)
+        # Stage A always precedes its own stage B, so the count of tool-using
+        # requests so far names the round either of them belongs to.
+        index = min(len(self.searches) - 1, len(self.rounds) - 1)
+        if "tools" in body:
+            return httpx.Response(200, json=self.rounds[index][0])
+        claim = self.rounds[index][1]
+        text = claim if isinstance(claim, str) else json.dumps(claim)
+        return httpx.Response(
+            200,
+            json={
+                "content": [{"type": "text", "text": text}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 400, "output_tokens": 200},
+            },
+        )
+
+    @property
+    def searches(self) -> list[dict[str, Any]]:
+        return [body for body in self.requests if "tools" in body]
+
+    @property
+    def extractions(self) -> list[dict[str, Any]]:
+        return [body for body in self.requests if "tools" not in body]
+
+    @property
+    def budgets(self) -> list[int]:
+        """The ``max_uses`` granted to each round, in order."""
+        return [int(body["tools"][0]["max_uses"]) for body in self.searches]
+
+    def payload(self, round_number: int = 1) -> dict[str, Any]:
+        """What stage B was handed in a given round."""
+        body = self.extractions[round_number - 1]
+        return json.loads(body["messages"][0]["content"])
+
+
+def rounds_for(transport: Rounds) -> AIClient:
+    return AIClient(
+        api_key="test-key",
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(transport), base_url="https://example.test"
+        ),
+        max_retries=1,
+    )
+
+
+def run_rounds(
+    *rounds: tuple[dict[str, Any], dict[str, Any] | str],
+    query: str = "United States midterm elections",
+    **kwargs: Any,
+):  # type: ignore[no-untyped-def]
+    transport = Rounds(*rounds)
+    concept = resolve_event_concept(
+        query, client=rounds_for(transport), now=NOW, **kwargs
+    )
+    return concept, transport
+
+
+def series_claim(
+    *events: tuple[str, str, str],
+    recurrence: str = "recurring",
+    coverage: str = "incomplete",
+    gap: str = "only the most recent cycle was dated",
+    **overrides: Any,
+) -> dict[str, Any]:
+    """A claim about a series, built from ``(label, date, source_id)`` triples.
+
+    Written as a helper because every test here varies the same three things:
+    how many occurrences were dated, what the research said about whether
+    that is all of them, and nothing else.
+    """
+    claim: dict[str, Any] = {
+        "canonical_name": "United States midterm elections",
+        "status": "resolved",
+        "events": [
+            {
+                "label": label,
+                "date": date,
+                "time": "",
+                "timezone": "America/New_York",
+                "evidence_source_ids": [source_id],
+                "role": "primary",
+            }
+            for label, date, source_id in events
+        ],
+        "sources": [
+            {
+                "source_id": source_id,
+                "publisher": "US Federal Election Commission",
+                "authority": "official",
+                "dates_event": label,
+            }
+            for label, _date, source_id in events
+        ],
+        "recurrence": recurrence,
+        "historical_coverage": coverage,
+        "coverage_gap": gap,
+        "ambiguities": [],
+        "missing_information": [],
+        "notes": "Election days from the FEC's published results pages.",
+    }
+    claim.update(overrides)
+    return claim
+
+
+LATEST_ONLY = search_response(
+    text="The FEC publishes a results page for the most recent election.",
+    cited=[(FEC_2022, "2022 election results", "Election Day was November 8, 2022.")],
+    searches=2,
+)
+
+#: A round that spends nothing and finds nothing new: the same page back, no
+#: search reported. What bounds this is the round cap, since the search count
+#: the ceiling is checked against never moves.
+STALLED = search_response(
+    text="No pages beyond the one already read.",
+    cited=[(FEC_2022, "2022 election results", "Election Day was November 8, 2022.")],
+    searches=0,
+)
+
+EARLIER = search_response(
+    text="The 2018 cycle has its own results page.",
+    cited=[(FEC_2018, "2018 election results", "Election Day was November 6, 2018.")],
+    searches=2,
+)
+
+# Ids are assigned over the merged evidence, in retrieval order: the first
+# round's page is source_1 and the second round's is source_2.
+ONE_CYCLE = series_claim(("2022 midterm elections", "2022-11-08", "source_1"))
+BOTH_CYCLES = series_claim(
+    ("2022 midterm elections", "2022-11-08", "source_1"),
+    ("2018 midterm elections", "2018-11-06", "source_2"),
+    coverage="complete",
+    gap="",
+)
+
+
+class TestAOneOffEventStaysCheap:
+    """The case that must not regress, and the reason the rule is narrow.
+
+    A date lookup for something that happened once is the common request and
+    the one the cost was optimised for. Nothing about coverage may make it buy
+    a search it has no use for -- and "no use for" has to be decided without
+    knowing what the event was.
+    """
+
+    def test_one_round_is_offered_two_searches(self) -> None:
+        _concept, transport = run_rounds((MERGE_SEARCH, MERGE_CLAIM))
+        assert transport.budgets == [MAX_SEARCHES]
+
+    def test_a_grounded_one_off_buys_no_second_round(self) -> None:
+        concept, transport = run_rounds(
+            (
+                search_response(
+                    text="The Ethereum Foundation recorded the Merge.",
+                    cited=[
+                        (
+                            EF_URL,
+                            "The Merge",
+                            "The Merge was completed on September 15, 2022 at 06:42 UTC.",
+                        )
+                    ],
+                    searches=1,
+                ),
+                dict(MERGE_CLAIM, recurrence="one-off", historical_coverage="complete"),
+            ),
+            query="Ethereum Merge",
+        )
+        assert len(transport.searches) == 1
+        assert concept.coverage.searches_used == 1
+        assert not concept.coverage.escalated
+        assert "no further occurrences" in concept.coverage.why_it_stopped
+
+    def test_a_one_off_may_spend_its_second_search_and_then_stop(self) -> None:
+        """Case B: two searches is what the starting budget is for.
+
+        A one-off that needed both of them is not escalation -- nothing was
+        authorised beyond the normal budget -- and it still must not reach for
+        a third.
+        """
+        concept, transport = run_rounds(
+            (
+                search_response(
+                    text="Confirmed against a second source.",
+                    cited=[
+                        (
+                            EF_URL,
+                            "The Merge",
+                            "The Merge was completed on September 15, 2022 at 06:42 UTC.",
+                        )
+                    ],
+                    searches=2,
+                ),
+                dict(MERGE_CLAIM, recurrence="one-off", historical_coverage="complete"),
+            ),
+            query="Ethereum Merge",
+        )
+        assert len(transport.searches) == 1
+        assert concept.coverage.searches_used == 2
+        assert not concept.coverage.escalated
+
+    def test_a_single_occurrence_of_a_one_off_counts_as_complete(self) -> None:
+        """Decided here, not taken from the extraction. There is nothing else
+        for a one-time event to have."""
+        concept, _ = run_rounds(
+            (
+                MERGE_SEARCH,
+                dict(
+                    MERGE_CLAIM, recurrence="one-off", historical_coverage="incomplete"
+                ),
+            ),
+            query="Ethereum Merge",
+        )
+        assert concept.coverage.history is HistoricalCoverage.COMPLETE
+        assert concept.coverage.is_sufficient
+
+    def test_an_unestablished_recurrence_buys_nothing(self) -> None:
+        """The default, and the safe direction. Not knowing whether a concept
+        recurs is not a reason to pay on the chance that it does."""
+        concept, transport = run_rounds((LATEST_ONLY, series_claim(
+            ("2022 midterm elections", "2022-11-08", "source_1"),
+            recurrence="unknown",
+        )))
+        assert len(transport.searches) == 1
+        assert concept.coverage.recurrence is Recurrence.UNKNOWN
+        assert "was not established" in concept.coverage.why_it_stopped
+
+    @pytest.mark.parametrize("spoken", ["", "sometimes", "periodic?", "yes"])
+    def test_an_unreadable_answer_reads_as_unknown(self, spoken: str) -> None:
+        concept, transport = run_rounds((LATEST_ONLY, series_claim(
+            ("2022 midterm elections", "2022-11-08", "source_1"),
+            recurrence=spoken,
+        )))
+        assert concept.coverage.recurrence is Recurrence.UNKNOWN
+        assert len(transport.searches) == 1
+
+
+class TestARecurringConceptCanEarnMoreSearches:
+    """Case C, and the point of the whole iteration.
+
+    Two searches find the most recent occurrence of a series and stop. That is
+    not an answer to "midterm elections", and the old resolver could not tell
+    the difference: one date with a status of ``resolved`` looked exactly like
+    a settled one-off.
+    """
+
+    def test_an_incomplete_series_buys_a_second_round(self) -> None:
+        _concept, transport = run_rounds((LATEST_ONLY, ONE_CYCLE), (EARLIER, BOTH_CYCLES))
+        assert len(transport.searches) == 2
+
+    def test_the_second_round_gets_what_is_left_of_the_ceiling(self) -> None:
+        _concept, transport = run_rounds((LATEST_ONLY, ONE_CYCLE), (EARLIER, BOTH_CYCLES))
+        # Two spent of four, so two remain.
+        assert transport.budgets == [MAX_SEARCHES, SEARCH_CEILING - MAX_SEARCHES]
+
+    def test_an_unspent_first_round_leaves_more_for_the_second(self) -> None:
+        """The ceiling is on the total, not on the round. A first round that
+        used one of its two leaves three."""
+        _concept, transport = run_rounds(
+            (
+                search_response(
+                    text="One search found the latest cycle.",
+                    cited=[
+                        (FEC_2022, "2022 results", "Election Day was November 8, 2022.")
+                    ],
+                    searches=1,
+                ),
+                ONE_CYCLE,
+            ),
+            (EARLIER, BOTH_CYCLES),
+        )
+        assert transport.budgets == [MAX_SEARCHES, SEARCH_CEILING - 1]
+
+    def test_the_second_round_is_told_what_is_already_settled(self) -> None:
+        """So it does not buy the same dates again. The only thing carried
+        across from the first round, and it is five lines rather than every
+        search result the first round accumulated."""
+        _concept, transport = run_rounds(
+            (LATEST_ONLY, ONE_CYCLE), (EARLIER, BOTH_CYCLES)
+        )
+        asked = transport.searches[1]["messages"][0]["content"]
+        assert "2022-11-08" in asked
+        assert "United States midterm elections" in asked
+        assert "settled" in asked
+        assert "only the most recent cycle was dated" in asked
+
+    def test_the_second_round_reuses_the_same_system_prompt(self) -> None:
+        """Identical text, so it is a cache read rather than a second write."""
+        _concept, transport = run_rounds(
+            (LATEST_ONLY, ONE_CYCLE), (EARLIER, BOTH_CYCLES)
+        )
+        first, second = (body["system"][0]["text"] for body in transport.searches)
+        assert first == second == RESEARCH_SYSTEM
+
+    def test_stage_b_sees_the_evidence_from_both_rounds(self) -> None:
+        """Merged and re-numbered, not appended. Stage B is answering over one
+        body of evidence, so the ids have to mean one thing."""
+        _concept, transport = run_rounds(
+            (LATEST_ONLY, ONE_CYCLE), (EARLIER, BOTH_CYCLES)
+        )
+        urls = [source["url"] for source in transport.payload(2)["sources"]]
+        assert urls == [FEC_2022, FEC_2018]
+        assert [source["source_id"] for source in transport.payload(2)["sources"]] == [
+            "source_1",
+            "source_2",
+        ]
+
+    def test_the_occurrences_from_both_rounds_are_measured(self) -> None:
+        concept, _ = run_rounds((LATEST_ONLY, ONE_CYCLE), (EARLIER, BOTH_CYCLES))
+        assert [event.local_date.isoformat() for event in concept.primary_events] == [
+            "2018-11-06",
+            "2022-11-08",
+        ]
+
+    def test_a_single_occurrence_of_a_series_is_never_complete(self) -> None:
+        """Decided here, against what the extraction said. A series of one is
+        not a series, and "found the latest one" is the exact state this
+        exists to catch -- so it is not left to the step that would have to
+        admit it."""
+        concept, transport = run_rounds(
+            (
+                LATEST_ONLY,
+                series_claim(
+                    ("2022 midterm elections", "2022-11-08", "source_1"),
+                    coverage="complete",
+                    gap="",
+                ),
+            ),
+            (EARLIER, BOTH_CYCLES),
+        )
+        assert len(transport.searches) == 2
+        assert concept.coverage.is_sufficient
+
+
+class TestItStopsWhenCoverageIsEnough:
+    """Case D. The ceiling is a limit, not a target."""
+
+    def test_a_sufficient_series_stops_before_the_ceiling(self) -> None:
+        concept, transport = run_rounds(
+            (LATEST_ONLY, ONE_CYCLE),
+            (
+                search_response(
+                    text="The 2018 cycle has its own page.",
+                    cited=[
+                        (FEC_2018, "2018 results", "Election Day was November 6, 2018.")
+                    ],
+                    searches=1,
+                ),
+                BOTH_CYCLES,
+            ),
+        )
+        assert len(transport.searches) == 2
+        assert concept.coverage.searches_used == 3
+        assert concept.coverage.searches_used < SEARCH_CEILING
+        assert not concept.coverage.hard_limit_reached
+        assert concept.coverage.is_sufficient
+        assert "every occurrence the evidence points to" in concept.coverage.why_it_stopped
+
+    def test_a_sufficient_series_says_nothing_about_missing_history(self) -> None:
+        concept, _ = run_rounds((LATEST_ONLY, ONE_CYCLE), (EARLIER, BOTH_CYCLES))
+        assert not any(
+            "not all of them" in item for item in concept.missing_information
+        )
+
+    def test_it_records_that_the_budget_was_extended(self) -> None:
+        concept, _ = run_rounds((LATEST_ONLY, ONE_CYCLE), (EARLIER, BOTH_CYCLES))
+        assert concept.coverage.escalated
+
+
+class TestAnIncompleteSeriesIsReportedAsIncomplete:
+    """Case E. The failure this must never turn into is a quiet one."""
+
+    def test_it_stops_at_the_hard_limit(self) -> None:
+        concept, transport = run_rounds(
+            (LATEST_ONLY, ONE_CYCLE), (EARLIER, series_claim(
+                ("2022 midterm elections", "2022-11-08", "source_1"),
+                ("2018 midterm elections", "2018-11-06", "source_2"),
+                gap="cycles before 2018 were not dated",
+            ))
+        )
+        assert len(transport.searches) == 2
+        assert concept.coverage.searches_used == SEARCH_CEILING
+        assert concept.coverage.hard_limit_reached
+        assert f"hard limit of {SEARCH_CEILING}" in concept.coverage.why_it_stopped
+
+    def test_the_shortfall_reaches_the_report(self) -> None:
+        concept, _ = run_rounds(
+            (LATEST_ONLY, ONE_CYCLE), (EARLIER, series_claim(
+                ("2022 midterm elections", "2022-11-08", "source_1"),
+                ("2018 midterm elections", "2018-11-06", "source_2"),
+                gap="cycles before 2018 were not dated",
+            ))
+        )
+        assert concept.coverage.history is HistoricalCoverage.INCOMPLETE
+        assert concept.coverage.is_partial_series
+        warning = concept.missing_information[0]
+        assert "not all of them" in warning
+        assert "cycles before 2018 were not dated" in warning
+        assert "sample of the concept's history" in warning
+
+    def test_a_gap_written_as_a_sentence_does_not_double_the_full_stop(
+        self,
+    ) -> None:
+        """Observed live: the research wrote a finished sentence, and the
+        warning came out "... were not searched.. What follows"."""
+        concept, _ = run_rounds(
+            (LATEST_ONLY, ONE_CYCLE),
+            (
+                EARLIER,
+                series_claim(
+                    ("2022 midterm elections", "2022-11-08", "source_1"),
+                    ("2018 midterm elections", "2018-11-06", "source_2"),
+                    gap="Cycles before 2018 were not searched for.",
+                ),
+            ),
+        )
+        assert ".." not in concept.missing_information[0]
+        assert "not searched for. What follows" in concept.missing_information[0]
+
+    def test_a_partial_series_is_still_measurable(self) -> None:
+        """Incomplete coverage is a disclosure, not a refusal. The dates found
+        are sound, cited and measurable; what a reader needs is to know they
+        are a sample."""
+        concept, _ = run_rounds(
+            (LATEST_ONLY, ONE_CYCLE), (EARLIER, series_claim(
+                ("2022 midterm elections", "2022-11-08", "source_1"),
+                ("2018 midterm elections", "2018-11-06", "source_2"),
+            ))
+        )
+        assert concept.status is ResolutionStatus.RESOLVED
+        assert concept.is_runnable
+
+    def test_it_is_summarised_in_one_sentence(self) -> None:
+        concept, _ = run_rounds(
+            (LATEST_ONLY, ONE_CYCLE), (EARLIER, series_claim(
+                ("2022 midterm elections", "2022-11-08", "source_1"),
+                ("2018 midterm elections", "2018-11-06", "source_2"),
+            ))
+        )
+        summary = concept.coverage_summary
+        assert summary.startswith("A recurring concept: 2 occurrences dated.")
+        assert "hard limit" in summary
+
+    def test_a_complete_series_summarises_as_complete(self) -> None:
+        concept, _ = run_rounds((LATEST_ONLY, ONE_CYCLE), (EARLIER, BOTH_CYCLES))
+        summary = concept.coverage_summary
+        assert summary.startswith("A recurring concept: 2 occurrences dated.")
+        assert "every occurrence the evidence points to" in summary
+
+
+class TestClarificationIsNotBoughtWithSearches:
+    """Case F.
+
+    A question only the reader can answer does not get cheaper with more
+    pages, and spending on it is spending to guess at their answer. This is
+    the one stop condition that is about the reader rather than the evidence.
+    """
+
+    def test_a_blocking_question_ends_the_research(self) -> None:
+        concept, transport = run_rounds(
+            (
+                LATEST_ONLY,
+                series_claim(
+                    ("2022 midterm elections", "2022-11-08", "source_1"),
+                    ambiguities=[
+                        {
+                            "question": "Which chamber's elections do you mean?",
+                            "affects_event": "",
+                            "blocks_research": True,
+                            "candidate_times": [],
+                        }
+                    ],
+                ),
+            ),
+            (EARLIER, BOTH_CYCLES),
+        )
+        assert len(transport.searches) == 1
+        assert not concept.is_runnable
+        assert "reader has to settle" in concept.coverage.why_it_stopped
+        assert "Which chamber" in concept.coverage.why_it_stopped
+
+    def test_an_informational_question_does_not_end_it(self) -> None:
+        """The distinction has to be the severity and not the presence of a
+        question, or an incomplete series could never be finished: a series
+        raises questions by existing."""
+        _concept, transport = run_rounds(
+            (
+                LATEST_ONLY,
+                series_claim(
+                    ("2022 midterm elections", "2022-11-08", "source_1"),
+                    ambiguities=[
+                        {
+                            "question": "Do runoffs count as part of the cycle?",
+                            "affects_event": "",
+                            "blocks_research": False,
+                            "candidate_times": [],
+                        }
+                    ],
+                ),
+            ),
+            (EARLIER, BOTH_CYCLES),
+        )
+        assert len(transport.searches) == 2
+
+    def test_nothing_found_at_all_is_not_a_coverage_gap(self) -> None:
+        """Searching again for a concept no source recognised is retrying a
+        failed lookup. The answer a reader needs is the refusal."""
+        concept, transport = run_rounds(
+            (
+                search_response(text="Nothing authoritative was found.", searches=2),
+                series_claim(status="not found", events=[], sources=[]),
+            ),
+            (EARLIER, BOTH_CYCLES),
+        )
+        assert len(transport.searches) == 1
+        assert concept.status is ResolutionStatus.NOT_FOUND
+        assert "No occurrence was dated at all" in concept.coverage.why_it_stopped
+
+
+class TestTheCeilingIsEnforcedInPython:
+    """Case G. Two independent bounds, because one of them is a model's word.
+
+    The search tool's ``max_uses`` caps a single request server-side, and
+    Python subtracts what has been spent before authorising any more. Neither
+    depends on the other being right, which is the only reason the second one
+    is worth having.
+    """
+
+    def test_no_round_is_granted_more_than_the_ceiling(self) -> None:
+        _concept, transport = run_rounds((LATEST_ONLY, ONE_CYCLE), (EARLIER, BOTH_CYCLES))
+        assert all(budget <= SEARCH_CEILING for budget in transport.budgets)
+
+    def test_the_granted_searches_never_exceed_the_ceiling(self) -> None:
+        _concept, transport = run_rounds((LATEST_ONLY, ONE_CYCLE), (EARLIER, BOTH_CYCLES))
+        assert sum(transport.budgets) <= SEARCH_CEILING
+
+    def test_a_ceiling_equal_to_the_budget_forbids_escalation(self) -> None:
+        """Which is what the resolver did before this existed, available as a
+        configuration rather than as a code change."""
+        _concept, transport = run_rounds(
+            (LATEST_ONLY, ONE_CYCLE),
+            (EARLIER, BOTH_CYCLES),
+            search_ceiling=MAX_SEARCHES,
+        )
+        assert len(transport.searches) == 1
+
+    def test_a_ceiling_below_the_budget_cannot_shrink_it(self) -> None:
+        """A starting budget is not reduced by a smaller ceiling: the two would
+        contradict each other, and the explicit one wins."""
+        _concept, transport = run_rounds(
+            (LATEST_ONLY, ONE_CYCLE), max_searches=2, search_ceiling=1
+        )
+        assert transport.budgets == [2]
+
+    def test_an_over_reported_round_still_ends_the_research(self) -> None:
+        """A search count larger than what was granted would be an API fault,
+        and the bound still holds: more spent than authorised leaves nothing
+        to authorise."""
+        concept, transport = run_rounds(
+            (
+                search_response(
+                    text="The latest cycle.",
+                    cited=[
+                        (FEC_2022, "2022 results", "Election Day was November 8, 2022.")
+                    ],
+                    searches=99,
+                ),
+                ONE_CYCLE,
+            ),
+            (EARLIER, BOTH_CYCLES),
+        )
+        assert len(transport.searches) == 1
+        assert f"hard limit of {SEARCH_CEILING}" in concept.coverage.why_it_stopped
+
+    def test_the_rounds_are_bounded_as_well_as_the_searches(self) -> None:
+        """A round that reports a gap and spends nothing would otherwise take
+        the same decision on the same evidence for ever.
+
+        ``STALLED`` is that round: it returns the page the first round already
+        had and reports no search, so the count the ceiling is checked against
+        does not move. Only the round cap ends this.
+        """
+        _concept, transport = run_rounds(
+            (LATEST_ONLY, ONE_CYCLE), (STALLED, ONE_CYCLE), (STALLED, ONE_CYCLE)
+        )
+        assert len(transport.searches) == MAX_RESEARCH_PASSES
+
+    def test_the_round_cap_is_reported_as_the_reason(self) -> None:
+        concept, _ = run_rounds((LATEST_ONLY, ONE_CYCLE), (STALLED, ONE_CYCLE))
+        assert concept.coverage.searches_used < SEARCH_CEILING
+        assert "one further round" in concept.coverage.why_it_stopped
+
+
+class TestEscalationReadsTheCoverageNotTheConcept:
+    """Case H, behaviourally. :class:`TestNoEventSpecificLogic` scans the
+    source; this checks the consequence.
+    """
+
+    def test_the_same_coverage_escalates_whatever_the_concept_is_called(
+        self,
+    ) -> None:
+        for query in ("United States midterm elections", "Bitcoin halvings", "zzz"):
+            _concept, transport = run_rounds(
+                (LATEST_ONLY, ONE_CYCLE), (EARLIER, BOTH_CYCLES), query=query
+            )
+            assert len(transport.searches) == 2, query
+
+    def test_a_one_off_label_on_a_recurring_concept_stops_it(self) -> None:
+        """The decision follows the reported shape, so a concept that recurs
+        but was read as one-off stops. Wrong, and wrong in the direction that
+        costs a reader nothing."""
+        _concept, transport = run_rounds(
+            (
+                LATEST_ONLY,
+                series_claim(
+                    ("2022 midterm elections", "2022-11-08", "source_1"),
+                    recurrence="one-off",
+                ),
+            ),
+            (EARLIER, BOTH_CYCLES),
+        )
+        assert len(transport.searches) == 1
+
+
+class TestTheSafeguardsSurviveASecondRound:
+    """Case I. A second round is more untrusted pages, not fewer.
+
+    Everything that holds for one round has to hold for two, and the pass that
+    arrives last is the one a page would want to arrive in -- by then there is
+    an established answer for it to contradict.
+    """
+
+    def test_a_poisoned_page_in_the_second_round_cannot_ground_a_date(self) -> None:
+        concept, _ = run_rounds(
+            (LATEST_ONLY, ONE_CYCLE),
+            (
+                search_response(
+                    text="A page with a different date.",
+                    cited=[
+                        (
+                            HOSTILE_URL,
+                            "Election facts",
+                            "The 2018 election was held on January 1, 2018.",
+                        )
+                    ],
+                    searches=2,
+                ),
+                series_claim(
+                    ("2022 midterm elections", "2022-11-08", "source_1"),
+                    ("2018 midterm elections", "2018-11-06", "source_2"),
+                ),
+            ),
+        )
+        # The claimed date is contradicted by the only source cited for it.
+        assert [event.local_date.isoformat() for event in concept.primary_events] == [
+            "2022-11-08"
+        ]
+        assert any("other dates than" in item for item in concept.missing_information)
+
+    def test_an_invented_source_in_the_second_round_is_still_refused(self) -> None:
+        concept, _ = run_rounds(
+            (LATEST_ONLY, ONE_CYCLE),
+            (
+                EARLIER,
+                series_claim(
+                    ("2022 midterm elections", "2022-11-08", "source_1"),
+                    ("2014 midterm elections", "2014-11-04", "source_99"),
+                ),
+            ),
+        )
+        assert len(concept.primary_events) == 1
+        assert any("cites no source" in item for item in concept.missing_information)
+
+    def test_roles_still_filter_what_a_second_round_turns_up(self) -> None:
+        claim = series_claim(
+            ("2022 midterm elections", "2022-11-08", "source_1"),
+            ("2018 midterm elections", "2018-11-06", "source_2"),
+        )
+        claim["events"][1]["role"] = "related"
+        concept, _ = run_rounds((LATEST_ONLY, ONE_CYCLE), (EARLIER, claim))
+        assert len(concept.primary_events) == 1
+        assert len(concept.related_events) == 1
+
+    def test_stage_b_still_has_no_tools_in_either_round(self) -> None:
+        _concept, transport = run_rounds(
+            (LATEST_ONLY, ONE_CYCLE), (EARLIER, BOTH_CYCLES)
+        )
+        assert len(transport.extractions) == 2
+        assert all("tools" not in body for body in transport.extractions)
+
+    def test_a_tool_error_in_either_round_is_reported(self) -> None:
+        failed = search_response(text="Partial.", searches=1)
+        failed["content"].append(
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srv_2",
+                "content": {
+                    "type": "web_search_tool_result_error",
+                    "error_code": "max_uses_exceeded",
+                },
+            }
+        )
+        concept, _ = run_rounds((LATEST_ONLY, ONE_CYCLE), (failed, BOTH_CYCLES))
+        assert any("max_uses_exceeded" in item for item in concept.missing_information)
+
+
+class TestEveryPaidCallInEveryRoundIsPriced:
+    """Four requests mean four bills, and a figure nobody recorded is one
+    somebody later recalls wrongly."""
+
+    def test_both_rounds_of_both_stages_are_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.INFO, logger="backtool.ai.usage"):
+            run_rounds((LATEST_ONLY, ONE_CYCLE), (EARLIER, BOTH_CYCLES))
+        assert caplog.text.count("resolver stage A") == 2
+        assert caplog.text.count("resolver stage B") == 2
+        assert "for coverage" in caplog.text
+
+    def test_the_total_counts_every_search(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.INFO, logger="backtool.ai"):
+            run_rounds((LATEST_ONLY, ONE_CYCLE), (EARLIER, BOTH_CYCLES))
+        assert "4 searches" in caplog.text

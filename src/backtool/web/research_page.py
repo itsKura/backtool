@@ -147,6 +147,14 @@ def render_event_provenance(thesis: Thesis) -> str:
         for source in _cited_sources(resolution)
     )
 
+    # Immediately after the dates, and phrased as what it is: a statement
+    # about how many occurrences exist, not a warning about the ones found.
+    reach = (
+        f'<p class="muted">{escape(resolution.coverage_summary)}</p>'
+        if resolution.coverage_summary
+        else ""
+    )
+
     related = resolution.related_events
     context = (
         '<p class="muted">Also found, and deliberately not measured: '
@@ -186,6 +194,7 @@ def render_event_provenance(thesis: Thesis) -> str:
         '<div class="spec-provenance">'
         f'<p class="spec-head">Dates established from published sources</p>'
         f'<div class="spec-card">{rows}</div>'
+        f"{reach}"
         f"{context}"
         f"{open_questions}"
         "<p><strong>Sources</strong></p>"

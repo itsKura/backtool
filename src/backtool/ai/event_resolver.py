@@ -29,6 +29,22 @@ What is deliberately not automated
 Disagreement. If sources of comparable standing give different dates, the
 status says so and the candidates are returned side by side. Picking one would
 produce a confident answer whose confidence nothing earned.
+
+A known limitation of the search budget
+---------------------------------------
+How deep to search a recurring concept's history is bounded by a flat number,
+:data:`SEARCH_CEILING`, and not by how much of that history could be measured.
+It should be the latter: there is no point establishing when an election was
+held decades before the first candle in the dataset, and the occurrences that
+do fall inside it are worth more searches than the ones that do not.
+
+Nothing at this boundary knows that range. The resolver is handed a concept and
+nothing else, and ``ai/`` may not import ``data/`` at all -- which is the
+constraint that keeps a model from touching a candle, and is worth far more
+than a smarter budget. Closing the gap means the *caller* passing a researchable
+window down, since the caller is the layer that may ask both sides. Until then
+the ceiling is deliberately crude, and a recurring concept reports which
+occurrences it dated rather than implying they are the ones that matter.
 """
 
 from __future__ import annotations
@@ -37,6 +53,7 @@ import datetime as dt
 import json
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -52,7 +69,7 @@ from backtool.ai.evidence import (
     supports_time,
     unused_contradictions,
 )
-from backtool.ai.usage import log_cost
+from backtool.ai.usage import Cost, log_cost
 from backtool.core.time import UTC, LocalTimeError, floor_to_interval, local_to_utc
 from backtool.events.models import SourceAuthority, SourceRef
 from backtool.events.resolution import (
@@ -61,6 +78,9 @@ from backtool.events.resolution import (
     AmbiguitySeverity,
     CandidateEvent,
     EventRole,
+    HistoricalCoverage,
+    Recurrence,
+    ResearchCoverage,
     ResolutionStatus,
     ResolvedEventConcept,
     resolves_to_one_candle,
@@ -92,6 +112,28 @@ SEARCH_TOOL_TYPE = "web_search_20250305"
 #: still is not settled after two is normally ambiguous rather than obscure,
 #: and saying so is the right answer rather than searching harder.
 MAX_SEARCHES = 2
+
+#: The most searches any one resolution may perform, across every round.
+#:
+#: :data:`MAX_SEARCHES` is what a lookup starts with; this is what it can reach
+#: if the research reports a gap only more searching could fill. The gap in
+#: question is a specific one -- see :func:`_more_searches` -- and the ceiling
+#: exists because "search until satisfied" has no cost ceiling at all, and a
+#: model reporting its own progress is not a reliable one to ask when to stop.
+#:
+#: Enforced twice, deliberately. Python subtracts what has been spent before
+#: authorising more, and each request's ``max_uses`` caps that request
+#: server-side, so neither check depends on the other being right.
+SEARCH_CEILING = 4
+
+#: Rounds of research allowed per resolution: the first, plus one escalation.
+#:
+#: The ceiling alone would not terminate the loop. A round that reports a gap
+#: and spends nothing leaves the count exactly where it was, and the same
+#: decision would be taken again on the same evidence -- so the number of
+#: rounds is bounded as well as the number of searches, and the two bounds are
+#: independent.
+MAX_RESEARCH_PASSES = 2
 
 #: Effort for each stage. Research benefits from care; extraction is copying
 #: settled facts into fields.
@@ -136,6 +178,23 @@ def search_tool(*, max_uses: int = MAX_SEARCHES) -> dict[str, Any]:
     assumed from a list written in advance.
     """
     return {"type": SEARCH_TOOL_TYPE, "name": "web_search", "max_uses": max_uses}
+
+
+@dataclass(frozen=True)
+class SearchBudget:
+    """What a resolution has spent on searching, and what it may.
+
+    Carried as one value because the three numbers only mean anything
+    together: three searches used is normal under a ceiling of four and a bug
+    under a ceiling of two.
+    """
+
+    #: Searches performed so far, across every round.
+    used: int
+    #: The hard ceiling for this resolution.
+    ceiling: int
+    #: Whether a further round was bought beyond the starting budget.
+    escalated: bool = False
 
 
 class SourceAssessment(BaseModel):
@@ -301,6 +360,34 @@ class ResolutionClaim(BaseModel):
             "source whose excerpt states a date, each rated"
         )
     )
+    recurrence: str = Field(
+        default="",
+        description=(
+            "'one-off' when the concept denotes something that happened once; "
+            "'recurring' when it denotes something that happens repeatedly, so "
+            "that its occurrences form a series; 'unknown' when the evidence "
+            "does not establish which. This is about the CONCEPT, not about "
+            "how many occurrences you happened to find."
+        ),
+    )
+    historical_coverage: str = Field(
+        default="",
+        description=(
+            "'complete' when the occurrences you listed are every one the "
+            "evidence points to; 'incomplete' when the evidence shows there "
+            "are others you did not date; 'unknown' when you cannot tell. "
+            "Dating only the most recent occurrence of a recurring concept is "
+            "'incomplete', however well sourced that one is."
+        ),
+    )
+    coverage_gap: str = Field(
+        default="",
+        description=(
+            "One line naming what is absent, when coverage is not complete -- "
+            "for example 'only the 2026 cycle was dated; earlier cycles were "
+            "not searched for'. Empty when it is complete."
+        ),
+    )
     ambiguities: list[AmbiguityClaim] = Field(
         description=(
             "Open questions, each one specific, each with what answering it "
@@ -325,61 +412,318 @@ def resolve_event_concept(
     *,
     client: AIClient | None = None,
     max_searches: int = MAX_SEARCHES,
+    search_ceiling: int = SEARCH_CEILING,
     now: dt.datetime | None = None,
 ) -> ResolvedEventConcept:
     """Research a public event concept and return it structured.
+
+    Searching is adaptive, and the rule is narrow on purpose. The first round
+    gets ``max_searches``, which settles a one-off event and costs what it
+    always cost. A second round is bought only when that round reports a
+    *recurring* concept whose occurrences are incomplete -- the one gap
+    searching can close that a reader cannot be asked to close instead. Every
+    other kind of uncertainty stops the research, because more pages do not
+    answer "which crisis did you mean".
 
     Args:
         query: The concept, in the reader's words.
         client: Optional pre-built client used for *both* stages, for testing.
             Left unset, each stage gets its own client on its own model.
-        max_searches: Cost ceiling. Every result a search returns is re-read on
-            each subsequent tool iteration, so this bounds input as well as the
-            per-search fee.
+        max_searches: What the first round may spend. Every result a search
+            returns is re-read on each subsequent tool iteration, so this
+            bounds input as well as the per-search fee.
+        search_ceiling: The hard maximum across every round. A resolution
+            cannot exceed it however incomplete it reports itself to be.
         now: Override for the retrieval timestamp, for deterministic tests.
 
     Returns:
-        A :class:`ResolvedEventConcept`. A concept that could not be settled is
-        returned with the status saying why -- that is an answer, not a
-        failure, and the caller needs it to decide what to ask.
+        A :class:`ResolvedEventConcept`, carrying a
+        :class:`~backtool.events.resolution.ResearchCoverage` that says how
+        much of the concept's history was reached and why the search stopped
+        there. A concept that could not be settled is returned with the status
+        saying why -- that is an answer, not a failure, and the caller needs it
+        to decide what to ask.
 
     Raises:
         AIError: on transport failure, refusal, or an extraction that does not
             validate. A web page can cause this; it cannot cause anything else.
     """
     retrieved_at = now or dt.datetime.now(tz=UTC)
+    # A starting budget can never exceed its own ceiling, whatever is passed.
+    ceiling = max(max_searches, search_ceiling)
     search, extraction, owned = _clients(client)
+    spent = Cost()
 
     try:
         logger.info(
-            "Resolving event concept: %s (search %s, extraction %s)",
+            "Resolving event concept: %s (search %s, extraction %s, %d "
+            "searches, up to %d if coverage earns them)",
             query[:120],
             search.model,
             extraction.model,
+            max_searches,
+            ceiling,
         )
         outcome = _research(query, search, max_searches)
-        # Ids are assigned here, from what the search actually returned.
-        # Everything downstream refers to evidence by id, so a source the model
-        # invents has no handle and cannot be cited.
-        records = build_evidence(outcome.citations)
-        claim = _extract(query, outcome, records, extraction)
-
-        # Both stages, priced. This is the only place that knows the search
-        # count and both models, so it is the only place that can say what a
-        # resolution cost -- and a cost nobody records is one somebody later
-        # recalls wrongly.
-        spent = log_cost(
+        spent += log_cost(
             "resolver stage A",
             search.model,
             outcome.usage,
             searches=outcome.search_requests,
-        ) + log_cost("resolver stage B", extraction.model, extraction.last_usage)
-        logger.info("Resolved %r for %s", query[:80], spent.describe())
+        )
 
-        return _build(query, claim, outcome, records, retrieved_at)
+        rounds = 0
+        while True:
+            rounds += 1
+            # Ids are assigned here, from what the searches actually returned.
+            # Everything downstream refers to evidence by id, so a source the
+            # model invents has no handle and cannot be cited. Reassigned over
+            # the merged evidence after a second round, so stage B sees one
+            # consistent list rather than two overlapping ones.
+            records = build_evidence(outcome.citations)
+            claim = _extract(query, outcome, records, extraction)
+            spent += log_cost(
+                "resolver stage B", extraction.model, extraction.last_usage
+            )
+            resolved = _build(
+                query,
+                claim,
+                outcome,
+                records,
+                retrieved_at,
+                SearchBudget(
+                    used=outcome.search_requests,
+                    ceiling=ceiling,
+                    escalated=rounds > 1,
+                ),
+            )
+            allowance, why = _more_searches(
+                resolved, ceiling, rounds_left=MAX_RESEARCH_PASSES - rounds
+            )
+            resolved = _stopped_because(resolved, why)
+            if not allowance:
+                break
+
+            logger.info("Coverage earns %d more search(es): %s", allowance, why)
+            further = _research_further(query, resolved, search, allowance)
+            spent += log_cost(
+                "resolver stage A, for coverage",
+                search.model,
+                further.usage,
+                searches=further.search_requests,
+            )
+            outcome = outcome.merged_with(further)
+
+        logger.info(
+            "Resolved %r for %s -- %s",
+            query[:80],
+            spent.describe(),
+            resolved.coverage_summary,
+        )
+        return resolved
     finally:
         for owned_client in owned:
             owned_client.close()
+
+
+def _more_searches(
+    resolved: ResolvedEventConcept, ceiling: int, *, rounds_left: int
+) -> tuple[int, str]:
+    """How many further searches coverage justifies, and why it stopped there.
+
+    The whole escalation rule, in one place, in order of precedence, and
+    phrased entirely in terms of what the research found rather than what it
+    was about. There is no list of recurring events here and no name matched
+    against anything: an election, a central bank meeting and a protocol's
+    periodic halving all arrive as "a recurring concept with occurrences
+    missing", and a one-off upgrade arrives as "a one-time event".
+
+    The reasons *not* to search further earn their place as much as the reason
+    to, and they are different kinds of thing:
+
+    * A one-time event has nothing else to find, and an unestablished
+      recurrence is not a reason to pay on the chance that it recurs.
+    * A complete set is complete.
+    * Nothing dated at all is a question about what the concept *is*.
+      Searching again for a concept no source recognised is retrying a failed
+      lookup, not filling a gap in a set.
+    * A blocking question has to go to the reader. Buying searches to avoid
+      asking is paying to guess at an answer only they have.
+    * The ceiling, and then the round cap, which bound the two ways this could
+      otherwise run on.
+
+    Returns:
+        The number of further searches authorised -- zero to stop -- and one
+        line saying why, which is reported either way.
+    """
+    coverage = resolved.coverage
+
+    if coverage.recurrence is Recurrence.ONE_OFF:
+        return 0, "There are no further occurrences to find."
+    if coverage.recurrence is Recurrence.UNKNOWN:
+        return 0, (
+            "Whether the concept recurs was not established, so no further "
+            "search was bought against the chance that it does."
+        )
+    if coverage.is_sufficient:
+        return 0, "That is every occurrence the evidence points to."
+    if not resolved.primary_events:
+        return 0, (
+            "No occurrence was dated at all, which is a question about what "
+            "the concept is rather than a gap in its history."
+        )
+    if resolved.blocking_ambiguities:
+        return 0, (
+            "A reader has to settle an open question that no amount of "
+            f"searching answers: {resolved.blocking_ambiguities[0].question}"
+        )
+
+    remaining = ceiling - coverage.searches_used
+    if remaining <= 0:
+        return 0, (
+            f"The set is still incomplete, and the hard limit of {ceiling} "
+            "searches was reached."
+        )
+    if rounds_left <= 0:
+        return 0, (
+            "The set is still incomplete, and one further round of searching "
+            "is all a resolution may buy."
+        )
+
+    found = len(resolved.primary_events)
+    return remaining, (
+        f"A recurring concept with {found} occurrence{'' if found == 1 else 's'}"
+        f" dated and more in evidence, so {remaining} further "
+        f"{'search was' if remaining == 1 else 'searches were'} authorised."
+    )
+
+
+def _stopped_because(
+    resolved: ResolvedEventConcept, why: str
+) -> ResolvedEventConcept:
+    """Record why the research stopped where it did.
+
+    Set after the resolution is built rather than inside it, because the
+    reason a round was the last one is a decision taken on the strength of
+    what that round produced.
+    """
+    return resolved.model_copy(
+        update={
+            "coverage": resolved.coverage.model_copy(update={"why_it_stopped": why})
+        }
+    )
+
+
+def _coverage(
+    claim: ResolutionClaim, found: int, budget: SearchBudget
+) -> ResearchCoverage:
+    """What the research said about the concept's shape, corrected and priced.
+
+    Two corrections, both deterministic, neither about any particular kind of
+    event:
+
+    * A recurring concept with fewer than two occurrences is incomplete,
+      whatever the extraction answered. A series of one is not a series, and
+      "found the most recent one and stopped" is exactly the state this exists
+      to catch -- so it is not left to the step that would have to admit it.
+    * A one-time concept with its one occurrence is complete, whatever the
+      extraction answered. There is nothing else for it to have.
+
+    Both directions earn their place. The first stops an incomplete set being
+    reported as finished; the second stops a settled one-off buying searches
+    it has no use for.
+    """
+    recurrence = _recurrence(claim.recurrence)
+    history = _history(claim.historical_coverage)
+
+    if recurrence is Recurrence.RECURRING and found < 2:
+        history = HistoricalCoverage.INCOMPLETE
+    elif recurrence is Recurrence.ONE_OFF and found == 1:
+        history = HistoricalCoverage.COMPLETE
+
+    return ResearchCoverage(
+        recurrence=recurrence,
+        history=history,
+        gap=(
+            claim.coverage_gap.strip()
+            if history is not HistoricalCoverage.COMPLETE
+            else ""
+        ),
+        searches_used=budget.used,
+        searches_allowed=budget.ceiling,
+        escalated=budget.escalated,
+    )
+
+
+def _recurrence(raw: str) -> Recurrence:
+    """Whether the concept happens once or repeatedly.
+
+    An unrecognised answer reads as ``UNKNOWN``, which authorises nothing.
+    That is the safe direction: a word nobody recognised should not buy a
+    search, and should not silently declare a series finished either.
+    """
+    try:
+        return Recurrence(raw.strip().lower())
+    except ValueError:
+        return Recurrence.UNKNOWN
+
+
+def _history(raw: str) -> HistoricalCoverage:
+    """Whether the occurrences found are all of them, as the research read it.
+
+    Unrecognised reads as ``UNKNOWN`` for the same reason: it neither spends
+    nor reassures.
+    """
+    try:
+        return HistoricalCoverage(raw.strip().lower())
+    except ValueError:
+        return HistoricalCoverage.UNKNOWN
+
+
+def _research_further(
+    query: str,
+    resolved: ResolvedEventConcept,
+    client: AIClient,
+    allowance: int,
+) -> ServerToolOutcome:
+    """A second, narrower round: the occurrences the first one did not reach.
+
+    A fresh request rather than a continuation of the first. Continuing would
+    mean sending the whole of the first round back -- every search result it
+    accumulated, re-read and re-billed -- to ask a question that fits in five
+    lines. What the second round actually needs from the first is the dates
+    already established, so that it does not buy them again, and those *are*
+    five lines. The system prompt is the same text, so it is a cache hit.
+
+    Nothing new crosses the trust boundary. These labels and dates came from
+    pages nobody vetted and are going back to the stage whose job is reading
+    such pages; stage B still sees only the search tool's own citations, under
+    ids this process assigned.
+    """
+    established = (
+        "\n".join(
+            f"- {candidate.local_date.isoformat()}: {candidate.label}"
+            for candidate in resolved.primary_events
+        )
+        or "- none"
+    )
+    gap = resolved.coverage.gap or "earlier occurrences were not dated"
+    return _round(
+        client,
+        user=(
+            f"Event concept to research: {query}\n\n"
+            f"A first round of searching established these occurrences:\n"
+            f"{established}\n\n"
+            f"The concept recurs and that set is incomplete: {gap}\n\n"
+            f"Find the occurrences that are missing. You have {allowance} "
+            f"search{'' if allowance == 1 else 'es'} and no more. Do not spend "
+            "them re-confirming the dates above; those are settled. Report "
+            "what you find in the same brief form -- each occurrence as a date "
+            "and the source that has it."
+        ),
+        max_searches=allowance,
+        about=query,
+    )
 
 
 def _clients(
@@ -402,9 +746,27 @@ def _clients(
 
 def _research(query: str, client: AIClient, max_searches: int) -> ServerToolOutcome:
     """Stage A: search the web. Everything it returns is untrusted."""
+    return _round(
+        client,
+        user=f"Event concept to research: {query}",
+        max_searches=max_searches,
+        about=query,
+    )
+
+
+def _round(
+    client: AIClient, *, user: str, max_searches: int, about: str
+) -> ServerToolOutcome:
+    """One round of searching, under its own cap.
+
+    The cap is per request, which is what makes the ceiling enforceable: a
+    round cannot exceed what it was given however many times the model asks,
+    and Python subtracts what previous rounds spent before handing out any
+    more.
+    """
     outcome = client.with_server_tools(
         system=RESEARCH_SYSTEM,
-        user=f"Event concept to research: {query}",
+        user=user,
         tools=[search_tool(max_uses=max_searches)],
         effort=RESEARCH_EFFORT,
     )
@@ -415,7 +777,7 @@ def _research(query: str, client: AIClient, max_searches: int) -> ServerToolOutc
         logger.warning(
             "Web search reported %s while resolving %r",
             ", ".join(outcome.tool_errors),
-            query,
+            about,
         )
     return outcome
 
@@ -470,6 +832,7 @@ def _build(
     outcome: ServerToolOutcome,
     records: tuple[EvidenceRecord, ...],
     retrieved_at: dt.datetime,
+    budget: SearchBudget,
 ) -> ResolvedEventConcept:
     """Validate the claim against the evidence that was actually retrieved.
 
@@ -524,7 +887,24 @@ def _build(
     )
     ambiguities.extend(_dispute_questions(disputes))
 
-    missing = [item for item in claim.missing_information if item.strip()]
+    coverage = _coverage(claim, len(primary), budget)
+
+    missing: list[str] = []
+    # First, because it changes how everything after it should be read. A
+    # reader looking at three dated occurrences of something that has happened
+    # twenty times needs to know that before they read the median.
+    if coverage.is_partial_series:
+        # The gap arrives as either a fragment or a finished sentence, so its
+        # punctuation is settled here rather than assumed.
+        gap = coverage.gap.rstrip(" .")
+        missing.append(
+            "This concept recurs, and the occurrences above are not all of "
+            "them"
+            + (f": {gap}" if gap else "")
+            + ". What follows measures the ones that were dated, which is a "
+            "sample of the concept's history rather than the whole of it."
+        )
+    missing.extend(item for item in claim.missing_information if item.strip())
     missing.extend(notes)
     # Reported, not escalated, in both directions. A page cited for one
     # milestone routinely dates its neighbours; a page nobody cited may be
@@ -552,6 +932,7 @@ def _build(
         ambiguities=tuple(ambiguities),
         missing_information=tuple(dict.fromkeys(missing)),
         resolution_notes=claim.notes.strip(),
+        coverage=coverage,
         retrieved_at=retrieved_at,
     )
 
@@ -1126,6 +1507,13 @@ establishes it.
 Some concepts are recurring -- elections, scheduled meetings -- and have many \
 occurrences. Some happened once. Both are normal; report what you find.
 
+When a concept recurs, **the occurrences are the answer**, not the most recent \
+one. Dating this cycle's and stopping leaves the question unanswered, so say \
+which occurrences you dated and whether there are others you did not. That is \
+a useful finding on its own: a further round of searching may be authorised on \
+the strength of it, and nothing is authorised on the strength of a date you \
+supplied without a source.
+
 Milestones around the concept are a means, not the goal. A protocol upgrade has \
 preparatory steps and rehearsals; a collapse has a run of announcements, \
 filings and closures; a ruling has a hearing and an appeal. Mention one **only \
@@ -1143,13 +1531,21 @@ almost always after two. You have enough when all of this holds:
 
 * an official or primary source gives the date, and the time if one exists;
 * nothing retrieved contradicts it about the same occurrence;
+* for a recurring concept, the occurrences themselves are dated -- not merely \
+the latest one;
 * any remaining question is one a reader must answer, not one more search \
 would settle.
 
-Searching past that point buys nothing. If two searches leave the concept \
-genuinely unsettled -- several different events share the name, or no \
+Searching past that point buys nothing. If the searches you have leave the \
+concept genuinely unsettled -- several different events share the name, or no \
 trustworthy source dates it -- that *is* the finding. Report it as unsettled \
 rather than searching for a cleaner answer that does not exist.
+
+How many searches you may run is decided outside this request and enforced \
+outside it, so there is nothing to budget here: use what you need, stop when \
+the list above holds, and report what is still missing. An incomplete series \
+reported as incomplete is how a further round gets bought. An incomplete \
+series reported as finished is how the question stays unanswered.
 
 ## Sources
 
@@ -1240,6 +1636,30 @@ around it `related`.
 If you are unsure, answer `related`. A primary occurrence becomes a \
 measurement anchor, and a wrong one answers a question nobody asked.
 
+## Is this all of them?
+
+Two separate questions, and the first decides what the second means.
+
+`recurrence` is about the **concept**, not about how many dates you found. \
+Something that happened once -- an upgrade, a collapse, a ruling -- is \
+`one-off`. Something held or repeated on a cycle -- an election, a scheduled \
+meeting, a periodic adjustment -- is `recurring`, however few of its \
+occurrences the evidence reached. Use `unknown` when the evidence genuinely \
+does not say, and not as a hedge: `unknown` buys nothing and settles nothing.
+
+`historical_coverage` is about the **occurrences you listed**. `complete` when \
+they are every one the evidence points to. `incomplete` when the evidence \
+shows there are others you did not date -- and dating only the most recent \
+occurrence of a recurring concept is `incomplete`, however well sourced that \
+one is. `unknown` when you cannot tell.
+
+`coverage_gap` is one line naming what is absent, whenever anything is.
+
+Do not round `incomplete` up to `complete` because the dates you do have are \
+good ones. A sound sample of a series is a sound sample; it is not the series, \
+and a reader comparing three occurrences to twenty needs to know which they \
+are looking at.
+
 ## Open questions
 
 Report what a reader would have to decide, and for each one say what answering \
@@ -1254,6 +1674,13 @@ adjacent.
 * `blocks_research` -- true when the concept is not settled until a reader \
 answers. "Which crisis do you mean" is such a question; "sources differ about \
 a rehearsal three months earlier" is not.
+
+For a recurring concept, **which occurrence a reader meant is not a blocking \
+question**. The occurrences are the answer, and what reads them measures the \
+ones it has, so "which cycle is intended?" is worth recording and is never a \
+reason to hold up the work. Blocking is for a concept whose *identity* is \
+unsettled -- two different events share the name, and until a reader says \
+which, there is nothing to measure at all.
 * `candidate_times` -- only for a question about which instant an occurrence \
 happened at, and then every candidate time of day as HH:MM or HH:MM:SS in that \
 occurrence's timezone, exactly as the sources give them. Empty for everything \
@@ -1331,6 +1758,7 @@ __all__ = [
     "EXTRACTION_EFFORT",
     "EXTRACTION_THINKS",
     "EXTRACTION_SYSTEM",
+    "MAX_RESEARCH_PASSES",
     "MAX_SEARCHES",
     "RESEARCH_EFFORT",
     "RESEARCH_SYSTEM",
@@ -1338,10 +1766,12 @@ __all__ = [
     "DEFAULT_SEARCH_MODEL",
     "EXTRACTION_MODEL_ENV",
     "SEARCH_MODEL_ENV",
+    "SEARCH_CEILING",
     "SEARCH_TOOL_TYPE",
     "AmbiguityClaim",
     "EventClaim",
     "ResolutionClaim",
+    "SearchBudget",
     "SourceAssessment",
     "resolve_event_concept",
     "search_tool",
