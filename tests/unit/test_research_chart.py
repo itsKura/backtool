@@ -30,7 +30,12 @@ from backtool.research.thesis import Outcome, Thesis
 from backtool.research.vocabulary import reaction_windows
 from backtool.research.windows import DEFAULT_WINDOWS, WindowSpec
 from backtool.web.app import _measured_window, app
-from backtool.web.event_page import CANDLE_CHART_JS, CHART_SPAN, chart_window_bands
+from backtool.web.event_page import (
+    CANDLE_CHART_JS,
+    CHART_SPAN,
+    EVENT_STYLE,
+    chart_window_bands,
+)
 from backtool.web.research_page import RESEARCH_SCRIPT, render_finding
 
 NOW = dt.datetime(2026, 10, 1, tzinfo=dt.UTC)
@@ -480,3 +485,88 @@ class TestAResolvedConceptChartsToo:
         ).json()
         assert data["candles"] == []
         assert "has happened yet" in data["message"]
+
+
+class TestZoomingInDoesNotDeleteTheZone:
+    """Reported from the product: 24h, 4h and 1h looked like three charts.
+
+    Two separate mechanisms, and only one of them was a defect.
+
+    The band had to be *entirely* inside the view or it was dropped, so that a
+    box labelled "24 hours before" could never be drawn covering one hour of
+    it. Right for a release page, which shades four windows of different
+    lengths and where zooming in is how the short ones become legible --
+    backwards for an answer that shades exactly one, where it meant zooming in
+    to look more closely at nothing.
+    """
+
+    def source(self) -> str:
+        return CANDLE_CHART_JS
+
+    def test_a_band_overlapping_the_view_is_kept(self) -> None:
+        assert "b.end > low && b.start < high" in self.source()
+
+    def test_the_old_rule_that_dropped_it_is_gone(self) -> None:
+        assert "b.start >= low && b.end <= high" not in self.source()
+
+    def test_it_is_clipped_to_the_view(self) -> None:
+        """Kept is not enough: drawn at its full span it would run outside the
+        canvas and the box would stop meaning anything."""
+        assert "Math.max(b.start, low)" in self.source()
+        assert "Math.min(b.end, high)" in self.source()
+
+    def test_a_clipped_band_says_it_continues(self) -> None:
+        """The arrow and the open border are the whole of the claim. Without
+        them the box reads as ending where the view does, which is the
+        mislabelling the old rule existed to prevent."""
+        source = self.source()
+        assert "clippedStart" in source
+        assert "clippedEnd" in source
+        assert chr(92) + "u2190" in source
+        assert chr(92) + "u2192" in source
+
+    def test_the_open_side_loses_its_border(self) -> None:
+        assert "band-open-start" in EVENT_STYLE
+        assert "band-open-end" in EVENT_STYLE
+        assert "border-right-color: transparent" in EVENT_STYLE
+
+    def test_the_marker_classes_reach_the_box(self) -> None:
+        assert "band-open-start" in self.source()
+        assert "band-open-end" in self.source()
+
+    def test_the_arrows_are_escapes_not_characters(self) -> None:
+        """So they do not depend on how the response is encoded. Written as
+        the escape in the Python source too, since a plain triple-quoted
+        string would otherwise resolve it before the browser ever saw it."""
+        source = self.source()
+        assert chr(92) + "u2190" in source
+        assert "←" not in source
+
+
+class TestTheCaptionDescribesTheView:
+    """The other half, and not a defect: the zoom narrows the series.
+
+    `fitContent`, `setVisibleRange` and `setVisibleLogicalRange` are accepted
+    and ignored by this build, so narrowing the data is the only lever that
+    moves the view. The price axis then rescales to what is shown and the
+    last-price line follows the last visible candle -- three endpoints of one
+    series, which reads as three different prices unless the caption says what
+    is being shown.
+    """
+
+    def test_the_span_is_its_own_element(self) -> None:
+        html = render_finding(finding_for(cpi_thesis()))
+        assert 'class="chart-span"' in html
+
+    def test_it_starts_at_the_opening_zoom(self) -> None:
+        html = render_finding(finding_for(cpi_thesis()))
+        opening = int(CHART_SPAN.total_seconds() // 3600)
+        assert f">{opening}h either side</span>" in html
+
+    def test_the_chart_rewrites_it_on_every_zoom(self) -> None:
+        assert "onZoom" in RESEARCH_SCRIPT
+        assert "h either side" in RESEARCH_SCRIPT
+
+    def test_the_chart_offers_the_hook_rather_than_requiring_it(self) -> None:
+        """The event page passes no callback, and must keep working."""
+        assert "typeof options.onZoom === 'function'" in CANDLE_CHART_JS

@@ -533,7 +533,13 @@ def _price_zone(finding: ResearchFinding) -> str:
         '<div class="chart-block" data-chart>'
         '<p class="finding-sub">Price around the event</p>'
         f'<p class="chart-note">{escape(finding.thesis.asset)} &middot; '
-        f"{int(CHART_SPAN.total_seconds() // 3600)}h either side"
+        # Rewritten by the chart on every zoom. A caption claiming 24 hours
+        # either side while the chart shows one is most of why three zoom
+        # levels read as three different charts: the view narrows the series,
+        # so the price scale and the last-price line follow the last visible
+        # candle rather than the last candle.
+        f'<span class="chart-span">'
+        f"{int(CHART_SPAN.total_seconds() // 3600)}h either side</span>"
         + (f" &middot; shaded: {escape(window)}" if window else "")
         + "</p>"
         '<div class="chart-toolbar">'
@@ -1109,6 +1115,7 @@ _RESEARCH_SCRIPT_TEMPLATE = """
         }),
       });
 
+      const span = block.querySelector('.chart-span');
       const mount = () => window.backtoolCandleChart({
         canvas: block.querySelector('.chart-canvas'),
         status: block.querySelector('.chart-status'),
@@ -1117,6 +1124,12 @@ _RESEARCH_SCRIPT_TEMPLATE = """
         zoom: __ZOOM__,
         marker: 'event',
         load: load,
+        // So the caption describes the view rather than the request. The
+        // price axis rescales to what is shown, so a caption that kept
+        // saying 24h made a narrower view look like different data.
+        onZoom: (hours) => {
+          if (span) span.textContent = hours + 'h either side';
+        },
       });
 
       // Switching event rebuilds the chart rather than re-pointing it: the

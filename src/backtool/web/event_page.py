@@ -679,7 +679,9 @@ window.backtoolCandleChart = function (options) {
       const depth = seen[band.phase] = (seen[band.phase] || 0) + 1;
       const node = document.createElement('div');
       node.className = 'band band-' + band.phase +
-        (depth === 1 ? ' band-outer' : ' band-inner');
+        (depth === 1 ? ' band-outer' : ' band-inner') +
+        (band.clippedStart ? ' band-open-start' : '') +
+        (band.clippedEnd ? ' band-open-end' : '');
       node.innerHTML = '<span class="band-label"></span>';
       node.querySelector('.band-label').textContent = band.title;
       band.node = node;
@@ -758,10 +760,42 @@ window.backtoolCandleChart = function (options) {
     series.setData(visible);
     candleTimes = visible.map(c => c.time);
 
-    // A window only partly inside the view would be drawn as though it ended
-    // at the edge of the canvas, so a band labelled "24 hours before" would
-    // cover one hour. Drop those rather than mislabel them.
-    bands = allBands.filter(b => b.start >= low && b.end <= high);
+    // A window only partly inside the view must not be drawn as though it
+    // ended at the edge of the canvas -- a band labelled "24 hours before"
+    // covering one hour of it is a lie about what was measured. It must not be
+    // dropped either: on an answer that shades a single window, dropping it is
+    // zooming in to look more closely at nothing.
+    //
+    // So it is clipped to the view and says so. The arrow and the missing
+    // border on the clipped side are the whole of the claim: this box runs
+    // past here.
+    const clipped = allBands
+      .filter(b => b.end > low && b.start < high)
+      .map(b => {
+        const clippedStart = b.start < low;
+        const clippedEnd = b.end > high;
+        return Object.assign({}, b, {
+          span: b.end - b.start,
+          start: Math.max(b.start, low),
+          end: Math.min(b.end, high),
+          clippedStart: clippedStart,
+          clippedEnd: clippedEnd,
+          title: (clippedStart ? '\\u2190 ' : '') + b.title +
+                 (clippedEnd ? ' \\u2192' : ''),
+        });
+      });
+
+    // Where clipping has reduced two windows of the same phase to the same
+    // span, they are one rectangle with two labels disagreeing about what it
+    // means. The narrower window is the one that actually describes it -- at
+    // the one-hour zoom "1 hour before" is the truth about that box and
+    // "24 hours before" is an accident of where the view stops.
+    const bySpan = {};
+    for (const band of clipped) {
+      const key = band.phase + ':' + band.start + ':' + band.end;
+      if (!bySpan[key] || band.span < bySpan[key].span) bySpan[key] = band;
+    }
+    bands = clipped.filter(b => bySpan[b.phase + ':' + b.start + ':' + b.end] === b);
     buildBands();
 
     // Narrowing the data alone does not move the viewport -- the range stays
@@ -770,6 +804,7 @@ window.backtoolCandleChart = function (options) {
     // container width first: asking for a coordinate from a chart that has not
     // been told how wide it is returns null for every one of them.
     fit();
+    if (typeof options.onZoom === 'function') options.onZoom(hours);
   }
 
   // fitContent() is accepted and ignored by this build of the library: the
@@ -920,6 +955,12 @@ EVENT_STYLE = """
                           border-color: rgba(var(--band-before), 0.70); }
 .band-inner.band-after { background: rgba(var(--band-after), 0.22);
                          border-color: rgba(var(--band-after), 0.70); }
+/* A clipped box has no border on the side it runs past, so it reads as
+   continuing rather than as ending at the edge of the view. */
+.band-open-start { border-left-color: transparent; border-top-left-radius: 0;
+                   border-bottom-left-radius: 0; }
+.band-open-end { border-right-color: transparent; border-top-right-radius: 0;
+                 border-bottom-right-radius: 0; }
 .band-label { position: absolute; bottom: 100%; margin-bottom: 3px; left: 50%;
               transform: translateX(-50%); font-size: 11px; white-space: nowrap;
               letter-spacing: 0.01em; padding: 1px 6px; border-radius: 4px;
