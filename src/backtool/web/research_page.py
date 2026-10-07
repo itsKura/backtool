@@ -300,7 +300,7 @@ def _status_sentence(resolution: ResolvedEventConcept) -> str:
     return "One thing has to be settled before this can be measured."
 
 
-def render_anchor_needed(resolution: ResolvedEventConcept) -> str:
+def render_anchor_needed(thesis: Thesis) -> str:
     """Dates established, but no instant to measure from.
 
     The sources settled which day something happened and published no time,
@@ -310,17 +310,13 @@ def render_anchor_needed(resolution: ResolvedEventConcept) -> str:
     trading day after the event, so a 1h or 24h window measured from it answers
     a different question than one measured from the close.
 
-    So the study stops here. This is the same refusal
-    :func:`~backtool.events.resolution.compile_event_set` makes, surfaced
-    before the reader presses a button rather than after.
-
-    What it must not do is invite a follow-up. :class:`DayAnchor` exists and
-    the thesis carries one, but nothing reads an anchor out of a question --
-    the planner has no field for it -- so "tell me which instant and I will run
-    it" would be a promise this cannot keep, and the reader would find that out
-    by being refused twice. Saying plainly that the case is not supported yet
-    is worth more than an invitation into a loop.
+    So the study stops and asks. The thesis travels with the card, which is
+    what makes answering free: the resolution has already been paid for, and
+    the follow-up reuses it rather than looking the event up again.
     """
+    resolution = thesis.resolution
+    assert resolution is not None  # only a resolved concept can need an anchor
+
     days = "".join(
         f'<div class="spec-row"><span class="spec-label">{escape(event.label)}</span>'
         f'<span class="spec-value">{escape(event.local_date.isoformat())} '
@@ -332,16 +328,19 @@ def render_anchor_needed(resolution: ResolvedEventConcept) -> str:
         '<div class="turn turn-clarify">'
         f'<p class="spec-head">{escape(resolution.canonical_name or resolution.query)}</p>'
         "<p>I established the dates, but no source gives a time of day, so "
-        "there is no instant to measure from:</p>"
+        "there is no instant to measure from yet:</p>"
         f'<div class="spec-card">{days}</div>'
-        "<p>Measuring would need one more decision, and it changes the answer: "
-        "a window starting at midnight puts the whole trading day after the "
-        "event, while one starting at the close puts it before. Picking for "
+        "<p>Which instant should the window start from? It changes the answer: "
+        "measuring from the start of the day puts the whole trading day after "
+        "the event, while measuring from the close puts it before. Picking for "
         "you would decide the result, so I will not.</p>"
-        '<p class="muted">Events dated to the day but not the hour cannot be '
-        "measured yet -- choosing that instant is not something this version "
-        "supports. Events with a published time, such as a scheduled release "
-        "or a timestamped upgrade, work normally.</p></div>"
+        '<p class="muted">Reply with where to measure from -- '
+        '<strong>"from the close of that day"</strong>, '
+        '<strong>"from the start of the day"</strong>, or a local time such as '
+        '<strong>"from 22:00"</strong>. The dates are already established, so '
+        "answering costs nothing.</p>"
+        f'<script type="application/json" class="thesis">{thesis.model_dump_json()}'
+        "</script></div>"
     )
 
 

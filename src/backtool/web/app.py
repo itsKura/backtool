@@ -26,6 +26,7 @@ from typing import Any
 from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse
 
+from backtool.ai.thesis_planner import PlannedThesis
 from backtool.config import Settings
 from backtool.core.time import UTC
 from backtool.core.types import EventType, Interval
@@ -96,6 +97,32 @@ app = FastAPI(
     description="Deterministic event-study research engine for crypto markets.",
     docs_url="/api/docs",
 )
+
+
+def _show_our_own_logs() -> None:
+    """Make this package's INFO records reach the console.
+
+    Uvicorn configures handlers for its own loggers and leaves the root
+    untouched, so without this every `logger.info` in `backtool` goes nowhere.
+    That was not a cosmetic gap: the per-request cost accounting is logged, so
+    the figures existed and nothing could see them -- which is how a number
+    nobody can look up gets recalled wrongly instead.
+
+    Done here rather than in a library module because this is the application
+    entry point; importing a library should not reconfigure anybody's logging.
+    Idempotent, so an autoreloading server does not stack handlers.
+    """
+    package = logging.getLogger("backtool")
+    package.setLevel(logging.INFO)
+    if any(getattr(h, "name", "") == "backtool-console" for h in package.handlers):
+        return
+    handler = logging.StreamHandler()
+    handler.name = "backtool-console"
+    handler.setFormatter(logging.Formatter("%(levelname)s:     %(name)s %(message)s"))
+    package.addHandler(handler)
+
+
+_show_our_own_logs()
 
 
 def _ai_available() -> bool:
@@ -529,7 +556,6 @@ def _interpret_question(question: str, previous: Thesis | None) -> str:
         return render_clarification(planned)
 
     resolution: ResolvedEventConcept | None = None
-    anchor: DayAnchor | None = None
     if planned.needs_resolution:
         resolution = _resolution_for(planned.concept, previous)
         if not resolution.is_runnable:
@@ -538,25 +564,44 @@ def _interpret_question(question: str, previous: Thesis | None) -> str:
             # -- and each is something to tell the reader rather than something
             # to resolve by picking.
             return render_unresolved_event(resolution)
-        if any(event.is_date_only for event in resolution.primary_events):
-            # The sources gave days, not instants. Nothing here invents one.
-            #
-            # Midnight local is not a neutral reading of "the day of the
-            # election" -- it puts the entire trading day *after* the event,
-            # and a 1h or 24h window measured from it answers a different
-            # question than one measured from the close. Picking it silently
-            # would be the engine deciding the result, and disclosing the pick
-            # afterwards does not make it the right one.
-            return render_anchor_needed(resolution)
 
     # Conversion is where the vocabulary is enforced. A field or value the
-    # planner invented fails here rather than reaching the engine.
+    # planner invented fails here rather than reaching the engine. The anchor
+    # comes from the question if it named one, and is absent otherwise -- this
+    # layer never supplies a default.
     try:
-        thesis = planned.to_thesis(question, resolution=resolution, anchor=anchor)
+        thesis = planned.to_thesis(
+            question, resolution=resolution, anchor=_anchor_from(planned, previous)
+        )
     except ValueError as exc:
         return render_error(f"That reading does not fit what Backtool measures: {exc}")
 
+    if thesis.needs_an_anchor:
+        # The sources gave days, not instants, and nothing here invents one.
+        # Midnight local is not a neutral reading of "the day of the election":
+        # it puts the whole trading day *after* the event, so a 1h or 24h
+        # window from it answers a different question than one from the close.
+        #
+        # The thesis still travels with the card, so answering the question
+        # costs nothing -- the resolution is already paid for and gets reused.
+        return render_anchor_needed(thesis)
+
     return render_spec_card(thesis, planned)
+
+
+def _anchor_from(planned: PlannedThesis, previous: Thesis | None) -> DayAnchor | None:
+    """The instant the reader chose, from this question or the last one.
+
+    Carried forward because the anchor question is usually answered in a
+    follow-up: the reader is shown the dates, says "from the close", and that
+    second question is planned on its own. Without this the choice would have
+    to be restated every time anything else about the question changed.
+
+    The new answer wins when there is one, so a reader can change their mind.
+    """
+    if planned.anchor is not None:
+        return planned.anchor
+    return previous.anchor if previous is not None else None
 
 
 def _resolution_for(

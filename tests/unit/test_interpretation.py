@@ -186,6 +186,11 @@ class StubClient:
     def __init__(self, paragraphs: list[str]) -> None:
         self._paragraphs = paragraphs
         self.seen: dict[str, object] = {}
+        # A faithful double reports these, because the caller prices the call
+        # it just made. A stand-in missing them would make the cost accounting
+        # untestable by the very tests that exercise the path it runs on.
+        self.model = "claude-opus-5"
+        self.last_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
 
     def structured(self, *, system: str, user: str, schema: type, **_: object):  # type: ignore[no-untyped-def]
         self.seen = {"system": system, "user": user}

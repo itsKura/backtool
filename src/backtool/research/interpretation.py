@@ -131,6 +131,9 @@ class ResearchFacts(BaseModel):
     question: str
     asset: str
     event_type: str
+    #: What one of these events is called, singular. "release" for a curated
+    #: family, "event" for a concept resolved from the web.
+    event_noun: str = "release"
     horizon: str
     #: What was measured and how, e.g. "the 5 largest 24h trading range
     #: readings".
@@ -217,12 +220,13 @@ def build_facts(finding: ResearchFinding) -> ResearchFacts:
         question=thesis.headline(),
         asset=f"{asset_label(thesis.asset)} ({thesis.asset})",
         event_type=thesis.event_label,
+        event_noun=thesis.event_noun,
         horizon=thesis.outcome.horizon,
         measure=thesis.outcome.describe(),
         metric_label=finding.metric.label,
         cohort_rule=(
             " and ".join(condition.describe() for condition in thesis.conditions)
-            or "no conditions -- every usable release"
+            or f"no conditions -- every usable {thesis.event_noun}"
         ),
         sample_size=finding.sample_size,
         sample_quality=quality.value,
@@ -372,7 +376,7 @@ def _ranked_summary(facts: ResearchFacts) -> tuple[str, ...]:
 
     paragraphs.append(
         f"These are the {facts.extreme} readings among {facts.ranked_from} "
-        f"{_releases(facts.ranked_from)} with usable data, observed rather "
+        f"{_releases(facts.ranked_from, facts.event_noun)} with usable data, observed rather "
         "than estimated. "
         + _exclusion_clause(facts)
     )
@@ -393,11 +397,11 @@ def _scalar_summary(facts: ResearchFacts) -> tuple[str, ...]:
         paragraphs.append(
             f"{facts.value_text} of {facts.event_type} releases met this "
             f"condition: {facts.matched_count} of {facts.sample_size} "
-            f"{_releases(facts.sample_size)} with usable data."
+            f"{_releases(facts.sample_size, facts.event_noun)} with usable data."
         )
     else:
         paragraphs.append(
-            f"Across {facts.sample_size} {_releases(facts.sample_size)} with "
+            f"Across {facts.sample_size} {_releases(facts.sample_size, facts.event_noun)} with "
             f"usable data, the {facts.measure} was {facts.value_text}."
         )
 
@@ -425,7 +429,7 @@ def _comparison_summary(facts: ResearchFacts) -> tuple[str, ...]:
         )
     if right is None:
         return (
-            f"{left.sample_size} {_releases(left.sample_size)} matched "
+            f"{left.sample_size} {_releases(left.sample_size, facts.event_noun)} matched "
             f"{left.label} and their {facts.measure} was {left.value_text}, "
             "but no release matched the group it was to be compared with, so "
             "there is no comparison to report.",
@@ -445,7 +449,7 @@ def _group_sentence(facts: ResearchFacts, group: GroupFacts) -> str:
     """One group's own figures, with its own sample size beside them."""
     sentence = (
         f"{group.label}: {group.sample_size} "
-        f"{_releases(group.sample_size)}, {facts.measure} "
+        f"{_releases(group.sample_size, facts.event_noun)}, {facts.measure} "
         f"{group.value_text}"
     )
     if group.positive_count is not None:
@@ -496,7 +500,7 @@ def _caveat_sentence(facts: ResearchFacts) -> str:
     if facts.needs_sample_warning:
         parts.append(
             f"the sample contains only {facts.sample_size} "
-            f"{_releases(facts.sample_size)}, which is {facts.sample_quality} "
+            f"{_releases(facts.sample_size, facts.event_noun)}, which is {facts.sample_quality} "
             "historical evidence rather than a stable relationship, and no "
             "statistical test has been run"
         )
@@ -645,8 +649,14 @@ def _round(value: float | None, places: int = 2) -> float | None:
     return None if value is None else round(value, places)
 
 
-def _releases(count: int) -> str:
-    return "release" if count == 1 else "releases"
+def _releases(count: int, noun: str = "release") -> str:
+    """The event noun, pluralised.
+
+    Defaulted so that every curated sentence comes out exactly as it did: this
+    helper is the one place the word appears, which is why threading a noun
+    through it was a small change rather than a prose rewrite.
+    """
+    return noun if count == 1 else f"{noun}s"
 
 
 def _join(parts: list[str]) -> str:

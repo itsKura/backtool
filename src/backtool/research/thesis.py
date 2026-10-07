@@ -599,7 +599,7 @@ class Thesis(BaseModel):
         if self.unresolved:
             return False
         if self.resolution is not None:
-            return self.resolution.is_runnable and not self._needs_an_anchor
+            return self.resolution.is_runnable and not self.needs_an_anchor
         return True
 
     @property
@@ -609,6 +609,17 @@ class Thesis(BaseModel):
             return self.resolution.canonical_name or self.resolution.query
         assert self.event_type is not None  # guaranteed by the validator
         return self.event_type.value
+
+    @property
+    def event_noun(self) -> str:
+        """What one of these events is called, singular.
+
+        A curated family publishes releases on a schedule; a concept resolved
+        from the web happened. Calling a one-off protocol upgrade a "release"
+        is the engine's vocabulary leaking into an answer about something it
+        does not describe.
+        """
+        return "event" if self.resolution is not None else "release"
 
     @property
     def event_phrase(self) -> str:
@@ -637,8 +648,14 @@ class Thesis(BaseModel):
         return curated_set_key(self.event_type)
 
     @property
-    def _needs_an_anchor(self) -> bool:
-        """Whether a measurable instant is still a decision nobody has made."""
+    def needs_an_anchor(self) -> bool:
+        """Whether a measurable instant is still a decision nobody has made.
+
+        Public because the layer that can ask the reader needs to tell this
+        apart from the other reasons a thesis will not run. An open question is
+        answered by clarifying the question; this is answered by naming an
+        instant, and the two are different conversations.
+        """
         if self.resolution is None or self.anchor is not None:
             return False
         return any(event.is_date_only for event in self.resolution.primary_events)
@@ -693,7 +710,7 @@ class Thesis(BaseModel):
         conditions = (
             " and ".join(condition.describe() for condition in self.conditions)
             if self.conditions
-            else "none -- every usable release"
+            else f"none -- every usable {self.event_noun}"
         )
         items = [
             ("Asset", f"{asset_label(self.asset)} ({self.asset})"),
@@ -717,7 +734,9 @@ class Thesis(BaseModel):
                     ("Compared with", self.versus.describe(self.event_phrase))
                 )
         items.append(("Measure", f"{self.outcome.describe()} for {self.asset}"))
-        items.append(("Sample", f"up to the last {self.event_count} releases"))
+        items.append(
+            ("Sample", f"up to the last {self.event_count} {self.event_noun}s")
+        )
         return items
 
     def headline(self) -> str:

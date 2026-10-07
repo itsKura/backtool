@@ -42,6 +42,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from backtool.ai.client import AIClient, AIError
+from backtool.ai.usage import log_cost
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,7 @@ def explain_research(
         logger.warning("Discarding explanation: %s", "; ".join(problems))
         raise AIError(f"Explanation contradicted the facts: {'; '.join(problems)}")
 
+    log_cost("interpreter", resolved.model, resolved.last_usage)
     return tuple(p.strip() for p in explanation.paragraphs if p.strip())
 
 

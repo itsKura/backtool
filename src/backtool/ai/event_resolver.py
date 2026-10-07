@@ -52,6 +52,7 @@ from backtool.ai.evidence import (
     supports_time,
     unused_contradictions,
 )
+from backtool.ai.usage import log_cost
 from backtool.core.time import UTC, LocalTimeError, floor_to_interval, local_to_utc
 from backtool.events.models import SourceAuthority, SourceRef
 from backtool.events.resolution import (
@@ -362,6 +363,19 @@ def resolve_event_concept(
         # invents has no handle and cannot be cited.
         records = build_evidence(outcome.citations)
         claim = _extract(query, outcome, records, extraction)
+
+        # Both stages, priced. This is the only place that knows the search
+        # count and both models, so it is the only place that can say what a
+        # resolution cost -- and a cost nobody records is one somebody later
+        # recalls wrongly.
+        spent = log_cost(
+            "resolver stage A",
+            search.model,
+            outcome.usage,
+            searches=outcome.search_requests,
+        ) + log_cost("resolver stage B", extraction.model, extraction.last_usage)
+        logger.info("Resolved %r for %s", query[:80], spent.describe())
+
         return _build(query, claim, outcome, records, retrieved_at)
     finally:
         for owned_client in owned:

@@ -708,6 +708,11 @@ class TestMethodologyCannotBeChanged:
             # the dates themselves still come from sources rather than from
             # the model. Nothing here can change how the measuring is done.
             "event_concept",
+            # Where in a calendar day to measure from, when the sources gave a
+            # date and no time. Records the reader's choice and never makes
+            # one: left empty, the reader is asked. Selection again, not
+            # methodology -- it decides which instant, not how measuring works.
+            "event_anchor",
             "conditions",
             # The second group of an A-versus-B question. Generic filters,
             # not a comparison type.

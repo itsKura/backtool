@@ -446,6 +446,11 @@ class AIClient:
                     usage[key] = usage.get(key, 0) + value
 
             if payload.get("stop_reason") != "pause_turn":
+                # Recorded here as well as returned, so `last_usage` means the
+                # same thing on both paths. It did not, and the tool-using
+                # path -- the expensive one -- was the half that went
+                # unrecorded.
+                self._last_usage = dict(usage)
                 return _read_blocks(blocks, searches, usage)
 
             # Paused mid-tool. The assistant turn goes back exactly as it came,

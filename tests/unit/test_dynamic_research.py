@@ -518,27 +518,27 @@ class TestTwoDifferentKindsOfNo:
         assert concept.event_count == family.event_count
 
 
-class TestNoInventedInstant:
-    """A day with no published time is a question, not a default.
+class TestTheInstantIsTheReadersToChoose:
+    """A day with no published time is a question, and now an answerable one.
 
     Midnight local is not a neutral reading of "the day of the election": it
-    puts the whole trading day after the event, so a 1h or 24h window measured
-    from it answers a different question than one measured from the close.
-    Choosing it silently would be the engine deciding the result, and
-    disclosing the choice afterwards would not make it the right one.
+    puts the whole trading day after the event, so a 1h or 24h window from it
+    answers a different question than one from the close. Nothing here picks.
+    What changed is that the reader can now answer -- and that answering is
+    free, because the resolution travels with the question rather than being
+    looked up again.
     """
 
     def test_a_day_only_resolution_stops_before_the_engine(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        ran: list[object] = []
         monkeypatch.setattr(
             "backtool.research.experiment.run_study",
-            lambda *a, **k: ran.append(a) or (_ for _ in ()).throw(AssertionError),
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("ran anyway")),
         )
         thesis = dynamic_thesis(resolution=midterms(), anchor=None)
+        assert thesis.needs_an_anchor
         assert not thesis.is_runnable
-        assert ran == []
 
     def test_compilation_refuses_it_too(self) -> None:
         """Same refusal at the layer below, so neither depends on the other."""
@@ -548,55 +548,139 @@ class TestNoInventedInstant:
             compile_event_set(midterms())
 
     def test_the_reader_is_told_what_is_needed_and_why(self) -> None:
-        html = render_anchor_needed(midterms())
+        html = render_anchor_needed(dynamic_thesis(resolution=midterms()))
         assert "no published time" in html
         assert "2022-11-08" in html
         assert "changes the answer" in html
         assert "I will not" in html
 
-    def test_it_does_not_promise_a_follow_up_it_cannot_honour(self) -> None:
-        """The copy used to invite the reader to name an instant. Nothing reads
-        an anchor out of a question -- the planner has no field for it -- so
-        that invitation led to being refused twice. A stated limit beats a loop.
+    def test_it_offers_no_default(self) -> None:
+        """The thing this exists to prevent: a midnight that reads like a
+        published fact once it reaches a report.
+
+        Checked against what a reader can see, not the raw markup -- the card
+        embeds the thesis as JSON, and a retrieval timestamp in there is not an
+        anchor being offered.
         """
-        html = render_anchor_needed(midterms())
-        assert "cannot be measured yet" in html
-        assert "and I will run it" not in html
+        html = render_anchor_needed(dynamic_thesis(resolution=midterms()))
+        visible = html.split('<script')[0]
+        assert "00:00" not in visible
+        assert "start of the calendar day (" not in visible
 
-    def test_nothing_can_read_an_anchor_out_of_a_question(self) -> None:
-        """Pins the gap the copy now admits to, so that wiring it up later
-        makes this test fail and the copy get revisited with it."""
-        from backtool.ai.thesis_planner import PlannedThesis
+    def test_the_question_carries_the_resolution(self) -> None:
+        """What makes answering free. Without this the follow-up would be
+        planned from scratch and buy the same dates a second time."""
+        html = render_anchor_needed(dynamic_thesis(resolution=midterms()))
+        start = html.index('class="thesis">') + len('class="thesis">')
+        restored = Thesis.model_validate_json(
+            html[start : html.index("</script>", start)]
+        )
+        assert restored.resolution is not None
+        assert restored.needs_an_anchor
 
-        assert not [
-            name
-            for name in PlannedThesis.model_fields
-            if "anchor" in name or "instant" in name
-        ]
+    def test_it_invites_the_three_forms_it_can_read(self) -> None:
+        html = render_anchor_needed(dynamic_thesis(resolution=midterms()))
+        assert "from the close of that day" in html
+        assert "from the start of the day" in html
+        assert "from 22:00" in html
 
-    def test_it_does_not_offer_a_default(self) -> None:
-        """The failure this replaces: a disclosed midnight that reads like a
-        published fact once it reaches a report."""
-        html = render_anchor_needed(midterms())
-        assert "00:00" not in html
-        assert "midnight" in html  # named as the thing being avoided
-        assert "start of the calendar day (00:00" not in html
+    @pytest.mark.parametrize(
+        ("spoken", "policy"),
+        [
+            ("end of day", AnchorPolicy.DAY_END),
+            ("close of that day", AnchorPolicy.DAY_END),
+            ("the close", AnchorPolicy.DAY_END),
+            ("start of day", AnchorPolicy.DAY_START),
+            ("market open", AnchorPolicy.DAY_START),
+            ("22:00", AnchorPolicy.EXPLICIT_TIME),
+            ("09:30", AnchorPolicy.EXPLICIT_TIME),
+        ],
+    )
+    def test_the_planner_reads_what_the_reader_said(
+        self, spoken: str, policy: AnchorPolicy
+    ) -> None:
+        answer = planned(event_anchor=spoken)
+        assert answer.anchor is not None
+        assert answer.anchor.policy is policy
 
-    def test_a_timestamp_resolution_proceeds(self) -> None:
-        """The other half: a sourced instant needs no decision and is not held
-        up by one."""
+    def test_an_explicit_time_keeps_the_time(self) -> None:
+        anchor = planned(event_anchor="22:00").anchor
+        assert anchor is not None
+        assert anchor.local_time == dt.time(22, 0)
+
+    def test_saying_nothing_chooses_nothing(self) -> None:
+        assert planned(event_anchor="").anchor is None
+
+    def test_an_unreadable_answer_asks_again(self) -> None:
+        """Rather than guessing. A spelling nobody recognised turning into an
+        instant is how a research decision becomes an invisible one."""
+        for spoken in ("whenever", "25:99", "sometime after lunch", "the vibes"):
+            assert planned(event_anchor=spoken).anchor is None, spoken
+
+    def test_answering_makes_it_runnable(self) -> None:
+        thesis = planned(event_anchor="end of day").to_thesis(
+            "q", resolution=midterms()
+        )
+        assert thesis.anchor is not None
+        assert thesis.anchor.policy is AnchorPolicy.DAY_END
+        assert not thesis.needs_an_anchor
+        assert thesis.is_runnable
+
+    def test_the_choice_reaches_the_measurement(self) -> None:
+        """Not just the thesis: the compiled instant moves with it, which is
+        the whole reason the question was worth asking."""
+        from backtool.events.resolution import compile_event_set
+
+        at_close = compile_event_set(
+            midterms(), anchor=DayAnchor(policy=AnchorPolicy.DAY_END)
+        )
+        at_open = compile_event_set(
+            midterms(), anchor=DayAnchor(policy=AnchorPolicy.DAY_START)
+        )
+        assert at_close.events[0].timestamp_utc != at_open.events[0].timestamp_utc
+        assert at_close.fingerprint != at_open.fingerprint
+
+    def test_the_choice_is_carried_into_the_report(self) -> None:
+        thesis = dynamic_thesis(
+            resolution=midterms(), anchor=DayAnchor(policy=AnchorPolicy.DAY_END)
+        )
+        html = render_event_provenance(thesis)
+        assert "measured from" in html
+        assert "end of the calendar day" in html
+
+    def test_a_timestamp_resolution_needs_no_decision(self) -> None:
         thesis = dynamic_thesis(resolution=eth_merge())
+        assert not thesis.needs_an_anchor
         assert thesis.anchor is None
         assert thesis.is_runnable
-        assert all(
-            not event.is_date_only for event in thesis.resolution.primary_events
-        )
 
-    def test_an_explicit_anchor_still_works(self) -> None:
-        """The mechanism is intact -- what changed is who supplies it."""
-        thesis = dynamic_thesis(resolution=midterms(), anchor=DAY_START)
-        assert thesis.is_runnable
-        assert "measured from" in render_event_provenance(thesis)
+    def test_an_anchor_carries_forward_across_a_follow_up(self) -> None:
+        """The reader answers once. A later question about the same event does
+        not have to restate it."""
+        from backtool.web.app import _anchor_from
+
+        answered = dynamic_thesis(
+            resolution=midterms(), anchor=DayAnchor(policy=AnchorPolicy.DAY_END)
+        )
+        carried = _anchor_from(planned(event_anchor=""), answered)
+        assert carried is not None
+        assert carried.policy is AnchorPolicy.DAY_END
+
+    def test_a_new_answer_overrides_the_carried_one(self) -> None:
+        """So a reader can change their mind."""
+        from backtool.web.app import _anchor_from
+
+        answered = dynamic_thesis(
+            resolution=midterms(), anchor=DayAnchor(policy=AnchorPolicy.DAY_END)
+        )
+        carried = _anchor_from(planned(event_anchor="start of day"), answered)
+        assert carried is not None
+        assert carried.policy is AnchorPolicy.DAY_START
+
+    def test_the_prompt_tells_the_planner_not_to_choose(self) -> None:
+        assert "Events dated to the day" in THESIS_PLANNER_SYSTEM
+        assert "Do not choose for the reader" in THESIS_PLANNER_SYSTEM
+        assert "records a decision; it never makes one" in THESIS_PLANNER_SYSTEM
 
 
 class TestTheProductUsesTheOptimisedResolver:
@@ -682,6 +766,52 @@ class TestTheProductUsesTheOptimisedResolver:
                     continue
                 named = getattr(node.func, "id", None)
                 assert named != "AIClient", f"{path.name} builds a client"
+
+
+class TestTheProseDoesNotCallItARelease:
+    """A curated family publishes releases. A protocol upgrade happened once.
+
+    The engine said "release" either way, so a report about the Merge read
+    "across 1 release with usable data". Clumsy rather than wrong, and on
+    every dynamic answer. The noun is defaulted, so curated wording is
+    unchanged byte for byte -- which is what the curated tests go on asserting.
+    """
+
+    def test_a_resolved_concept_has_events_not_releases(self) -> None:
+        assert dynamic_thesis().event_noun == "event"
+
+    def test_a_curated_family_still_has_releases(self) -> None:
+        assert Thesis(question="q").event_noun == "release"
+
+    def test_the_specification_rows_follow(self) -> None:
+        rows = dict(dynamic_thesis().describe_items())
+        assert rows["Sample"] == "up to the last 40 events"
+        assert rows["Condition"] == "none -- every usable event"
+
+    def test_the_curated_rows_are_untouched(self) -> None:
+        rows = dict(Thesis(question="q").describe_items())
+        assert rows["Sample"] == "up to the last 40 releases"
+        assert rows["Condition"] == "none -- every usable release"
+
+    def test_the_summary_follows_too(self) -> None:
+        from backtool.research.interpretation import build_facts
+
+        facts = build_facts(_finding())
+        assert facts.event_noun == "event"
+
+    def test_the_noun_pluralises(self) -> None:
+        from backtool.research.interpretation import _releases
+
+        assert _releases(1, "event") == "event"
+        assert _releases(2, "event") == "events"
+        assert _releases(1) == "release"
+        assert _releases(2) == "releases"
+
+
+def _finding():  # type: ignore[no-untyped-def]
+    from backtool.research.experiment import run_thesis
+
+    return run_thesis(dynamic_thesis())
 
 
 class TestTheEngineMeasuresIt:

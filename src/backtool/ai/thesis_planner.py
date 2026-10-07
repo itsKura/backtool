@@ -24,6 +24,7 @@ rather than reaching the engine.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import os
@@ -31,8 +32,13 @@ import os
 from pydantic import BaseModel, ConfigDict, Field
 
 from backtool.ai.client import AIClient
+from backtool.ai.usage import log_cost
 from backtool.core.types import EventType
-from backtool.events.resolution import DayAnchor, ResolvedEventConcept
+from backtool.events.resolution import (
+    AnchorPolicy,
+    DayAnchor,
+    ResolvedEventConcept,
+)
 from backtool.research.thesis import Comparison, Condition, Outcome, Thesis
 from backtool.research.vocabulary import (
     DEFAULT_HORIZON,
@@ -140,6 +146,16 @@ class PlannedThesis(BaseModel):
             "which goes in event_concept instead."
         )
     )
+    event_anchor: str = Field(
+        default="",
+        description=(
+            "Only when the question says where in the day to measure from, for "
+            "an event dated to the day with no published time. One of: 'start "
+            "of day', 'end of day', or a local time as HH:MM. Empty when the "
+            "question does not say -- this records the reader's choice and is "
+            "never a guess at one."
+        ),
+    )
     event_concept: str = Field(
         # Defaulted so that answers recorded before this field existed still
         # validate. The wire schema is unaffected -- `strict_json_schema`
@@ -234,6 +250,33 @@ class PlannedThesis(BaseModel):
     )
 
     @property
+    def anchor(self) -> DayAnchor | None:
+        """Where in a calendar day the reader asked to measure from.
+
+        ``None`` when the question did not say, which is not the same as a
+        default: an event dated to the day and no instant chosen is a question
+        for the reader, because midnight local puts the whole trading day after
+        the event and the close puts it before.
+
+        An unreadable answer is also ``None``. Falling back to asking again is
+        the only safe direction -- inventing an instant from a spelling nobody
+        recognised is how a research decision becomes an invisible one.
+        """
+        raw = self.event_anchor.strip().lower()
+        if not raw:
+            return None
+        if raw in _DAY_START_SPELLINGS:
+            return DayAnchor(policy=AnchorPolicy.DAY_START)
+        if raw in _DAY_END_SPELLINGS:
+            return DayAnchor(policy=AnchorPolicy.DAY_END)
+        try:
+            chosen = dt.time.fromisoformat(raw)
+        except ValueError:
+            logger.info("Unreadable anchor %r; asking again", self.event_anchor)
+            return None
+        return DayAnchor(policy=AnchorPolicy.EXPLICIT_TIME, local_time=chosen)
+
+    @property
     def concept(self) -> str:
         """The public event to look up, or empty for a curated family."""
         return self.event_concept.strip()
@@ -288,6 +331,10 @@ class PlannedThesis(BaseModel):
             )
         if not family and resolution is None:
             raise ValueError("The question names no event to measure around.")
+        if anchor is None:
+            # The reader's own words, when they gave any. Passed explicitly by
+            # a caller that already has one; read from the question otherwise.
+            anchor = self.anchor if resolution is not None else None
         aggregation = _aggregation(self.aggregation)
         ranked = aggregation is Aggregation.ROWS
         frequency = aggregation is Aggregation.FREQUENCY
@@ -378,6 +425,33 @@ _OPERATOR_SPELLINGS: dict[str, Operator] = {
     "lte": Operator.AT_MOST,
     "at most": Operator.AT_MOST,
 }
+
+
+#: Ways a reader spells the two ends of a day. Deliberately short lists: a
+#: spelling that is not here asks again rather than being guessed at.
+_DAY_START_SPELLINGS = frozenset(
+    {
+        "start of day",
+        "start of the day",
+        "day start",
+        "open",
+        "the open",
+        "market open",
+        "midnight",
+        "00:00",
+    }
+)
+_DAY_END_SPELLINGS = frozenset(
+    {
+        "end of day",
+        "end of the day",
+        "day end",
+        "close",
+        "the close",
+        "market close",
+        "close of that day",
+    }
+)
 
 
 def _operator(raw: str) -> Operator:
@@ -565,12 +639,14 @@ def plan_thesis(
         )
 
     logger.info("Planning thesis for: %s", question[:120])
-    return resolved.structured(
+    planned = resolved.structured(
         system=THESIS_PLANNER_SYSTEM,
         user=json.dumps(payload, indent=2),
         schema=PlannedThesis,
         effort=PLANNER_EFFORT,
     )
+    log_cost("planner", resolved.model, resolved.last_usage)
+    return planned
 
 
 THESIS_PLANNER_SYSTEM = """\
@@ -703,6 +779,22 @@ A field derived from a curated calendar cannot be tested against such \
 an event, because there is no published consensus or prior print to \
 compare against. Conditions computed from price apply to anything with \
 a date, so a question about the trend going in is fine either way.
+
+## Events dated to the day
+
+Some events have a date and no published time: an election day, a ruling \
+with no announced hour. Measuring one needs an instant, and which instant \
+changes the answer -- a 24-hour window from midnight covers the whole \
+trading day after the event, one from the close covers the next day.
+
+Do not choose for the reader. Leave `event_anchor` empty unless the \
+question says where to measure from, and they will be asked. When the \
+question does say, record it: `start of day`, `end of day`, or a local \
+time as HH:MM.
+
+"after the midterm elections" says nothing about the instant, so leave it \
+empty. "from the close on election day" is `end of day`. "from 22:00 ET" \
+is `22:00`. This field records a decision; it never makes one.
 
 ## Defaults versus clarifications
 
