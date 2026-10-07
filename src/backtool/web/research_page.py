@@ -18,9 +18,10 @@ not something a model wrote.
 
 from __future__ import annotations
 
-from xml.sax.saxutils import escape
+from collections.abc import Sequence
+from xml.sax.saxutils import escape, quoteattr
 
-from backtool.ai.thesis_planner import PlannedThesis
+from backtool.ai.thesis_planner import ANCHOR_CHOICES, PlannedThesis
 from backtool.events.models import SourceAuthority, SourceRef
 from backtool.events.resolution import (
     CandidateEvent,
@@ -30,7 +31,7 @@ from backtool.events.resolution import (
 )
 from backtool.reporting.charts import BarItem, distribution_chart, diverging_bar_chart
 from backtool.research.experiment import ResearchFinding
-from backtool.research.thesis import Thesis
+from backtool.research.thesis import MAX_REMEMBERED_EXCHANGES, Exchange, Thesis
 from backtool.research.vocabulary import (
     OUTCOME_HORIZONS,
     Aggregation,
@@ -47,6 +48,63 @@ EXAMPLE_QUESTIONS: tuple[str, ...] = (
     "What usually happens to BTC after FOMC?",
     "Does a bearish 7-day BTC trend change the reaction to CPI?",
 )
+
+
+def _state_block(css_class: str, payload: str) -> str:
+    """Embed JSON the page will read back, safely.
+
+    ``<`` is escaped to its JSON unicode form. A JSON string may contain the
+    characters ``</script>``, and a browser ends a script element at the first
+    one it sees regardless of what the element is supposed to contain -- so the
+    reader's own question, which travels inside this block, was enough to end
+    it and have whatever followed parsed as HTML. Escaping leaves the value
+    identical once parsed and leaves no closing tag to find.
+    """
+    return (
+        f'<script type="application/json" class="{css_class}">'
+        f'{payload.replace("<", chr(92) + "u003c")}</script>'
+    )
+
+
+def _remember(
+    question: str, restated: str = "", asked: tuple[str, ...] = ()
+) -> str:
+    """Record what this turn asked, so the next one is read as an answer.
+
+    Emitted by every card that ends in a question. Those are precisely the
+    cards with no thesis to carry -- which is why the reader could answer four
+    times and be asked the same thing each time.
+    """
+    turn = Exchange(question=question, restated=restated, asked=asked)
+    return _state_block("exchange", turn.model_dump_json())
+
+
+def _choices(question: str, options: Sequence[str]) -> str:
+    """One question with the answers it can be given.
+
+    Picking fills the box rather than sending it. A card can ask two things,
+    and a reader should see the whole answer before it goes -- which is also
+    what lets them edit one word of a suggested answer instead of accepting or
+    retyping it.
+    """
+    usable = [option.strip() for option in options if option.strip()]
+    if not usable:
+        return f"<li>{escape(question)}</li>"
+    buttons = "".join(
+        # quoteattr supplies the quotes and escapes them: an option is the
+        # reader's next message, and a message containing a quote mark must
+        # not end the attribute it travels in.
+        f'<button type="button" class="choice" aria-pressed="false" '
+        f"data-choice={quoteattr(option)}>{escape(option)}</button>"
+        for option in usable
+    )
+    return (
+        f'<li class="ask"><p>{escape(question)}</p>'
+        f'<div class="choices">{buttons}'
+        '<button type="button" class="choice choice-other" data-other '
+        'aria-pressed="false">Something else\u2026</button>'
+        "</div></li>"
+    )
 
 
 def render_research_page() -> str:
@@ -110,8 +168,8 @@ def render_spec_card(thesis: Thesis, planned: PlannedThesis) -> str:
         '<button type="button" class="btn" data-run="1">Run research</button>'
         '<button type="button" class="btn-quiet" data-edit="1">Edit question</button>'
         "</div>"
-        f'<script type="application/json" class="thesis">{thesis.model_dump_json()}'
-        "</script></div>"
+        + _state_block("thesis", thesis.model_dump_json())
+        + "</div>"
     )
 
 
@@ -239,7 +297,9 @@ def _cited_sources(resolution: ResolvedEventConcept) -> list[SourceRef]:
     return sorted(seen.values(), key=lambda s: order.get(s.authority, 3))
 
 
-def render_unresolved_event(resolution: ResolvedEventConcept) -> str:
+def render_unresolved_event(
+    resolution: ResolvedEventConcept, *, question: str = ""
+) -> str:
     """A lookup that did not settle, as a question rather than a failure.
 
     Four different outcomes arrive here and they are not the same thing: a name
@@ -247,11 +307,14 @@ def render_unresolved_event(resolution: ResolvedEventConcept) -> str:
     and something real with no published date. Each needs a different sentence,
     and none of them is an error the reader caused.
     """
+    # The resolver may name what a reader would have to choose between. When
+    # it does, those are the answers, and offering them costs nothing.
     questions = "".join(
-        f"<li>{escape(item.question)}"
-        + (f' <span class="muted">{escape(item.why_it_matters)}</span>'
-           if item.why_it_matters else "")
-        + "</li>"
+        _choices(
+            item.question
+            + (f" ({item.why_it_matters})" if item.why_it_matters else ""),
+            item.options,
+        )
         for item in resolution.blocking_ambiguities
     )
     found = (
@@ -278,7 +341,12 @@ def render_unresolved_event(resolution: ResolvedEventConcept) -> str:
         + (f'<ul class="findings-list">{questions}</ul>' if questions else "")
         + f"{found}{notes}"
         '<p class="muted">Answer in a follow-up and I will measure it.</p>'
-        "</div>"
+        + _remember(
+            question,
+            resolution.canonical_name or resolution.query,
+            tuple(item.question for item in resolution.blocking_ambiguities),
+        )
+        + "</div>"
     )
 
 
@@ -309,7 +377,7 @@ def _status_sentence(resolution: ResolvedEventConcept) -> str:
     return "One thing has to be settled before this can be measured."
 
 
-def render_anchor_needed(thesis: Thesis) -> str:
+def render_anchor_needed(thesis: Thesis, *, question: str = "") -> str:
     """Dates established, but no instant to measure from.
 
     The sources settled which day something happened and published no time,
@@ -343,31 +411,58 @@ def render_anchor_needed(thesis: Thesis) -> str:
         "measuring from the start of the day puts the whole trading day after "
         "the event, while measuring from the close puts it before. Picking for "
         "you would decide the result, so I will not.</p>"
-        '<p class="muted">Reply with where to measure from -- '
-        '<strong>"from the close of that day"</strong>, '
-        '<strong>"from the start of the day"</strong>, or a local time such as '
+        '<ul class="findings-list">'
+        # The offered words are the planner's own, not the page's: see
+        # ANCHOR_CHOICES. A button whose text had drifted out of what the
+        # planner reads would send the reader round the same question again.
+        + _choices(
+            "Where in the day should the window start?",
+            [text for text, _policy in ANCHOR_CHOICES],
+        )
+        + "</ul>"
+        '<p class="muted">Or type a local time, such as '
         '<strong>"from 22:00"</strong>. The dates are already established, so '
         "answering costs nothing.</p>"
-        f'<script type="application/json" class="thesis">{thesis.model_dump_json()}'
-        "</script></div>"
+        + _state_block("thesis", thesis.model_dump_json())
+        + _remember(
+            question,
+            resolution.canonical_name or resolution.query,
+            ("Where in the day should the window start?",),
+        )
+        + "</div>"
     )
 
 
-def render_clarification(planned: PlannedThesis) -> str:
-    """Questions that must be answered before the test means anything."""
-    items = "".join(f"<li>{escape(q)}</li>" for q in planned.clarifications)
+def render_clarification(planned: PlannedThesis, *, question: str = "") -> str:
+    """Questions that must be answered before the test means anything.
+
+    Each one offers the answers it can take. A reader who has to guess which
+    words will be understood is being asked two questions, and only one of them
+    is the interesting one -- so the wording comes from the step that will read
+    it back, and the reader picks or edits rather than guesses.
+    """
+    asked = tuple(item.question for item in planned.clarifications)
+    items = "".join(
+        _choices(item.question, item.options) for item in planned.clarifications
+    )
+    several = len(planned.clarifications) > 1
     return (
         '<div class="turn turn-clarify">'
         f'<p class="spec-head">{escape(planned.restated_question)}</p>'
-        "<p>I can test that, but one thing would change the answer and the "
-        "question does not settle it:</p>"
+        "<p>I can test that, but "
+        + ("some things would" if several else "one thing would")
+        + " change the answer and the question does not settle "
+        + ("them" if several else "it")
+        + ":</p>"
         f'<ul class="findings-list">{items}</ul>'
-        '<p class="muted">Reply with what you meant and I will rebuild the '
-        "specification.</p></div>"
+        '<p class="muted">Pick an answer or type your own, then press '
+        "Interpret and I will rebuild the specification.</p>"
+        + _remember(question, planned.restated_question, asked)
+        + "</div>"
     )
 
 
-def render_unsupported(planned: PlannedThesis) -> str:
+def render_unsupported(planned: PlannedThesis, *, question: str = "") -> str:
     """An honest refusal, naming what is missing."""
     items = "".join(f"<li>{escape(item)}</li>" for item in planned.unsupported)
     return (
@@ -378,7 +473,11 @@ def render_unsupported(planned: PlannedThesis) -> str:
         '<p class="muted">Backtool measures BTC and ETH around CPI and FOMC '
         "releases, and around public events whose dates it can establish from "
         "published sources. Everything else would be a guess dressed as a "
-        "result.</p></div>"
+        "result.</p>"
+        # Remembered, so a rephrasing is read against what was refused rather
+        # than from nothing.
+        + _remember(question, planned.restated_question)
+        + "</div>"
     )
 
 
@@ -854,7 +953,12 @@ def _truncate(text: str, limit: int = 28) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-RESEARCH_SCRIPT = """
+#: The page script, with the turn limit filled in from the one place that
+#: defines it. Written as a substitution rather than an f-string because the
+#: body is full of braces, and as a substitution rather than a literal because
+#: a browser trimming to a different number than the server would be invisible
+#: until a conversation got long enough to notice.
+_RESEARCH_SCRIPT_TEMPLATE = """
 (function () {
   const form = document.getElementById('research-form');
   if (!form) return;
@@ -867,6 +971,34 @@ RESEARCH_SCRIPT = """
   function currentThesis() {
     const cards = thread.querySelectorAll('script.thesis');
     return cards.length ? cards[cards.length - 1].textContent : '';
+  }
+
+  // ...and where there is no thesis, the thread itself travels. Every card
+  // that ends in a question records what it asked, which is exactly the case
+  // a thesis cannot cover: a reader answering "from the close of that day"
+  // has said nothing at all unless what was asked goes with it.
+  //
+  // The thread on screen is the whole of the memory. Nothing informs an
+  // answer that the reader cannot point at, and closing the page ends it.
+  function conversation() {
+    const blocks = [...thread.querySelectorAll('script.exchange')];
+    return blocks.slice(-__MAX_TURNS__).map((node) => {
+      try {
+        return JSON.parse(node.textContent);
+      } catch (e) {
+        return null;
+      }
+    }).filter(Boolean);
+  }
+
+  // A card can ask two things, so picking an answer fills the box rather than
+  // sending it: the reader sees the whole reply, and can edit one word of a
+  // suggestion instead of accepting it or retyping it.
+  function compose(card) {
+    const picked = [...card.querySelectorAll('.choice[aria-pressed="true"]')]
+      .map((button) => button.dataset.choice)
+      .filter(Boolean);
+    box.value = picked.join('; ');
   }
 
   function scrollToEnd() {
@@ -898,7 +1030,8 @@ RESEARCH_SCRIPT = """
     scrollToEnd();
     try {
       const html = await post('/api/research/interpret',
-        { question: question, thesis: currentThesis() });
+        { question: question, thesis: currentThesis(),
+          conversation: conversation() });
       pending.outerHTML = html;
     } catch (e) {
       pending.outerHTML = '<div class="error"><h3>Could not reach the server</h3><p>'
@@ -910,6 +1043,21 @@ RESEARCH_SCRIPT = """
   });
 
   thread.addEventListener('click', async (ev) => {
+    const choice = ev.target.closest('.choice');
+    if (choice) {
+      // One answer per question. "Something else" clears that question's
+      // answer rather than becoming one, so the box holds what the reader
+      // actually means and nothing stands in for the part they are typing.
+      const asked = choice.closest('.ask');
+      for (const button of asked.querySelectorAll('.choice')) {
+        const chosen = button === choice && !('other' in button.dataset);
+        button.setAttribute('aria-pressed', String(chosen));
+      }
+      compose(choice.closest('.turn'));
+      box.focus();
+      return;
+    }
+
     const edit = ev.target.closest('[data-edit]');
     if (edit) {
       const card = edit.closest('.turn');
@@ -949,6 +1097,13 @@ RESEARCH_SCRIPT = """
   }
 })();
 """
+
+#: The script as served. The browser trims the conversation to the same number
+#: of turns the planner will keep, so what is sent is what is read.
+RESEARCH_SCRIPT = _RESEARCH_SCRIPT_TEMPLATE.replace(
+    "__MAX_TURNS__", str(MAX_REMEMBERED_EXCHANGES)
+)
+
 
 
 RESEARCH_STYLE = """
@@ -992,6 +1147,23 @@ RESEARCH_STYLE = """
 .btn-quiet:hover { color: var(--text-primary); border-color: var(--accent); }
 .turn-unsupported, .turn-clarify { border-left: 3px solid var(--accent);
                                    padding-left: 14px; }
+
+/* An offered answer does what an example question does -- fills the box on a
+   click -- so it is the same pill, with a state for the one that is picked.
+   Nothing is pre-selected: offering a choice must not look like having made
+   one, which is the whole reason the question is being asked. */
+.ask p { margin: 0 0 7px; }
+.ask + .ask { margin-top: 12px; }
+.choices { display: flex; flex-wrap: wrap; gap: 6px; }
+.choice { padding: 6px 12px; border: 1px solid var(--grid); border-radius: 99px;
+          background: transparent; color: var(--text-secondary);
+          font: inherit; font-size: 12.5px; cursor: pointer; text-align: left; }
+.choice:hover { border-color: var(--accent); color: var(--text-primary); }
+.choice[aria-pressed="true"] { border-color: var(--accent);
+                               background: var(--surface-2);
+                               color: var(--text-primary); }
+.choice-other { color: var(--text-muted); border-style: dashed; }
+.findings-list li.ask { list-style: none; margin-left: -1.1em; }
 
 .compare { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
            border: 1px solid var(--grid); border-radius: 10px; overflow: hidden;

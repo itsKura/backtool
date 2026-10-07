@@ -38,7 +38,11 @@ from backtool.reporting.html import render_body
 from backtool.research.results import StudyResult
 from backtool.research.runner import run_study
 from backtool.research.spec import ResearchSpec
-from backtool.research.thesis import Thesis
+from backtool.research.thesis import (
+    MAX_REMEMBERED_EXCHANGES,
+    Exchange,
+    Thesis,
+)
 from backtool.research.windows import DEFAULT_WINDOWS, WindowSpec, window_title
 from backtool.web.calendar_page import render_calendar
 from backtool.web.event_page import (
@@ -524,9 +528,12 @@ async def research_interpret(payload: dict[str, Any]) -> HTMLResponse:
         )
 
     previous = _previous_thesis(payload.get("thesis"))
+    conversation = _conversation(payload.get("conversation"))
 
     try:
-        html = await asyncio.to_thread(_interpret_question, question, previous)
+        html = await asyncio.to_thread(
+            _interpret_question, question, previous, conversation
+        )
     except Exception as exc:  # noqa: BLE001 - the thread must show the reason
         logger.exception("Thesis planning failed")
         return HTMLResponse(render_error(f"{type(exc).__name__}: {exc}"), status_code=502)
@@ -534,7 +541,11 @@ async def research_interpret(payload: dict[str, Any]) -> HTMLResponse:
     return HTMLResponse(html)
 
 
-def _interpret_question(question: str, previous: Thesis | None) -> str:
+def _interpret_question(
+    question: str,
+    previous: Thesis | None,
+    conversation: tuple[Exchange, ...] = (),
+) -> str:
     """Plan, look up any public event, validate, and render. Off the event loop.
 
     The lookup sits between planning and conversion because of what each step
@@ -548,12 +559,16 @@ def _interpret_question(question: str, previous: Thesis | None) -> str:
     """
     from backtool.ai.thesis_planner import plan_thesis
 
-    planned = plan_thesis(question, previous=previous)
+    planned = plan_thesis(question, previous=previous, conversation=conversation)
 
+    # Every card below that ends in a question is handed the question that
+    # prompted it, so it can record the exchange. Those are exactly the cards
+    # with no thesis to carry, which is why a reader could answer the same
+    # question four times and get asked it again each time.
     if planned.unsupported:
-        return render_unsupported(planned)
+        return render_unsupported(planned, question=question)
     if planned.clarifications:
-        return render_clarification(planned)
+        return render_clarification(planned, question=question)
 
     resolution: ResolvedEventConcept | None = None
     if planned.needs_resolution:
@@ -563,7 +578,7 @@ def _interpret_question(question: str, previous: Thesis | None) -> str:
             # matches more than one event, sources that disagree, nothing found
             # -- and each is something to tell the reader rather than something
             # to resolve by picking.
-            return render_unresolved_event(resolution)
+            return render_unresolved_event(resolution, question=question)
 
     # Conversion is where the vocabulary is enforced. A field or value the
     # planner invented fails here rather than reaching the engine. The anchor
@@ -584,7 +599,7 @@ def _interpret_question(question: str, previous: Thesis | None) -> str:
         #
         # The thesis still travels with the card, so answering the question
         # costs nothing -- the resolution is already paid for and gets reused.
-        return render_anchor_needed(thesis)
+        return render_anchor_needed(thesis, question=question)
 
     return render_spec_card(thesis, planned)
 
@@ -624,6 +639,29 @@ def _resolution_for(
 
     logger.info("Resolving %r for a research question", concept)
     return resolve_event_concept(concept)
+
+
+def _conversation(raw: object) -> tuple[Exchange, ...]:
+    """The turns the page sent, validated and trimmed.
+
+    An unreadable entry is dropped rather than fatal, for the same reason a
+    stale thesis is: the worst case is one turn planned without its context,
+    which the reader can see and correct, and that is a far better failure
+    than a page that cannot ask anything at all.
+
+    Trimmed here as well as in the browser. The browser's limit keeps the
+    request small and this one is the one that holds, because what reaches the
+    planner should not depend on what a page chose to send.
+    """
+    if not isinstance(raw, list):
+        return ()
+    turns: list[Exchange] = []
+    for item in raw:
+        try:
+            turns.append(Exchange.model_validate(item))
+        except ValueError:
+            logger.info("Ignoring an unreadable entry in the conversation")
+    return tuple(turns[-MAX_REMEMBERED_EXCHANGES:])
 
 
 def _previous_thesis(raw: object) -> Thesis | None:

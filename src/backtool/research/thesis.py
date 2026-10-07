@@ -23,9 +23,15 @@ Follow-ups
 ----------
 A thesis is immutable and composes. "What about only when BTC was down that
 week?" is :meth:`Thesis.with_condition` on the thesis already on screen, not a
-new question parsed from nothing. That is why conversation state holds a thesis
-rather than a transcript: the second question is a modification of the first,
-and the structure makes it one.
+new question parsed from nothing. Conversation state therefore holds a thesis
+rather than a transcript wherever it can: the second question is a modification
+of the first, and the structure makes it one.
+
+Where it cannot is the gap :class:`Exchange` fills. A turn that ends in a
+question -- a clarification, a refusal, a lookup that did not settle -- has no
+thesis to carry, and carrying nothing meant the reader's answer arrived with no
+record of what it was answering. The structure only composes once there is
+something to compose.
 """
 
 from __future__ import annotations
@@ -369,6 +375,50 @@ class Outcome(BaseModel):
             return f"how many releases had a usable {subject}"
 
         return f"{self.aggregation.value} {subject}"
+
+
+#: How many turns of the conversation travel with a question.
+#:
+#: Enough to follow a clarification that took several rounds to settle, and
+#: bounded because every turn is tokens on every later request. The page is a
+#: working thread, not an archive: what is on screen informs the next question,
+#: and what scrolled off a week ago does not.
+MAX_REMEMBERED_EXCHANGES = 6
+
+
+class Exchange(BaseModel):
+    """One round of the conversation, as it happened on the page.
+
+    What the reader said, how it was read back, and what was put to them in
+    return. The third part is the one that matters: without it a reply like
+    "from the close of that day" is not a question at all, and the only honest
+    thing to do with it is ask what it refers to.
+
+    Carried rather than stored. This is the thread on screen, which is also
+    what the reader can see -- so nothing informs an answer that they cannot
+    themselves point at, and closing the page ends the conversation.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    #: What the reader typed, verbatim.
+    question: str = ""
+    #: How it was read back to them, if it got that far.
+    restated: str = ""
+    #: What was put to the reader in return. The questions, not the options:
+    #: the options are an affordance for answering, and what needs remembering
+    #: is what was asked.
+    asked: tuple[str, ...] = ()
+
+    @property
+    def is_worth_remembering(self) -> bool:
+        """Whether this turn says anything the next one needs.
+
+        A turn that asked nothing and restated nothing is a blank, and a blank
+        in the conversation is worse than an absence -- it spends tokens
+        saying that something happened and not what.
+        """
+        return bool(self.asked or self.restated.strip())
 
 
 class Comparison(BaseModel):
@@ -835,7 +885,9 @@ def unsupported_reason(
 
 
 __all__ = [
+    "MAX_REMEMBERED_EXCHANGES",
     "Comparison",
+    "Exchange",
     "Condition",
     "Outcome",
     "Thesis",
