@@ -39,9 +39,14 @@ from backtool.research.vocabulary import (
     ResultShape,
     asset_label,
 )
-from backtool.research.windows import REACTION_WINDOWS, window_title
+from backtool.research.windows import (
+    REACTION_WINDOWS,
+    WindowSpec,
+    compact_duration,
+    window_title,
+)
 from backtool.web.cohort_view import render_cohort_table, render_sample_badge
-from backtool.web.event_page import CHART_SPAN, CHART_ZOOMS
+from backtool.web.event_page import chart_opening_for, chart_zooms_for
 
 #: Starting points, chosen to show the three shapes a question can take: a
 #: cohort comparison, a plain event study, and a conditional follow-up.
@@ -522,13 +527,21 @@ def _price_zone(finding: ResearchFinding) -> str:
             f'<select class="chart-event">{options}</select></label>'
         )
 
+    # The rungs follow the window: a ninety-day box needs a ninety-day view,
+    # and "17520h" is not a label. The widest is selected, so the window is
+    # whole on the opening view.
+    measured = _measured_spec(finding.thesis.outcome.horizon)
+    rungs = chart_zooms_for(measured) if measured is not None else ()
+    opening = chart_opening_for(measured) if measured is not None else None
     zooms = "".join(
-        f'<button type="button" data-hours="{hours}" '
-        f'aria-selected="{str(hours == CHART_ZOOMS[0]).lower()}">'
-        f"&plusmn;{hours}h</button>"
-        for hours in CHART_ZOOMS
+        f'<button type="button" data-hours="{rung.total_seconds() / 3600:g}" '
+        f"data-label={quoteattr(compact_duration(rung))} "
+        f'aria-selected="{str(rung == opening).lower()}">'
+        f"&plusmn;{escape(compact_duration(rung))}</button>"
+        for rung in rungs
     )
     window = window_title_for(finding.thesis.outcome.horizon)
+    reach = compact_duration(opening) if opening else "24h"
     return (
         '<div class="chart-block" data-chart>'
         '<p class="finding-sub">Price around the event</p>'
@@ -538,8 +551,7 @@ def _price_zone(finding: ResearchFinding) -> str:
         # levels read as three different charts: the view narrows the series,
         # so the price scale and the last-price line follow the last visible
         # candle rather than the last candle.
-        f'<span class="chart-span">'
-        f"{int(CHART_SPAN.total_seconds() // 3600)}h either side</span>"
+        f'<span class="chart-span">{escape(reach)} either side</span>'
         + (f" &middot; shaded: {escape(window)}" if window else "")
         + "</p>"
         '<div class="chart-toolbar">'
@@ -555,6 +567,18 @@ def _price_zone(finding: ResearchFinding) -> str:
     )
 
 
+def _measured_spec(horizon: str) -> WindowSpec | None:
+    """The window this horizon measures, from the family it belongs to.
+
+    Separate from :func:`window_title_for` because the chart needs the spec
+    itself -- its span decides the zoom rungs -- and not only its name.
+    """
+    from backtool.research.vocabulary import reaction_windows, window_for
+
+    name = window_for(horizon)
+    return next((w for w in reaction_windows(horizon) if w.name == name), None)
+
+
 def window_title_for(horizon: str) -> str:
     """What the shaded box is, in the reader's words.
 
@@ -564,7 +588,7 @@ def window_title_for(horizon: str) -> str:
     from backtool.research.vocabulary import reaction_windows, window_for
 
     name = window_for(horizon)
-    spec = next((w for w in reaction_windows() if w.name == name), None)
+    spec = next((w for w in reaction_windows(horizon) if w.name == name), None)
     return window_title(spec) if spec is not None else ""
 
 
@@ -1121,14 +1145,22 @@ _RESEARCH_SCRIPT_TEMPLATE = """
         status: block.querySelector('.chart-status'),
         bands: block.querySelector('.chart-bands'),
         toolbar: block.querySelector('.chart-range'),
-        zoom: __ZOOM__,
+        // The opening rung is the card's own widest, not a constant: the
+        // ladder depends on the window being shaded.
+        zoom: Number(
+          (block.querySelector('.chart-range button[aria-selected="true"]')
+            || block.querySelector('.chart-range button'))?.dataset.hours || 24),
         marker: 'event',
         load: load,
         // So the caption describes the view rather than the request. The
         // price axis rescales to what is shown, so a caption that kept
         // saying 24h made a narrower view look like different data.
-        onZoom: (hours) => {
-          if (span) span.textContent = hours + 'h either side';
+        onZoom: () => {
+          const picked = block.querySelector(
+            '.chart-range button[aria-selected="true"]');
+          if (span && picked) {
+            span.textContent = picked.dataset.label + ' either side';
+          }
         },
       });
 
@@ -1254,7 +1286,7 @@ _RESEARCH_SCRIPT_TEMPLATE = """
 #: of turns the planner will keep, so what is sent is what is read.
 RESEARCH_SCRIPT = _RESEARCH_SCRIPT_TEMPLATE.replace(
     "__MAX_TURNS__", str(MAX_REMEMBERED_EXCHANGES)
-).replace("__ZOOM__", str(CHART_ZOOMS[0]))
+)
 
 
 

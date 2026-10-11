@@ -564,8 +564,12 @@ class TestTheCaptionDescribesTheView:
         assert f">{opening}h either side</span>" in html
 
     def test_the_chart_rewrites_it_on_every_zoom(self) -> None:
+        """The label comes off the pressed button rather than being built in
+        JavaScript, because formatting a duration belongs with the ladder that
+        defines the rungs -- "17520h" is not a label a reader can use."""
         assert "onZoom" in RESEARCH_SCRIPT
-        assert "h either side" in RESEARCH_SCRIPT
+        assert "dataset.label" in RESEARCH_SCRIPT
+        assert "either side" in RESEARCH_SCRIPT
 
     def test_the_chart_offers_the_hook_rather_than_requiring_it(self) -> None:
         """The event page passes no callback, and must keep working."""

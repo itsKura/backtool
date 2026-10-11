@@ -158,6 +158,10 @@ _ZERO = dt.timedelta(0)
 #: after", where the reader is comparing spans and the unit switching under
 #: them hides that 24h is twenty-four times the others.
 _UNITS: tuple[tuple[str, str, int, int], ...] = (
+    # A year is 365 days exactly. Nothing here is a calendar operation -- an
+    # offset is a duration added to an instant -- so the only thing a leap day
+    # would change is which arbitrary number gets printed.
+    ("year", "y", 31536000, 1),
     ("day", "d", 86400, 2),
     ("hour", "h", 3600, 1),
     ("minute", "m", 60, 1),
@@ -258,3 +262,26 @@ REACTION_WINDOWS: tuple[WindowSpec, ...] = (
     WindowSpec(name="post_event_4h", start="0h", end="4h"),
     WindowSpec(name="post_event_24h", start="0h", end="24h"),
 )
+
+#: The windows a long-horizon study measures, spanning a week to two years.
+#:
+#: Separate from :data:`REACTION_WINDOWS` rather than appended to it, because a
+#: study has one candle interval and no interval serves both: two years at five
+#: minutes is 210,240 candles per event, and five minutes at one hour is not
+#: resolvable at all. Which family a thesis runs against follows from the
+#: horizon it asked about.
+#:
+#: The same reasoning as the reaction grid applies within this one. Each is
+#: measured from the event, not from the previous step -- the 2y figure is not
+#: the 1y figure plus something -- and reading them in sequence is the point: a
+#: move still present after two years is a different event from one that was
+#: there at ninety days and gone by one.
+LONG_WINDOWS: tuple[WindowSpec, ...] = (
+    WindowSpec(name="post_event_7d", start="0h", end="7d"),
+    WindowSpec(name="post_event_30d", start="0h", end="30d"),
+    WindowSpec(name="post_event_90d", start="0h", end="90d"),
+    WindowSpec(name="post_event_180d", start="0h", end="180d"),
+    WindowSpec(name="post_event_1y", start="0h", end="365d"),
+    WindowSpec(name="post_event_2y", start="0h", end="730d"),
+)
+

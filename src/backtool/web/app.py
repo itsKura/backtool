@@ -50,6 +50,7 @@ from backtool.web.event_page import (
     CHART_SPAN,
     LIGHTWEIGHT_CHARTS_CDN,
     ai_summary_script,
+    chart_span_for,
     chart_window_bands,
     history_load_script,
     price_chart_script,
@@ -684,6 +685,8 @@ async def research_chart(payload: dict[str, Any]) -> dict[str, Any]:
     for. A chart that fetched its own data would be a second account of the
     same run, and the one a reader looks at would be the one nobody checked.
     """
+    from backtool.research.vocabulary import interval_for
+
     thesis = _previous_thesis(payload.get("thesis"))
     if thesis is None:
         return {"candles": [], "message": "That specification could not be read."}
@@ -693,7 +696,7 @@ async def research_chart(payload: dict[str, Any]) -> dict[str, Any]:
             _thesis_candles,
             thesis=thesis,
             event_id=str(payload.get("event_id") or ""),
-            interval=str(payload.get("interval") or Interval.M5.value),
+            interval=str(payload.get("interval") or interval_for(thesis.outcome.horizon)),
         )
     except ValueError as exc:
         return {"candles": [], "message": str(exc)}
@@ -713,8 +716,9 @@ def _measured_window(thesis: Thesis) -> WindowSpec | None:
     """
     from backtool.research.vocabulary import reaction_windows, window_for
 
-    name = window_for(thesis.outcome.horizon)
-    return next((w for w in reaction_windows() if w.name == name), None)
+    horizon = thesis.outcome.horizon
+    name = window_for(horizon)
+    return next((w for w in reaction_windows(horizon) if w.name == name), None)
 
 
 def _thesis_candles(
@@ -742,16 +746,20 @@ def _thesis_candles(
         chosen = max(past, key=lambda event: event.timestamp_utc)
 
     resolved = Interval(interval.lower())
-    start = chosen.timestamp_utc - CHART_SPAN
-    end = chosen.timestamp_utc + CHART_SPAN
+    # The chart reaches as far as the window it shades, not a fixed day: a
+    # ninety-day box on a chart spanning a day either side is a rectangle wider
+    # than the canvas with none of the window inside it.
+    window = _measured_window(thesis)
+    span = chart_span_for(window) if window is not None else CHART_SPAN
+    start = chosen.timestamp_utc - span
+    end = chosen.timestamp_utc + span
 
     with MarketDataService.from_settings(Settings.from_env()) as service:
         frame = service.get_candles(thesis.asset, resolved, start, end)
 
-    window = _measured_window(thesis)
     bands = (
         chart_window_bands(
-            chosen.timestamp_utc, frame, resolved, windows=(window,)
+            chosen.timestamp_utc, frame, resolved, windows=(window,), span=span
         )
         if window is not None
         else []

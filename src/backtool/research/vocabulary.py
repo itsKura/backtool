@@ -34,7 +34,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from backtool.core.types import EventType
+from backtool.core.types import EventType, Interval
 from backtool.research.windows import WindowSpec
 
 #: Markets that can be measured. Both list on Binance from 2017-08-17, so
@@ -542,7 +542,31 @@ OUTCOME_HORIZONS: dict[str, str] = {
     "1h": "post_event_1h",
     "4h": "post_event_4h",
     "24h": "post_event_24h",
+    "7d": "post_event_7d",
+    "30d": "post_event_30d",
+    "90d": "post_event_90d",
+    "180d": "post_event_180d",
+    "1y": "post_event_1y",
+    "2y": "post_event_2y",
 }
+
+#: Horizons measured on the long grid, at hourly candles.
+#:
+#: The split is not a preference. A study carries one interval; two years of
+#: five-minute candles is 210,240 per event, and a five-minute window cannot be
+#: resolved at hourly. So a question about a week or more is run against
+#: :data:`~backtool.research.windows.LONG_WINDOWS` at
+#: :data:`LONG_HORIZON_INTERVAL`, and everything shorter against the reaction
+#: grid at :data:`SHORT_HORIZON_INTERVAL`.
+LONG_HORIZONS: frozenset[str] = frozenset(
+    {"7d", "30d", "90d", "180d", "1y", "2y"}
+)
+
+#: Candles each family is measured on. Five minutes is the finest the project
+#: supports and an hour the coarsest, which is exactly the range these two
+#: families need.
+SHORT_HORIZON_INTERVAL = Interval.M5
+LONG_HORIZON_INTERVAL = Interval.H1
 
 #: The horizon assumed when a question does not name one. Long enough to
 #: contain a full reaction rather than the first spike, short enough that the
@@ -703,16 +727,37 @@ _NUMERIC_KEYS: dict[str, str] = {
 }
 
 
-def reaction_windows() -> tuple[WindowSpec, ...]:
-    """The windows every thesis measures.
+def is_long_horizon(horizon: str) -> bool:
+    """Whether this horizon is measured on the long grid."""
+    return horizon.strip() in LONG_HORIZONS
 
-    All five horizons are measured whatever the thesis asked for, because the
-    cost is one study either way and a reader looking at a 24-hour answer
-    almost always wants to know whether it was already there at one hour.
+
+def interval_for(horizon: str) -> Interval:
+    """The candle interval a study of this horizon runs at.
+
+    Derived from the horizon rather than configured, so the interval and the
+    windows cannot be set to disagree -- a two-year window measured at five
+    minutes would be a quarter of a million candles per event, and a
+    five-minute window measured hourly would have nothing inside it.
     """
-    from backtool.research.windows import REACTION_WINDOWS
+    return LONG_HORIZON_INTERVAL if is_long_horizon(horizon) else SHORT_HORIZON_INTERVAL
 
-    return REACTION_WINDOWS
+
+def reaction_windows(horizon: str = DEFAULT_HORIZON) -> tuple[WindowSpec, ...]:
+    """The windows a thesis of this horizon measures.
+
+    Every horizon in the family is measured whatever the thesis asked for,
+    because the cost is one study either way and a reader looking at a 24-hour
+    answer almost always wants to know whether it was already there at one
+    hour -- or, on the long grid, whether a two-year move was already there at
+    ninety days.
+
+    The two families are not merged because a study has one candle interval.
+    See :data:`LONG_HORIZONS`.
+    """
+    from backtool.research.windows import LONG_WINDOWS, REACTION_WINDOWS
+
+    return LONG_WINDOWS if is_long_horizon(horizon) else REACTION_WINDOWS
 
 
 __all__ = [

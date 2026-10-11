@@ -60,13 +60,20 @@ from backtool.research.vocabulary import (
     Order,
     ResolutionContext,
     ResultShape,
+    interval_for,
     reaction_windows,
 )
 
 logger = logging.getLogger(__name__)
 
-#: Candle interval every thesis is measured at. Fine enough to resolve a
-#: five-minute window, which is the shortest horizon the vocabulary offers.
+#: Candle interval a short-horizon thesis is measured at. Fine enough to
+#: resolve a five-minute window, which is the shortest the vocabulary offers.
+#:
+#: No longer the only one: a thesis asking about a week or more runs on hourly
+#: candles instead, because two years at five minutes is a quarter of a million
+#: candles for a single event. Which one applies follows from the horizon --
+#: see :func:`~backtool.research.vocabulary.interval_for` -- so the interval and
+#: the windows cannot be set to disagree.
 THESIS_INTERVAL = Interval.M5
 
 
@@ -227,6 +234,22 @@ class ResearchFinding(BaseModel):
             return f"{value:.0f}"
         return self.metric.format(value)
 
+    def counted(self, n: int) -> str:
+        """``3 releases``, ``1 event`` -- the count with the right noun.
+
+        Both halves vary. The noun follows the thesis, because a concept
+        resolved from the web is not a release of anything; the plural follows
+        the count, which stopped being academic when long horizons made a
+        sample of one the ordinary outcome rather than a degenerate one.
+        """
+        noun = self.thesis.event_noun
+        return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+    @property
+    def _plural(self) -> str:
+        """The event noun, pluralised, for sentences with no count in them."""
+        return f"{self.thesis.event_noun}s"
+
     def verdict(self) -> str:
         """A neutral one-line reading, derived from the result and its shape.
 
@@ -241,7 +264,10 @@ class ResearchFinding(BaseModel):
 
         if self.shape is ResultShape.RANKED:
             if not self.rows:
-                return "No release had a usable reading, so there is nothing to rank."
+                return (
+                    f"No {self.thesis.event_noun} had a usable reading, so "
+                    "there is nothing to rank."
+                )
             top = self.rows[0]
             extreme = "largest" if outcome.order is Order.DESCENDING else "smallest"
             return (
@@ -252,8 +278,8 @@ class ResearchFinding(BaseModel):
 
         if self.value is None:
             return (
-                "No release matched with a usable reading, so there is nothing "
-                "to report."
+                f"No {self.thesis.event_noun} matched with a usable reading, "
+                "so there is nothing to report."
             )
 
         # Gated on the shape, so a frequency *comparison* falls through to the
@@ -273,7 +299,7 @@ class ResearchFinding(BaseModel):
             return (
                 f"The {subject} was {comparison} "
                 f"{self.metric.format(outcome.threshold)} after "
-                f"{self.value:.0f}% of releases"
+                f"{self.value:.0f}% of {self._plural}"
                 f"{f' ({counted})' if counted else ''}."
             )
 
@@ -281,13 +307,13 @@ class ResearchFinding(BaseModel):
             outcome.aggregation is Aggregation.COUNT
             and self.shape is not ResultShape.COMPARISON
         ):
-            return f"{self.value:.0f} releases had a usable {subject}."
+            return f"{self.counted(int(self.value))} had a usable {subject}."
 
         if self.shape is ResultShape.SCALAR:
             return (
                 f"The {outcome.aggregation.value} {subject} was "
                 f"{self.format_value(self.value)} across "
-                f"{self.sample_size} releases."
+                f"{self.counted(self.sample_size)}."
             )
 
         difference = self.difference_pp
@@ -303,7 +329,7 @@ class ResearchFinding(BaseModel):
         # group can be "a typical release", because only an unfiltered group
         # is every release.
         against = (
-            "a typical release"
+            f"a typical {self.thesis.event_noun}"
             if self.comparison is not None and self.comparison.key == "right"
             and self.thesis.versus is not None
             and self.thesis.versus.is_baseline
@@ -313,7 +339,7 @@ class ResearchFinding(BaseModel):
         )
 
         # A result that is not in the metric's units cannot be described as a
-        # higher or lower *return*: both sides are shares of releases, so the
+        # higher or lower *return*: both sides are shares of the sample, so the
         # sentence states the two shares and the gap between them.
         if not self.result_in_metric_units:
             left = self.describe_count(self.matched_count, self.sample_size)
@@ -371,8 +397,8 @@ def run_thesis(thesis: Thesis, *, as_of: dt.datetime | None = None) -> ResearchF
         event_type=thesis.event_type,
         event_set=event_set,
         event_count=thesis.event_count,
-        interval=THESIS_INTERVAL,
-        windows=reaction_windows(),
+        interval=interval_for(thesis.outcome.horizon),
+        windows=reaction_windows(thesis.outcome.horizon),
         as_of=cutoff,
     )
 
@@ -730,24 +756,28 @@ def _warnings(thesis: Thesis, measured: int, compared: int) -> tuple[str, ...]:
     observation rather than an inference.
     """
     notes: list[str] = []
+    noun = thesis.event_noun
+
+    def counted(n: int) -> str:
+        return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
 
     if measured == 0:
-        notes.append("No release matched with a usable reading.")
+        notes.append(f"No {noun} matched with a usable reading.")
         return tuple(notes)
 
     if thesis.shape is ResultShape.RANKED:
         # Stated as context rather than as a caveat: a reader ranking releases
         # needs to know how many were in the running.
         notes.append(
-            f"Ranked across {measured} releases with a usable reading. These "
+            f"Ranked across {counted(measured)} with a usable reading. These "
             "are the observed extremes of that sample, not an estimate of how "
-            "extreme a future release could be."
+            f"extreme a future {noun} could be."
         )
     else:
         quality = sample_quality(measured)
         if quality.needs_warning:
             notes.append(
-                f"{quality.value.capitalize()} sample: {measured} releases. "
+                f"{quality.value.capitalize()} sample: {counted(measured)}. "
                 "No statistical test has been run, and a handful of different "
                 "outcomes would move these figures."
             )
@@ -755,8 +785,8 @@ def _warnings(thesis: Thesis, measured: int, compared: int) -> tuple[str, ...]:
     if thesis.versus is not None:
         if thesis.versus.is_baseline:
             notes.append(
-                "The comparison group is every usable release, including the "
-                "ones selected here. Comparing against the remaining releases "
+                f"The comparison group is every usable {noun}, including the "
+                f"ones selected here. Comparing against the remaining {noun}s "
                 "instead would answer a different question and would widen "
                 "the gap."
             )
@@ -765,15 +795,15 @@ def _warnings(thesis: Thesis, measured: int, compared: int) -> tuple[str, ...]:
             # contradict, which is the usual case, but nothing guarantees it --
             # so the overlap is reported rather than assumed away.
             notes.append(
-                "The two groups are selected independently; a release meeting "
+                f"The two groups are selected independently; a {noun} meeting "
                 "both sets of conditions would appear in both."
             )
         quality = sample_quality(compared)
         if compared == 0:
-            notes.append("No release matched the comparison group.")
+            notes.append(f"No {noun} matched the comparison group.")
         elif quality.needs_warning:
             notes.append(
-                f"Comparison group: {compared} releases, a "
+                f"Comparison group: {counted(compared)}, a "
                 f"{quality.value} sample on that side."
             )
 

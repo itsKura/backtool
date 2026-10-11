@@ -62,6 +62,66 @@ CHART_SPAN = dt.timedelta(hours=24)
 #: legible. Native scroll-zoom does the same thing; these just make it findable.
 CHART_ZOOMS: tuple[int, ...] = (24, 4, 1)
 
+#: Zoom rungs a chart can offer, shortest first.
+#:
+#: A chart offers the rung its window sits on and the two below it, so the
+#: window is visible whole at the widest setting and examinable at the
+#: narrowest. For a 24-hour window that yields 24h, 4h, 1h -- which is what the
+#: release page offered before any of this existed, and is the check that these
+#: rungs generalise it rather than replace it.
+CHART_ZOOM_LADDER: tuple[dt.timedelta, ...] = (
+    dt.timedelta(hours=1),
+    dt.timedelta(hours=4),
+    dt.timedelta(hours=24),
+    dt.timedelta(days=7),
+    dt.timedelta(days=30),
+    dt.timedelta(days=90),
+    dt.timedelta(days=180),
+    dt.timedelta(days=365),
+    dt.timedelta(days=730),
+)
+
+
+def chart_zooms_for(window: WindowSpec) -> tuple[dt.timedelta, ...]:
+    """The zoom rungs to offer for a chart shading this window, widest first.
+
+    The widest is the smallest rung that contains the window, so the shaded box
+    always fits on the opening view. Two narrower rungs come with it, because a
+    long window's interesting part is usually its first few percent and a
+    reader has no other way to get there.
+    """
+    index = CHART_ZOOM_LADDER.index(chart_opening_for(window))
+    chosen = CHART_ZOOM_LADDER[max(0, index - 2) : index + 1]
+    # Three rungs wherever the ladder allows it. A window at the bottom of the
+    # ladder has nothing below to offer, and a chart with one button is a
+    # chart with no zoom -- so it borrows from above instead.
+    if len(chosen) < 3:
+        chosen = CHART_ZOOM_LADDER[:3]
+    return tuple(reversed(chosen))
+
+
+def chart_opening_for(window: WindowSpec) -> dt.timedelta:
+    """The rung a chart of this window opens on.
+
+    The tightest that still contains the window, so the box is whole and as
+    large as it can be. Not necessarily the widest offered: a five-minute
+    window opens at an hour and can still be pulled out to a day.
+    """
+    span = window.end_offset - window.start_offset
+    fits = [rung for rung in CHART_ZOOM_LADDER if rung >= span]
+    return fits[0] if fits else CHART_ZOOM_LADDER[-1]
+
+
+def chart_span_for(window: WindowSpec) -> dt.timedelta:
+    """How far either side of the event the chart's data must reach.
+
+    The *widest* rung offered, not the opening one: zooming narrows the series
+    the client already holds, so anything it can be pulled out to has to have
+    been fetched.
+    """
+    return chart_zooms_for(window)[0]
+
+
 
 def chart_window_bands(
     event_time: dt.datetime,

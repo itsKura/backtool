@@ -905,6 +905,29 @@ time as HH:MM.
 empty. "from the close on election day" is `end of day`. "from 22:00 ET" \
 is `22:00`. This field records a decision; it never makes one.
 
+## How long after the event
+
+`outcome_horizon` reaches from five minutes to two years, and the whole list is \
+in `vocabulary`. Use what the question asks for: "two years after" is `2y`, \
+"the first week" is `7d`, "the next quarter" is `90d`. A question that names no \
+horizon means 24h, as before -- do not promote one to years because the event \
+sounds long-lived.
+
+Two things follow from a long horizon, and neither is a reason to refuse one.
+
+A window is only measurable once it has fully elapsed, so a two-year horizon \
+can only be answered for events at least two years old. Exchange history is \
+short: for most assets a 2y question has one or two usable occurrences, and \
+sometimes none. That is a finding, not a failure -- the engine reports exactly \
+how many events survived and says so. Do not quietly shorten the horizon to \
+get a bigger sample. The reader asked about two years.
+
+Say in `assumptions` that a long horizon leaves few occurrences, so a reader \
+who wanted a pattern rather than a case study can disagree before anything \
+runs. Do not ask it as a `clarification`: the horizon is not in doubt, and \
+questioning the one thing they were explicit about is how a reader ends up \
+answering their own question back.
+
 ## Defaults versus clarifications
 
 Fill in a default when it is low-consequence, conventional, and stated. A \
