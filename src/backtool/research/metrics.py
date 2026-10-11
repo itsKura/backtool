@@ -35,7 +35,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 
 from backtool.core.time import expected_candle_count
 from backtool.core.types import Interval
-from backtool.research.anchoring import anchor_at
+from backtool.research.anchoring import Anchor, anchor_at
 from backtool.research.windows import ResolvedWindow
 
 
@@ -135,6 +135,65 @@ class WindowMetrics(BaseModel):
         return self.status is WindowStatus.OK
 
 
+def _boundary_out_of_reach(
+    start_anchor: Anchor,
+    end_anchor: Anchor,
+    window: ResolvedWindow,
+    interval: Interval,
+) -> str | None:
+    """Whether either anchor is too far from the boundary it is pricing.
+
+    An anchor is the last candle that closed at or before its boundary, so on
+    complete data it sits within one candle of it. A larger gap means candles
+    are missing there -- and at the end of a long window that is usually not a
+    gap at all, it is the window running past the end of history.
+
+    The distinction this draws is between "the two-year return" and "the return
+    over however much of two years we happen to have". Those are different
+    numbers, and reporting the second under the first's name is the kind of
+    quiet wrongness nothing downstream could detect: the figure is plausible,
+    the status is ``ok``, and the only evidence is a lag field no caller reads.
+
+    One interval of slack, so a single missing candle at a boundary stays a
+    coverage note rather than becoming a refusal -- that is what
+    ``coverage_pct`` is for, and exchange outages of one candle are ordinary.
+
+    Returns:
+        A sentence naming the boundary and the shortfall, or ``None`` when both
+        anchors are close enough to mean what they say.
+    """
+    tolerance = interval.duration.total_seconds()
+    for edge, anchor, boundary in (
+        ("start", start_anchor, window.start),
+        ("end", end_anchor, window.end),
+    ):
+        if anchor.lag_seconds <= tolerance:
+            continue
+        return (
+            f"The window {edge} ({boundary:%Y-%m-%d %H:%M} UTC) is "
+            f"{_roughly(anchor.lag_seconds)} beyond the last candle available, "
+            "so only part of this window has data."
+        )
+    return None
+
+
+def _roughly(seconds: float) -> str:
+    """A shortfall in the largest unit that reads sensibly.
+
+    :func:`humanise_duration` names a unit only when the duration divides into
+    it exactly, which a shortfall essentially never does -- so it reported a
+    year as "8761 hours". This rounds instead, because the number is being
+    shown to explain a refusal rather than to be computed with.
+    """
+    for name, size in (("year", 31_536_000), ("day", 86_400), ("hour", 3_600)):
+        if seconds >= size:
+            value = round(seconds / size, 1)
+            whole = int(value)
+            shown = whole if value == whole else value
+            return f"{shown} {name}{'' if shown == 1 else 's'}"
+    return f"{round(seconds / 60)} minutes"
+
+
 def compute_window_metrics(
     candles: pd.DataFrame,
     window: ResolvedWindow,
@@ -156,6 +215,9 @@ def compute_window_metrics(
     What can go wrong:
         * History starts after the window -- no anchor exists, so
           ``INSUFFICIENT_DATA``.
+        * History *ends* before the window does -- an anchor exists but prices
+          an instant well before the boundary, so ``INSUFFICIENT_DATA``. See
+          :func:`_boundary_out_of_reach`.
         * An exchange outage removes candles mid-window -- metrics are still
           computed, but ``coverage_pct`` drops and the anchor lags grow.
         * The window is shorter than one candle -- no candle closes inside it,
@@ -180,6 +242,23 @@ def compute_window_metrics(
                 f"No candle closed at or before the window {missing} "
                 f"({boundary:%Y-%m-%d %H:%M} UTC)"
             ),
+        )
+
+    out_of_reach = _boundary_out_of_reach(start_anchor, end_anchor, window, interval)
+    if out_of_reach is not None:
+        return WindowMetrics(
+            name=window.name,
+            start_utc=window.start,
+            end_utc=window.end,
+            expected_candles=expected,
+            status=WindowStatus.INSUFFICIENT_DATA,
+            reason=out_of_reach,
+            start_price=start_anchor.price,
+            end_price=end_anchor.price,
+            start_anchor_utc=start_anchor.time,
+            end_anchor_utc=end_anchor.time,
+            start_anchor_lag_s=start_anchor.lag_seconds,
+            end_anchor_lag_s=end_anchor.lag_seconds,
         )
 
     # Candles whose close falls inside (start, end]. The start anchor supplies
