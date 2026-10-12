@@ -22,7 +22,7 @@ import datetime as dt
 from collections.abc import Sequence
 from xml.sax.saxutils import escape, quoteattr
 
-from backtool.ai.thesis_planner import ANCHOR_CHOICES, PlannedThesis
+from backtool.ai.thesis_planner import PlannedThesis
 from backtool.events.models import SourceAuthority, SourceRef
 from backtool.events.resolution import (
     CandidateEvent,
@@ -382,62 +382,6 @@ def _status_sentence(resolution: ResolvedEventConcept) -> str:
     if not resolution.primary_events:
         return "Nothing was found that is an occurrence of this, as opposed to context."
     return "One thing has to be settled before this can be measured."
-
-
-def render_anchor_needed(thesis: Thesis, *, question: str = "") -> str:
-    """Dates established, but no instant to measure from.
-
-    The sources settled which day something happened and published no time,
-    which is ordinary -- an election day has no announcement instant, and a
-    ruling often has no stated hour. What is not ordinary is choosing one
-    anyway. Midnight local is not a neutral reading: it places the whole
-    trading day after the event, so a 1h or 24h window measured from it answers
-    a different question than one measured from the close.
-
-    So the study stops and asks. The thesis travels with the card, which is
-    what makes answering free: the resolution has already been paid for, and
-    the follow-up reuses it rather than looking the event up again.
-    """
-    resolution = thesis.resolution
-    assert resolution is not None  # only a resolved concept can need an anchor
-
-    days = "".join(
-        f'<div class="spec-row"><span class="spec-label">{escape(event.label)}</span>'
-        f'<span class="spec-value">{escape(event.local_date.isoformat())} '
-        f"({escape(event.timezone)}), no published time</span></div>"
-        for event in resolution.primary_events
-        if event.is_date_only
-    )
-    return (
-        '<div class="turn turn-clarify">'
-        f'<p class="spec-head">{escape(resolution.canonical_name or resolution.query)}</p>'
-        "<p>I established the dates, but no source gives a time of day, so "
-        "there is no instant to measure from yet:</p>"
-        f'<div class="spec-card">{days}</div>'
-        "<p>Which instant should the window start from? It changes the answer: "
-        "measuring from the start of the day puts the whole trading day after "
-        "the event, while measuring from the close puts it before. Picking for "
-        "you would decide the result, so I will not.</p>"
-        '<ul class="findings-list">'
-        # The offered words are the planner's own, not the page's: see
-        # ANCHOR_CHOICES. A button whose text had drifted out of what the
-        # planner reads would send the reader round the same question again.
-        + _choices(
-            "Where in the day should the window start?",
-            [text for text, _policy in ANCHOR_CHOICES],
-        )
-        + "</ul>"
-        '<p class="muted">Or type a local time, such as '
-        '<strong>"from 22:00"</strong>. The dates are already established, so '
-        "answering costs nothing.</p>"
-        + _state_block("thesis", thesis.model_dump_json())
-        + _remember(
-            question,
-            resolution.canonical_name or resolution.query,
-            ("Where in the day should the window start?",),
-        )
-        + "</div>"
-    )
 
 
 def render_clarification(planned: PlannedThesis, *, question: str = "") -> str:
@@ -1410,7 +1354,6 @@ RESEARCH_STYLE = """
 
 
 __all__ = [
-    "render_anchor_needed",
     "render_event_provenance",
     "render_unresolved_event",
     "EXAMPLE_QUESTIONS",

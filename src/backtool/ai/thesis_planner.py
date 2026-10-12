@@ -436,7 +436,10 @@ class PlannedThesis(BaseModel):
             asset=self.asset,
             event_type=EventType(family) if resolution is None else None,
             resolution=resolution,
-            anchor=anchor,
+            # The one place a thesis is built from a resolution, so the one
+            # place the default belongs. The engine still refuses to compile a
+            # date-only event without an anchor; nothing should now reach it.
+            anchor=anchor or default_anchor(resolution),
             conditions=conditions,
             outcome=outcome,
             versus=versus,
@@ -660,6 +663,32 @@ def _number(raw: str, what: str) -> float:
         raise ValueError(
             f"A frequency needs a numeric {what}, and {raw!r} is not one."
         ) from None
+
+
+def default_anchor(resolution: ResolvedEventConcept | None) -> DayAnchor | None:
+    """Where to measure from when the question did not say.
+
+    The start of the event's own day, for anything the sources dated to a day
+    rather than an instant. ``None`` when there is nothing to anchor: a curated
+    family, or a concept whose occurrences all carry a published time, where
+    the instant is a fact rather than a choice.
+
+    This was a question put to the reader, on the reasoning that a silently
+    chosen instant hides a research decision. That held for the disclosure and
+    not for the asking -- when the sources give a day and no time, every
+    instant inside it is invented, and noon chosen by the reader is not better
+    evidence than the start of the day chosen here. The start of the day is the
+    boundary the sources did establish, so it is the only choice that asserts
+    nothing of its own.
+
+    A question that names an instant still wins; see
+    :attr:`PlannedThesis.anchor`.
+    """
+    if resolution is None:
+        return None
+    if not any(event.is_date_only for event in resolution.primary_events):
+        return None
+    return DayAnchor(policy=AnchorPolicy.DAY_START)
 
 
 def plan_thesis(
@@ -891,19 +920,21 @@ a date, so a question about the trend going in is fine either way.
 
 ## Events dated to the day
 
-Some events have a date and no published time: an election day, a ruling \
-with no announced hour. Measuring one needs an instant, and which instant \
-changes the answer -- a 24-hour window from midnight covers the whole \
-trading day after the event, one from the close covers the next day.
+Some events have a date and no published time: an election day, a ruling with \
+no announced hour. Measuring one needs an instant, and when the sources give \
+only a day, every instant inside that day is invented. The engine therefore \
+measures from the **start of the event's day** and says so, which is the one \
+boundary the sources did establish.
 
-Do not choose for the reader. Leave `event_anchor` empty unless the \
-question says where to measure from, and they will be asked. When the \
-question does say, record it: `start of day`, `end of day`, or a local \
-time as HH:MM.
+So leave `event_anchor` empty unless the question actually names an instant. \
+Do not ask about it, and do not put it in `assumptions` -- the specification \
+card states where the window starts, on every run, without being told to.
 
-"after the midterm elections" says nothing about the instant, so leave it \
-empty. "from the close on election day" is `end of day`. "from 22:00 ET" \
-is `22:00`. This field records a decision; it never makes one.
+When the question *does* name one, record it: `start of day`, `end of day`, or \
+a local time as HH:MM. "after the midterm elections" names nothing, so leave \
+it empty. "from the close on election day" is `end of day`. "from 22:00 ET" is \
+`22:00`. A named instant wins over the default; an empty field is not a gap to \
+be filled in later, it is the ordinary case.
 
 ## How long after the event
 

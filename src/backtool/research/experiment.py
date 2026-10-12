@@ -34,7 +34,7 @@ from backtool.data.service import MarketDataService
 from backtool.events import load_events
 from backtool.events.models import MarketEvent
 from backtool.events.releases import SCENARIO_RULES, load_releases
-from backtool.events.resolution import compile_event_set, curated_set_key
+from backtool.events.resolution import AnchorPolicy, compile_event_set, curated_set_key
 from backtool.research.aggregate import (
     MetricReading,
     WindowAggregate,
@@ -62,6 +62,7 @@ from backtool.research.vocabulary import (
     ResultShape,
     interval_for,
     reaction_windows,
+    window_for,
 )
 
 logger = logging.getLogger(__name__)
@@ -745,6 +746,42 @@ def _group_description(
     )
 
 
+def _shorter_than_the_event_day(thesis: Thesis) -> str | None:
+    """Warn when the window ends before the event's own day does.
+
+    A date-only event is measured from the start of its day, which is the only
+    boundary its sources established. That is a fair reading for a window of a
+    day or more. It is not one for a shorter window: "the hour after the
+    inauguration", measured from the start of inauguration day, is midnight to
+    1am -- hours that may be entirely before the event happened.
+
+    Reported rather than corrected. Widening to a full day would answer a
+    question the reader did not ask, and refusing would withhold a figure they
+    can read perfectly well once told what it covers.
+    """
+    if thesis.resolution is None or thesis.anchor is None:
+        return None
+    if thesis.anchor.policy is not AnchorPolicy.DAY_START:
+        return None
+
+    undated = [c.label for c in thesis.resolution.primary_events if c.is_date_only]
+    if not undated:
+        return None
+
+    horizon = thesis.outcome.horizon
+    name = window_for(horizon)
+    window = next((w for w in reaction_windows(horizon) if w.name == name), None)
+    if window is None or window.end_offset >= dt.timedelta(days=1):
+        return None
+
+    return (
+        f"The sources date {'these' if len(undated) > 1 else 'this'} to a day "
+        "and no time, so the window starts at the beginning of that day. A "
+        f"{horizon} window therefore covers the first {horizon} of the day, "
+        "which may be entirely before the event itself."
+    )
+
+
 def _warnings(thesis: Thesis, measured: int, compared: int) -> tuple[str, ...]:
     """What a reader should know before trusting the result.
 
@@ -757,6 +794,10 @@ def _warnings(thesis: Thesis, measured: int, compared: int) -> tuple[str, ...]:
     """
     notes: list[str] = []
     noun = thesis.event_noun
+
+    shorter = _shorter_than_the_event_day(thesis)
+    if shorter is not None:
+        notes.append(shorter)
 
     def counted(n: int) -> str:
         return f"{n} {noun}" if n == 1 else f"{n} {noun}s"

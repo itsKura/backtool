@@ -25,7 +25,7 @@ from typing import Any
 
 import httpx
 import pytest
-from tests.fixtures.dynamic_events import eth_merge, midterms, unresolvable
+from tests.fixtures.dynamic_events import eth_merge, unresolvable
 
 from backtool.ai.client import AIClient
 from backtool.ai.thesis_planner import (
@@ -44,7 +44,6 @@ from backtool.research.thesis import (
 from backtool.web.app import _conversation
 from backtool.web.research_page import (
     RESEARCH_SCRIPT,
-    render_anchor_needed,
     render_clarification,
     render_spec_card,
     render_unresolved_event,
@@ -198,15 +197,6 @@ class TestATurnThatAsksSomethingRemembersAsking:
         turn = remembered(html)[0]
         assert turn["question"] == "which crisis?"
         assert turn["asked"]
-
-    def test_the_anchor_card_records_its_question(self) -> None:
-        """It carries a thesis as well, and still records the exchange: the
-        thesis says what the specification is, and the exchange says what was
-        asked about it. A reader who answers with something unreadable needs
-        the second one."""
-        html = render_anchor_needed(dynamic_thesis(resolution=midterms()), question="q")
-        assert remembered(html)[0]["asked"]
-        assert 'class="thesis"' in html
 
     def test_a_card_with_no_question_is_not_remembered_as_a_blank(self) -> None:
         """A turn that asked nothing and restated nothing spends tokens saying
@@ -432,21 +422,21 @@ class TestTheAnchorQuestionOffersWordsThePlannerReads:
         assert anchor is not None, spoken
         assert anchor.policy is policy
 
-    def test_the_card_offers_them(self) -> None:
-        html = render_anchor_needed(dynamic_thesis(resolution=midterms()))
+    def test_a_clarification_can_still_offer_them(self) -> None:
+        """The card that asked is gone -- a date-only event is measured from
+        the start of its day now -- but the words outlive it. A planner
+        clarification about which instant to use still has to offer spellings
+        it will recognise coming back."""
+        html = render_clarification(
+            asking(
+                {
+                    "question": "Where in the day should the window start?",
+                    "options": [text for text, _policy in ANCHOR_CHOICES],
+                }
+            )
+        )
         for spoken, _policy in ANCHOR_CHOICES:
             assert f'data-choice="{spoken}"' in html
-
-    def test_a_time_can_still_be_typed(self) -> None:
-        html = render_anchor_needed(dynamic_thesis(resolution=midterms()))
-        assert "22:00" in html
-        assert "data-other" in html
-
-    def test_it_still_offers_no_default(self) -> None:
-        """What the card exists to prevent. Offering a choice is not the same
-        as making one, and a pre-selected button would be making one."""
-        html = render_anchor_needed(dynamic_thesis(resolution=midterms()))
-        assert 'aria-pressed="true"' not in html
 
 
 class TestStateCannotEscapeItsBlock:
@@ -547,24 +537,3 @@ class TestTheHalvesFitTogether:
         )
         assert recorder.payload["conversation"][0]["i_asked"]
 
-    def test_the_anchor_answer_carries_both_the_thesis_and_the_question(
-        self, recorder: Recorder
-    ) -> None:
-        """The thesis is what makes answering free -- the resolution is already
-        paid for. The exchange is what makes an unreadable answer recoverable
-        rather than a fresh start."""
-        card = render_anchor_needed(
-            dynamic_thesis(resolution=midterms()), question="midterm elections"
-        )
-        body = card.split('class="thesis">', 1)[1].split("</script>", 1)[0]
-        restored = Thesis.model_validate_json(body.replace(chr(92) + "u003c", "<"))
-        assert restored.resolution is not None
-
-        plan_thesis(
-            "from the close of that day",
-            client=recorder.client,
-            previous=restored,
-            conversation=_conversation(self.exchanges_from(card)),
-        )
-        assert recorder.payload["current_thesis"]
-        assert recorder.payload["conversation"][0]["i_asked"]

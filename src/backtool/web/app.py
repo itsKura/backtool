@@ -70,7 +70,6 @@ from backtool.web.history_panel import HISTORY_SCRIPT, render_history
 from backtool.web.page import render_error, render_page, shell
 from backtool.web.research_page import (
     RESEARCH_SCRIPT,
-    render_anchor_needed,
     render_clarification,
     render_finding,
     render_research_page,
@@ -581,28 +580,22 @@ def _interpret_question(
     except ValueError as exc:
         return render_error(f"That reading does not fit what Backtool measures: {exc}")
 
-    if thesis.needs_an_anchor:
-        # The sources gave days, not instants, and nothing here invents one.
-        # Midnight local is not a neutral reading of "the day of the election":
-        # it puts the whole trading day *after* the event, so a 1h or 24h
-        # window from it answers a different question than one from the close.
-        #
-        # The thesis still travels with the card, so answering the question
-        # costs nothing -- the resolution is already paid for and gets reused.
-        return render_anchor_needed(thesis, question=question)
-
     return render_spec_card(thesis, planned)
 
 
 def _anchor_from(planned: PlannedThesis, previous: Thesis | None) -> DayAnchor | None:
     """The instant the reader chose, from this question or the last one.
 
-    Carried forward because the anchor question is usually answered in a
-    follow-up: the reader is shown the dates, says "from the close", and that
-    second question is planned on its own. Without this the choice would have
-    to be restated every time anything else about the question changed.
+    Carried forward so a choice survives a follow-up: a reader who said "from
+    the close" once should not have to restate it every time anything else
+    about the question changes. The new answer wins when there is one, so they
+    can change their mind.
 
-    The new answer wins when there is one, so a reader can change their mind.
+    ``None`` when neither question named an instant, which is the ordinary
+    case. The default is applied in
+    :func:`~backtool.ai.thesis_planner.default_anchor`, at the single point a
+    thesis is built from a resolution -- not here, so that a reader's silence
+    means the same thing on every path into the engine.
     """
     if planned.anchor is not None:
         return planned.anchor
