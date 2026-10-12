@@ -71,7 +71,7 @@ from backtool.ai.evidence import (
 )
 from backtool.ai.usage import Cost, log_cost
 from backtool.core.time import UTC, LocalTimeError, floor_to_interval, local_to_utc
-from backtool.events.models import SourceAuthority, SourceRef
+from backtool.events.models import SourceAuthority, SourceRef, TemporalPrecision
 from backtool.events.resolution import (
     FINEST_MEASURABLE_SPAN,
     Ambiguity,
@@ -875,6 +875,7 @@ def _build(
     )
 
     candidates = _deduplicate([candidate for candidate, _ in built])
+    candidates, settled, collapsed = _collapse_to_the_day(candidates)
     primary = [candidate for candidate in candidates if candidate.is_primary]
     # Only a disagreement about something being measured can make the concept
     # conflicting. A disputed related milestone is reported, not escalated.
@@ -883,13 +884,16 @@ def _build(
     )
 
     ambiguities = _reader_questions(
-        claim.ambiguities, {candidate.label: candidate for candidate in primary}
+        claim.ambiguities,
+        {candidate.label: candidate for candidate in primary},
+        settled_by_the_day=settled,
     )
     ambiguities.extend(_dispute_questions(disputes))
 
     coverage = _coverage(claim, len(primary), budget)
 
     missing: list[str] = []
+    missing.extend(collapsed)
     # First, because it changes how everything after it should be read. A
     # reader looking at three dated occurrences of something that has happened
     # twenty times needs to know that before they read the median.
@@ -1154,8 +1158,95 @@ def _disputes(
     return found
 
 
+def _collapse_to_the_day(
+    candidates: list[CandidateEvent],
+) -> tuple[list[CandidateEvent], set[str], list[str]]:
+    """Several primary occurrences on one date are one occurrence, dated.
+
+    Sources that disagree about which minute of a day something happened have
+    not established a minute. They have established the day, and reporting
+    their readings as rival occurrences turns that into two anchors a few
+    minutes apart plus a question a reader must settle -- when a window of a
+    day or more measures both identically.
+
+    This is the same rule :func:`_grounded_time` applies to a single
+    occurrence, at the level of the set: a time the evidence does not support
+    is not recorded, and a time the evidence contradicts itself about is not
+    supported. What survives is the date, which every reading agrees on, and
+    the disagreement, which is reported.
+
+    Deliberately narrow. A lone occurrence keeps its published instant, so the
+    Merge is still timed to 06:42. A recurring concept whose occurrences fall
+    on different dates is untouched. Related milestones are untouched, because
+    nothing is anchored to them.
+
+    Returns:
+        The candidates, the labels of the occurrences that were folded away --
+        so a question about them can be released rather than asked -- and a
+        note for the report.
+    """
+    by_date: dict[dt.date, list[CandidateEvent]] = {}
+    for candidate in candidates:
+        if candidate.is_primary:
+            by_date.setdefault(candidate.local_date, []).append(candidate)
+
+    folded: set[str] = set()
+    notes: list[str] = []
+    merged: dict[dt.date, CandidateEvent] = {}
+
+    for date, rival in by_date.items():
+        if len(rival) < 2:
+            continue
+        folded.update(candidate.label for candidate in rival)
+        sources = {
+            source.url: source for candidate in rival for source in candidate.sources
+        }
+        # Labelled by the date rather than by one of the rival readings, which
+        # would silently pick the winner this exists to avoid picking.
+        merged[date] = rival[0].model_copy(
+            update={
+                "label": f"{rival[0].label} ({date.isoformat()})",
+                "local_time": None,
+                "precision": TemporalPrecision.DATE_ONLY,
+                "sources": tuple(sources.values()),
+            }
+        )
+        # Phrased for readings that may carry no instant at all: one of them
+        # having already been demoted by `_grounded_time` is the common case,
+        # and "different instants (A at 11:48, B)" reads as a missing value
+        # rather than as a source that never gave one.
+        notes.append(
+            f"The sources describe this event more than one way on "
+            f"{date.isoformat()} ("
+            + "; ".join(
+                c.label
+                + (f", at {c.local_time.strftime('%H:%M')}" if c.local_time else "")
+                for c in rival
+            )
+            + "). The day is established and a single instant is not, so it is "
+            "measured from the start of that day."
+        )
+
+    if not merged:
+        return candidates, folded, notes
+
+    kept: list[CandidateEvent] = []
+    seen: set[dt.date] = set()
+    for candidate in candidates:
+        if not candidate.is_primary or candidate.local_date not in merged:
+            kept.append(candidate)
+            continue
+        if candidate.local_date not in seen:
+            seen.add(candidate.local_date)
+            kept.append(merged[candidate.local_date])
+    return kept, folded, notes
+
+
 def _reader_questions(
-    raw: list[AmbiguityClaim], measured: dict[str, CandidateEvent]
+    raw: list[AmbiguityClaim],
+    measured: dict[str, CandidateEvent],
+    *,
+    settled_by_the_day: set[str] = frozenset(),  # type: ignore[assignment]
 ) -> list[Ambiguity]:
     """The model's open questions, each weighed against what it would change.
 
@@ -1183,7 +1274,27 @@ def _reader_questions(
         if not question:
             continue
 
-        occurrence = measured.get(item.affects_event.strip())
+        affects = item.affects_event.strip()
+
+        # A question about which instant, where the rival instants were the
+        # same day and have already been folded into it. Answering it cannot
+        # move a window anchored to that day, so it is reported rather than
+        # asked -- which is the whole of why the folding happens.
+        if affects in settled_by_the_day:
+            questions.append(
+                Ambiguity(
+                    question=question,
+                    severity=AmbiguitySeverity.INFORMATIONAL,
+                    why_it_matters=(
+                        "Both readings fall on the same day, and the study is "
+                        "measured from the start of that day, so the answer "
+                        "cannot change what is measured."
+                    ),
+                )
+            )
+            continue
+
+        occurrence = measured.get(affects)
         if occurrence is None and not item.blocks_research:
             questions.append(
                 Ambiguity(

@@ -3435,3 +3435,125 @@ class TestEveryPaidCallInEveryRoundIsPriced:
         with caplog.at_level(logging.INFO, logger="backtool.ai"):
             run_rounds((LATEST_ONLY, ONE_CYCLE), (EARLIER, BOTH_CYCLES))
         assert "4 searches" in caplog.text
+
+
+class TestRivalInstantsOnOneDayResolveToTheDay:
+    """Asked how BTC behaved on Biden's first day, the resolver returned two
+    primary occurrences twelve minutes apart -- the oath finishing at 11:48 ET
+    and the constitutional noon term start -- and a blocking question asking
+    which one the inauguration is.
+
+    A fair question about the constitution and an irrelevant one about the
+    study: both readings are the same calendar day, and the window measured is
+    that day and the days after it. Sources that disagree about the minute have
+    not established a minute; they have established the day.
+    """
+
+    INAUGURATION = search_response(
+        text="Two accounts of when the presidency began.",
+        cited=[
+            ("https://ap.example/oath", "Oath",
+             "Biden finished the oath at 11:48 a.m. on January 20, 2021."),
+            ("https://crs.example/noon", "Noon",
+             "The term began at noon on January 20, 2021."),
+        ],
+    )
+
+    def claim(self, **overrides: Any) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "canonical_name": "Inauguration of Joe Biden",
+            "status": "resolved",
+            "events": [
+                {"label": "Oath of office", "date": "2021-01-20", "time": "11:48",
+                 "timezone": "America/New_York", "evidence_source_ids": ["source_1"],
+                 "role": "primary"},
+                {"label": "Constitutional noon", "date": "2021-01-20", "time": "12:00",
+                 "timezone": "America/New_York", "evidence_source_ids": ["source_2"],
+                 "role": "primary"},
+            ],
+            "sources": [
+                {"source_id": "source_1", "publisher": "AP", "authority": "secondary",
+                 "dates_event": "Oath of office"},
+                {"source_id": "source_2", "publisher": "CRS", "authority": "secondary",
+                 "dates_event": "Constitutional noon"},
+            ],
+            "recurrence": "one-off",
+            "historical_coverage": "complete",
+            "coverage_gap": "",
+            "ambiguities": [{
+                "question": "Which instant should be recorded as the inauguration?",
+                "affects_event": "Oath of office",
+                "blocks_research": True,
+                "candidate_times": ["11:48", "12:00"],
+            }],
+            "missing_information": [],
+            "notes": "Two accounts of the same morning.",
+        }
+        base.update(overrides)
+        return base
+
+    def resolved(self):  # type: ignore[no-untyped-def]
+        concept, _ = resolve(
+            "Inauguration of Joe Biden",
+            research=self.INAUGURATION,
+            extraction=self.claim(),
+        )
+        return concept
+
+    def test_the_two_readings_become_one_occurrence(self) -> None:
+        assert len(self.resolved().primary_events) == 1
+
+    def test_it_keeps_the_date_and_drops_the_instant(self) -> None:
+        """The date every reading agrees on; the minute none of them
+        established."""
+        event = self.resolved().primary_events[0]
+        assert event.local_date == dt.date(2021, 1, 20)
+        assert event.is_date_only
+
+    def test_it_keeps_both_sources(self) -> None:
+        assert len(self.resolved().primary_events[0].sources) == 2
+
+    def test_the_question_is_reported_not_asked(self) -> None:
+        concept = self.resolved()
+        assert not concept.blocking_ambiguities
+        assert concept.informational_ambiguities
+        assert "same day" in concept.informational_ambiguities[0].why_it_matters
+
+    def test_the_concept_now_runs(self) -> None:
+        assert self.resolved().is_runnable
+
+    def test_the_disagreement_still_reaches_the_report(self) -> None:
+        """Folding the readings together must not hide that they differed.
+
+        Only one instant appears: the "noon" reading says the word rather than
+        a time, so `_grounded_time` had already demoted it before this ran.
+        That is the usual shape, which is why the sentence does not promise an
+        instant for every reading."""
+        notes = " ".join(self.resolved().missing_information)
+        assert "more than one way" in notes
+        assert "Oath of office" in notes and "Constitutional noon" in notes
+        assert "11:48" in notes
+
+    def test_a_lone_timed_occurrence_keeps_its_instant(self) -> None:
+        """The Merge is still 06:42. One source is not a disagreement."""
+        concept, _ = resolve("Ethereum Merge", research=MERGE_SEARCH,
+                             extraction=MERGE_CLAIM)
+        event = concept.primary_events[0]
+        assert not event.is_date_only
+        assert event.local_time == dt.time(6, 42)
+
+    def test_occurrences_on_different_days_are_untouched(self) -> None:
+        """A recurring concept is a series, not a disagreement."""
+        concept, _ = resolve(research=MIDTERM_SEARCH, extraction=midterm_claim())
+        assert len(concept.primary_events) == 2
+        assert len({e.local_date for e in concept.primary_events}) == 2
+
+    def test_a_related_milestone_on_the_same_day_is_untouched(self) -> None:
+        """Nothing is anchored to a milestone, so there is nothing to settle."""
+        claim = self.claim()
+        claim["events"][1]["role"] = "related"
+        concept, _ = resolve("Inauguration of Joe Biden",
+                             research=self.INAUGURATION, extraction=claim)
+        assert len(concept.primary_events) == 1
+        assert concept.primary_events[0].local_time == dt.time(11, 48)
+        assert len(concept.related_events) == 1
