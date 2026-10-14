@@ -195,6 +195,113 @@ def chart_window_bands(
         bands.append(band)
     return bands
 
+#: The most candles a chart is sent.
+#:
+#: A chart in this layout is at most about 1600 CSS pixels wide, so past
+#: roughly that many rows there is under a pixel each to draw them in and the
+#: rest are bytes a reader waits for and cannot see. Set above that rather than
+#: at it: this figure decides which rung of :data:`DISPLAY_GRAINS` is used, and
+#: a tighter one would re-grain a whole chart to shed a few dozen candles.
+DISPLAY_BUDGET = 2000
+
+#: The candle sizes a chart may be drawn at, finest first.
+#:
+#: Real timeframes rather than the span divided by the budget. A reader told
+#: the chart is in 12-hour candles can go and check one; "43-minute candles"
+#: is an artefact of arithmetic wearing the shape of a timeframe. It stops at
+#: a day because a day covers the widest question the engine accepts -- two
+#: years, fetched as four years of hours, is 1,460 daily candles -- and because
+#: coarser buckets align to an arbitrary epoch weekday, which would put a
+#: label on the chart that means less than it appears to.
+DISPLAY_GRAINS: tuple[tuple[str, dt.timedelta], ...] = (
+    ("15m", dt.timedelta(minutes=15)),
+    ("30m", dt.timedelta(minutes=30)),
+    ("1h", dt.timedelta(hours=1)),
+    ("2h", dt.timedelta(hours=2)),
+    ("4h", dt.timedelta(hours=4)),
+    ("6h", dt.timedelta(hours=6)),
+    ("12h", dt.timedelta(hours=12)),
+    ("1d", dt.timedelta(days=1)),
+)
+
+
+def display_grain(rows: int, interval: Interval) -> tuple[str, dt.timedelta] | None:
+    """The candle size ``rows`` of ``interval`` should be drawn at.
+
+    ``None`` when they should be drawn as fetched, which is every short
+    question -- a day either side at five minutes is 579 candles and wants no
+    help.
+
+    Only sizes that are whole multiples of the fetched interval are offered, so
+    every drawn candle is made of complete ones. Aggregating 1h rows into 30m
+    buckets cannot be done at all, and aggregating 5m rows into something that
+    does not divide evenly would make the last bucket of each group a different
+    length from its neighbours while looking identical.
+    """
+    if rows <= DISPLAY_BUDGET:
+        return None
+    source = interval.duration
+    usable = [
+        (label, size)
+        for label, size in DISPLAY_GRAINS
+        if size > source and size % source == dt.timedelta(0)
+    ]
+    if not usable:
+        return None
+    for label, size in usable:
+        if rows * source <= DISPLAY_BUDGET * size:
+            return label, size
+    # Past the coarsest rung. Unreachable for any window the engine accepts,
+    # and drawing the chart in day candles beats inventing a size to fit.
+    return usable[-1]
+
+
+def thin_for_display(
+    candles: pd.DataFrame | None, interval: Interval
+) -> tuple[pd.DataFrame | None, str | None]:
+    """A frame reduced to what a chart can draw, and the size it is drawn at.
+
+    **Aggregated, never sampled.** Keeping every n-th row would discard the
+    highs and lows between the ones kept, and the chart's visible extremes
+    would then disagree with the high and low printed on the shaded box --
+    which is the disagreement :func:`chart_window_bands` exists to rule out.
+    Bucketing takes the max of the highs and the min of the lows, so every
+    extreme in the fetched data still appears in some drawn candle.
+
+    The statistics are untouched by this. Bands are priced by
+    :func:`compute_window_metrics` from the frame as fetched, before anything
+    here runs, so what changes is the picture's resolution and never a number.
+
+    Buckets are floored to the epoch, so a drawn candle covers a span a reader
+    could look up elsewhere rather than one that depends on where the window
+    happened to start. Empty buckets are not created: a gap in the cache stays
+    a gap instead of becoming a row with no prices in it.
+
+    Returns:
+        The frame to draw and the label it is drawn at, or the frame unchanged
+        and ``None`` when it was already small enough.
+    """
+    if candles is None or candles.empty:
+        return candles, None
+    grain = display_grain(len(candles), interval)
+    if grain is None:
+        return candles, None
+    label, size = grain
+
+    buckets = candles["open_time"].dt.floor(size)
+    drawn = (
+        candles.groupby(buckets, sort=True)
+        .agg(
+            open=("open", "first"),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", "last"),
+        )
+        .reset_index()
+    )
+    return drawn, label
+
+
 #: Display names for the symbols offered. The exchange symbol stays visible in
 #: technical contexts -- the methodology block, the section subtitle -- because
 #: there it is the precise thing being described. On a selector it is noise.
@@ -342,7 +449,11 @@ def render_price_chart(event: MarketEvent, symbol: str, *, available: bool) -> s
         "<h2>Price around the release</h2>"
         f'<p class="section-sub"><span class="mono">{escape(symbol)}</span> '
         f"&middot; {hours}h either side &middot; shaded bands are the windows "
-        "the statistics below are measured over</p>"
+        "the statistics below are measured over"
+        # Empty unless the chart reports drawing something coarser than it
+        # measured, which a fixed day at five minutes never does. Here so the
+        # two pages share the mechanism as well as the chart itself.
+        '<span id="price-chart-grain"></span></p>'
         "</div>"
         '<div class="panel-card chart-card">'
         '<div class="chart-toolbar">'
@@ -698,6 +809,15 @@ window.backtoolCandleChart = function (options) {
 
       eventTime = data.event_time;
       allCandles = data.candles;
+
+      // Only when it is news. A span this wide cannot be drawn at the
+      // interval it was measured at, and a reader counting hours off daily
+      // candles would be reading the chart wrong with nothing on the page to
+      // say so. On a short question the two are equal and this stays empty.
+      if (options.grain && data.drawn_interval
+          && data.drawn_interval !== data.interval) {
+        options.grain.textContent = data.drawn_interval + ' candles';
+      }
       // Widest first, so a nested shorter window paints on top of the one that
       // contains it and reads as the stronger of the two.
       allBands = (data.windows || []).slice().sort(
@@ -933,6 +1053,7 @@ def price_chart_script(event_id: str, symbol: str) -> str:
     canvas: document.getElementById('price-chart'),
     status: document.getElementById('price-chart-status'),
     bands: document.getElementById('price-bands'),
+    grain: document.getElementById('price-chart-grain'),
     toolbar: document.querySelector('.chart-range'),
     zoom: {CHART_ZOOMS[0]},
     marker: 'release',
@@ -1078,6 +1199,14 @@ EVENT_STYLE = """
 .chart-view[hidden] { display: none; }
 .chart-note { color: var(--text-muted); font-size: 12px; margin: 4px 0 0;
               max-width: 70ch; }
+
+/* The candle size the chart settled on. Written by the chart, and only when it
+   differs from the interval measured. The separator hangs off the slot rather
+   than sitting in the markup before it, so an empty slot leaves no dangling
+   middot -- which is the whole reason this is a rule and not a plain span. */
+.chart-grain:not(:empty)::before,
+#price-chart-grain:not(:empty)::before { content: "\\00B7"; margin: 0 4px; }
+.chart-grain, #price-chart-grain { color: var(--text-muted); }
 
 .disclosure { border: 1px solid var(--grid); border-radius: 10px;
               margin: 14px 0; background: var(--surface-1); }

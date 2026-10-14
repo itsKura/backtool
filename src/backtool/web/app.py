@@ -65,6 +65,7 @@ from backtool.web.event_page import (
     render_upcoming_notice,
     scenarios_load_script,
     setups_load_script,
+    thin_for_display,
 )
 from backtool.web.history_panel import HISTORY_SCRIPT, render_history
 from backtool.web.page import render_error, render_page, shell
@@ -301,7 +302,7 @@ async def event_candles(
         }
 
     try:
-        candles, bands = await asyncio.to_thread(
+        candles, bands, grain = await asyncio.to_thread(
             _event_candles, event=event, symbol=chosen, interval=interval
         )
     except Exception as exc:  # noqa: BLE001 - the chart shows the reason
@@ -311,6 +312,11 @@ async def event_candles(
     return {
         "symbol": chosen,
         "interval": interval,
+        # What the candles on screen actually are, which is the fetched
+        # interval until a span is too wide to draw at it. Reported rather
+        # than inferred: a reader counting hours off a chart of daily candles
+        # would be reading it wrong with nothing on the page to say so.
+        "drawn_interval": grain or interval,
         "event_time": int(event.timestamp_utc.timestamp()),
         "candles": candles,
         # Derived from the same windows the statistics are measured over, and
@@ -323,7 +329,7 @@ async def event_candles(
 
 def _event_candles(
     *, event: MarketEvent, symbol: str, interval: str
-) -> tuple[list[dict[str, float | int]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, float | int]], list[dict[str, Any]], str | None]:
     """Fetch and shape the candles surrounding an event, plus the window boxes.
 
     Both come from one fetch. Pricing the bands from a second, separately
@@ -342,8 +348,10 @@ def _event_candles(
     with MarketDataService.from_settings(Settings.from_env()) as service:
         frame = service.get_candles(symbol, resolved, start, end)
 
+    # Priced from the frame as fetched, before it is thinned for drawing.
     bands = chart_window_bands(event.timestamp_utc, frame, resolved)
-    return _shaped_candles(frame), bands
+    drawn, grain = thin_for_display(frame, resolved)
+    return _shaped_candles(drawn), bands, grain
 
 
 @app.get("/api/event/{event_id}/setups", response_class=HTMLResponse)
@@ -750,6 +758,9 @@ def _thesis_candles(
     with MarketDataService.from_settings(Settings.from_env()) as service:
         frame = service.get_candles(thesis.asset, resolved, start, end)
 
+    # Priced from the frame as fetched. A two-year window is drawn in daily
+    # candles, and a high taken off those would be the high of whichever day
+    # straddled the boundary rather than the high of the window.
     bands = (
         chart_window_bands(
             chosen.timestamp_utc, frame, resolved, windows=(window,), span=span
@@ -757,14 +768,16 @@ def _thesis_candles(
         if window is not None
         else []
     )
+    drawn, grain = thin_for_display(frame, resolved)
 
     return {
         "symbol": thesis.asset,
         "interval": resolved.value,
+        "drawn_interval": grain or resolved.value,
         "event_id": chosen.event_id,
         "event_label": chosen.notes or chosen.event_id,
         "event_time": int(chosen.timestamp_utc.timestamp()),
-        "candles": _shaped_candles(frame),
+        "candles": _shaped_candles(drawn),
         "windows": bands,
     }
 

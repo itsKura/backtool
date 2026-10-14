@@ -497,6 +497,11 @@ def _price_zone(finding: ResearchFinding) -> str:
         # candle rather than the last candle.
         f'<span class="chart-span">{escape(reach)} either side</span>'
         + (f" &middot; shaded: {escape(window)}" if window else "")
+        # Filled by the chart once it has the data, and only when the candles
+        # on screen are coarser than the ones measured. Rendered empty rather
+        # than omitted, so the chart has somewhere to write without building
+        # the separator itself -- that is CSS on :not(:empty).
+        + '<span class="chart-grain"></span>'
         + "</p>"
         '<div class="chart-toolbar">'
         f"{picker}"
@@ -1088,6 +1093,7 @@ _RESEARCH_SCRIPT_TEMPLATE = """
         canvas: block.querySelector('.chart-canvas'),
         status: block.querySelector('.chart-status'),
         bands: block.querySelector('.chart-bands'),
+        grain: block.querySelector('.chart-grain'),
         toolbar: block.querySelector('.chart-range'),
         // The opening rung is the card's own widest, not a constant: the
         // ladder depends on the window being shaded.

@@ -33,8 +33,12 @@ from backtool.web.app import _measured_window, app
 from backtool.web.event_page import (
     CANDLE_CHART_JS,
     CHART_SPAN,
+    DISPLAY_BUDGET,
     EVENT_STYLE,
+    chart_span_for,
     chart_window_bands,
+    display_grain,
+    thin_for_display,
 )
 from backtool.web.research_page import RESEARCH_SCRIPT, render_finding
 
@@ -434,6 +438,227 @@ class TestTheChartAndTheStatisticsAreOneThing:
             update={"outcome": Outcome.model_construct(horizon="nonsense")}
         )
         assert _measured_window(unmeasurable) is None
+
+
+class TestALongChartIsDrawnInCandlesAChartCanDraw:
+    """Two years of hourly candles is 35,042 rows and 2.9 MiB of JSON, sent to
+    a canvas about 1,600 pixels wide -- some 39 candles per pixel. The reader
+    waits for data that cannot be drawn, and the browser scans all of it for
+    every band edge.
+
+    The reduction has to be an aggregation. Keeping every n-th row would throw
+    away the extremes in between: over two years of real candles, sampling
+    loses the high by about $900, so the chart's tallest wick would sit below
+    the high printed on the shaded box beside it. Bucketing keeps the max and
+    the min, which is what a daily candle already is.
+    """
+
+    def frame(self, hours: int) -> Any:
+        """A frame with a spike in a known place, so losing it is detectable."""
+        import pandas as pd
+
+        start = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+        frame = pd.DataFrame(
+            {
+                "open_time": [start + dt.timedelta(hours=i) for i in range(hours)],
+                "open": [100.0 + i for i in range(hours)],
+                "high": [101.0 + i for i in range(hours)],
+                "low": [99.0 + i for i in range(hours)],
+                "close": [100.5 + i for i in range(hours)],
+            }
+        )
+        # One hour wide, and on a prime-numbered row so that no plausible
+        # sampling stride lands on it by luck.
+        if hours > 1459:
+            frame.loc[1459, "high"] = 999_999.0
+            frame.loc[1459, "low"] = -999.0
+        return frame
+
+    def test_a_short_chart_is_left_alone(self) -> None:
+        """Most questions. A day either side at five minutes is 579 candles and
+        wants no help; re-graining it would cost resolution for nothing."""
+        frame = self.frame(500)
+        drawn, grain = thin_for_display(frame, Interval.H1)
+        assert grain is None
+        assert drawn is frame
+
+    def test_a_long_chart_is_aggregated(self) -> None:
+        drawn, grain = thin_for_display(self.frame(17_523), Interval.H1)
+        assert grain == "12h"
+        assert len(drawn) <= DISPLAY_BUDGET
+        assert list(drawn.columns) == ["open_time", "open", "high", "low", "close"]
+
+    def test_no_extreme_is_lost(self) -> None:
+        """The property that makes this safe rather than merely smaller."""
+        frame = self.frame(17_523)
+        drawn, _grain = thin_for_display(frame, Interval.H1)
+        assert drawn["high"].max() == frame["high"].max() == 999_999.0
+        assert drawn["low"].min() == frame["low"].min() == -999.0
+
+    def test_sampling_would_have_lost_it(self) -> None:
+        """Not a test of our code -- a test that the one above is worth having.
+        If a stride kept the extremes too, aggregating would be needless
+        complexity."""
+        frame = self.frame(17_523)
+        sampled = frame.iloc[::12]
+        assert sampled["high"].max() < frame["high"].max()
+        assert sampled["low"].min() > frame["low"].min()
+
+    def test_the_ends_of_the_series_survive(self) -> None:
+        frame = self.frame(17_523)
+        drawn, _grain = thin_for_display(frame, Interval.H1)
+        assert drawn["open"].iloc[0] == frame["open"].iloc[0]
+        assert drawn["close"].iloc[-1] == frame["close"].iloc[-1]
+
+    def test_every_drawn_candle_is_a_candle(self) -> None:
+        drawn, _grain = thin_for_display(self.frame(17_523), Interval.H1)
+        assert (drawn["high"] >= drawn["low"]).all()
+        assert drawn["open_time"].is_monotonic_increasing
+
+    @pytest.mark.parametrize(
+        ("interval", "forbidden"),
+        [(Interval.H1, {"15m", "30m"}), (Interval.M15, {"5m"})],
+    )
+    def test_a_grain_is_always_whole_source_candles(
+        self, interval: Interval, forbidden: set[str]
+    ) -> None:
+        """A bucket that does not divide evenly would make one candle per group
+        a different length from its neighbours while looking identical, and a
+        bucket finer than the source cannot be built at all."""
+        for rows in (3_000, 17_523, 40_000):
+            grain = display_grain(rows, interval)
+            assert grain is not None
+            assert grain[0] not in forbidden
+            assert grain[1] % interval.duration == dt.timedelta(0)
+            assert grain[1] > interval.duration
+
+    def test_the_coarsest_grain_covers_the_widest_question(self) -> None:
+        """Two years, fetched as four years of hours, is the most the engine
+        accepts. If that needed something past the ladder, the label on the
+        chart would stop matching the candles under it."""
+        four_years = int(dt.timedelta(days=1461).total_seconds() // 3600)
+        grain = display_grain(four_years, Interval.H1)
+        assert grain is not None
+        assert grain[0] == "1d"
+
+    def test_an_empty_frame_is_not_an_error(self) -> None:
+        import pandas as pd
+
+        empty = pd.DataFrame(
+            {c: [] for c in ("open_time", "open", "high", "low", "close")}
+        )
+        drawn, grain = thin_for_display(empty, Interval.H1)
+        assert grain is None
+        assert drawn is empty
+        assert thin_for_display(None, Interval.H1) == (None, None)
+
+
+class TestTheDrawnCandleSizeIsReported:
+    """A reader counting hours off a chart of daily candles is reading it
+    wrong, and nothing on the page would say so. So the size the candles are
+    drawn at crosses the wire with them.
+    """
+
+    def body(self, thesis: Thesis, **extra: Any) -> dict[str, Any]:
+        return {"thesis": thesis.model_dump_json(), **extra}
+
+    def test_a_short_question_reports_the_interval_it_measured(
+        self, client: TestClient
+    ) -> None:
+        data = client.post(
+            "/api/research/chart",
+            json=self.body(cpi_thesis("24h"), event_id="CPI-2024-07-11"),
+        ).json()
+        assert data["interval"] == "5m"
+        assert data["drawn_interval"] == "5m"
+
+    def test_a_two_year_question_says_it_is_drawing_days(
+        self, client: TestClient
+    ) -> None:
+        data = client.post(
+            "/api/research/chart",
+            json=self.body(cpi_thesis("2y"), event_id="CPI-2024-07-11"),
+        ).json()
+        assert data["interval"] == "1h"
+        assert data["drawn_interval"] == "1d"
+        assert len(data["candles"]) <= DISPLAY_BUDGET
+
+    def test_the_figures_on_the_band_do_not_move_when_the_picture_coarsens(
+        self, client: TestClient
+    ) -> None:
+        """The whole point. Bands are priced from the frame as fetched, so a
+        two-year chart drawn in daily candles still reports the high of the
+        window rather than the high of whichever day straddled its edge."""
+        from backtool.config import Settings
+        from backtool.data.service import MarketDataService
+        from backtool.research.metrics import compute_window_metrics
+
+        thesis = cpi_thesis("2y")
+        data = client.post(
+            "/api/research/chart",
+            json=self.body(thesis, event_id="CPI-2024-07-11"),
+        ).json()
+        assert data["drawn_interval"] != data["interval"]
+
+        window = _measured_window(thesis)
+        assert window is not None
+        event = dt.datetime.fromtimestamp(data["event_time"], tz=dt.UTC)
+        span = chart_span_for(window)
+        with MarketDataService.from_settings(Settings.from_env()) as service:
+            frame = service.get_candles(
+                thesis.asset, Interval.H1, event - span, event + span
+            )
+        metrics = compute_window_metrics(frame, window.resolve(event), Interval.H1)
+
+        band = data["windows"][0]
+        assert band["high"] == metrics.high
+        assert band["low"] == metrics.low
+
+
+class TestTheCaptionSaysWhatTheCandlesAre:
+    """The card renders somewhere to write and the shared script writes there.
+
+    Two halves that have to meet, because a chart on this page is data on a
+    card plus behaviour in one script: a slot nothing fills and a script with
+    nowhere to write both look fine on their own.
+    """
+
+    def test_the_card_renders_an_empty_slot(self) -> None:
+        """Empty, not absent. The chart cannot know the size until the candles
+        arrive, and a slot built in JavaScript would have to build the
+        separator too."""
+        html = chart_block(render_finding(finding_for(cpi_thesis("2y"))))
+        assert '<span class="chart-grain"></span>' in html
+
+    def test_the_script_is_given_the_slot(self) -> None:
+        assert "grain: block.querySelector('.chart-grain')" in RESEARCH_SCRIPT
+
+    def test_the_chart_writes_the_size_it_drew(self) -> None:
+        assert "data.drawn_interval + ' candles'" in CANDLE_CHART_JS
+
+    def test_it_only_writes_when_that_is_news(self) -> None:
+        """A caption reading "5m candles" over a chart of 5m candles is noise
+        standing where news should be, and every short question is that case."""
+        assert "data.drawn_interval !== data.interval" in CANDLE_CHART_JS
+
+    def test_a_missing_slot_is_not_a_crash(self) -> None:
+        """The event page's chart is a fixed day at five minutes and never
+        thinned, so its slot stays empty -- and any other caller may not have
+        one at all."""
+        assert "options.grain &&" in CANDLE_CHART_JS
+
+    def test_the_separator_only_shows_on_a_filled_slot(self) -> None:
+        """Otherwise every short chart carries a trailing middot pointing at
+        nothing, which is the reason this is a CSS rule rather than markup."""
+        assert ".chart-grain:not(:empty)::before" in EVENT_STYLE
+
+    def test_the_note_survives_a_zoom(self) -> None:
+        """The zoom handler rewrites .chart-span on every change. If the size
+        shared that element it would vanish the first time anybody touched the
+        view -- which is why it has its own."""
+        assert ".chart-span" in RESEARCH_SCRIPT
+        assert "span.textContent = picked.dataset.label" in RESEARCH_SCRIPT
+        assert "grain.textContent" not in RESEARCH_SCRIPT
 
 
 def test_the_shaded_zone_is_json_the_browser_can_read(client: TestClient) -> None:
