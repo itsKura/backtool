@@ -22,6 +22,7 @@ from backtool.research.cohort import Cohort
 from backtool.research.regime import DIMENSION_LABELS, MarketSetup
 from backtool.research.setups import SetupMatch
 from backtool.research.windows import WindowSpec, compact_duration
+from backtool.web.timefmt import local_stamp
 
 
 def render_cohort_table(cohort: Cohort, windows: tuple[WindowSpec, ...]) -> str:
@@ -144,7 +145,8 @@ def render_setup(setup: MarketSetup, *, title: str, note: str = "") -> str:
     """
     items = setup.describe_items()
     stamp = (
-        f'<span class="setup-stamp">as of {setup.as_of:%d %b %Y, %H:%M} UTC</span>'
+        '<span class="setup-stamp">as of '
+        f"{local_stamp(setup.as_of, with_date=True)}</span>"
     )
 
     if not items:

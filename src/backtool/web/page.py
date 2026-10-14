@@ -20,6 +20,7 @@ from backtool.web.cohort_view import COHORT_STYLE
 from backtool.web.event_page import EVENT_STYLE
 from backtool.web.prepare_page import PREPARE_STYLE
 from backtool.web.research_page import RESEARCH_STYLE
+from backtool.web.timefmt import LOCAL_TIME_SCRIPT
 
 _PAGE_STYLE = """
 .masthead { margin-bottom: 8px; }
@@ -181,6 +182,7 @@ def shell(
   </nav>
   {body}
 </div>
+<script>{LOCAL_TIME_SCRIPT}</script>
 {f"<script>{script}</script>" if script else ""}
 </body>
 </html>

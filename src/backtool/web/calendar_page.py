@@ -14,10 +14,16 @@ from backtool.core.time import NEW_YORK, utc_to_local
 from backtool.core.types import EventType
 from backtool.events.meta import meta_for
 from backtool.events.models import MarketEvent
+from backtool.web.timefmt import local_stamp
 
 #: How many past events to list. Enough to show recent context without turning
 #: the page into an archive.
 PAST_LIMIT = 8
+
+#: Between two clocks shown on one line. Carried inside the second one, so a
+#: stamp the browser drops as redundant takes its separator with it rather than
+#: leaving one pointing at nothing.
+SEPARATOR = " · "
 
 
 def render_calendar(
@@ -58,6 +64,13 @@ def _event_card(event: MarketEvent, now: dt.datetime) -> str:
     delta = event.timestamp_utc - now
     upcoming = delta.total_seconds() > 0
 
+    # The same instant on the reader's own clock. The browser drops it for
+    # anyone already in the release's timezone, where it would otherwise print
+    # the same time twice.
+    in_your_time = local_stamp(
+        event.timestamp_utc, lead=SEPARATOR, instead_of=f"{local:%H:%M}"
+    )
+
     # A container rather than one big link, because the card now carries a
     # second destination. The main link still covers the whole card -- through
     # a stretched ::after in the stylesheet -- so the target is unchanged for
@@ -67,8 +80,7 @@ def _event_card(event: MarketEvent, now: dt.datetime) -> str:
         f'<a class="event-open" href="/event/{escape(event.event_id)}">'
         f'<span class="event-when">'
         f'<span class="event-date">{local:%a %d %b %Y}</span>'
-        f'<span class="event-time">{local:%H:%M} ET &middot; '
-        f"{event.timestamp_utc:%H:%M} UTC</span>"
+        f'<span class="event-time">{local:%H:%M} ET{in_your_time}</span>'
         f"</span>"
         f'<span class="event-body">'
         f'<span class="event-title">{escape(meta.label)}</span>'

@@ -66,8 +66,9 @@ from backtool.research.results import EventResult, StudyResult
 from backtool.research.runner import run_study
 from backtool.research.spec import ResearchSpec
 from backtool.research.windows import REACTION_WINDOWS
-from backtool.web.calendar_page import format_delta
+from backtool.web.calendar_page import SEPARATOR, format_delta
 from backtool.web.cohort_view import render_cohort_table, render_sample_badge
+from backtool.web.timefmt import local_stamp
 
 #: How many past releases the page considers. The whole supplied dataset fits
 #: well inside this; releases without candles are reported, never dropped.
@@ -388,12 +389,19 @@ def _header(prep: Preparation) -> str:
             f'<strong>{escape(SCENARIO_LABELS.get(key, key))}</strong>{gap}.</p>'
         )
 
+    # The release instant on the reader's own clock. Dropped by the browser for
+    # anyone already in the release's timezone, where it would print the same
+    # time twice -- which on a US release page is a good share of readers.
+    in_your_time = local_stamp(
+        prep.event.timestamp_utc, lead=SEPARATOR, instead_of=f"{local:%H:%M}"
+    )
+
     return (
         '<section class="prep-header">'
         '<p class="prep-kicker">Event preparation</p>'
         f"<h1>{escape(meta.label)}</h1>"
         f'<p class="prep-when">{local:%A %d %B %Y} &middot; '
-        f"{local:%H:%M} ET &middot; {prep.event.timestamp_utc:%H:%M} UTC"
+        f"{local:%H:%M} ET{in_your_time}"
         f"{state}{countdown}</p>"
         f'<p class="prep-sub">{escape(meta.summary)}</p>'
         f'<div class="prep-figures">{figures}</div>'
@@ -755,7 +763,8 @@ def _context_section(prep: Preparation) -> str:
     price = (
         '<div class="prep-figure"><span class="prep-figure-label">Price</span>'
         f'<span class="prep-figure-value mono">{context.price:,.2f}</span>'
-        f'<span class="prep-figure-note">as of {context.as_of:%H:%M} UTC</span>'
+        '<span class="prep-figure-note">as of '
+        f"{local_stamp(context.as_of)}</span>"
         "</div>"
     )
 
