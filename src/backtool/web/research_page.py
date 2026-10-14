@@ -114,8 +114,22 @@ def _choices(question: str, options: Sequence[str]) -> str:
     )
 
 
-def render_research_page() -> str:
-    """The empty workspace."""
+#: The longest question a link may drop into the box.
+#:
+#: Not a security boundary -- the value is escaped into a textarea either way.
+#: It stops a hand-edited URL from pasting a novel into the workspace, which
+#: would push the thread off the first screen before anything had been asked.
+MAX_PREFILL_CHARS = 500
+
+
+def render_research_page(prefill: str = "") -> str:
+    """The workspace, optionally arriving with a question already typed.
+
+    The preparation page hands questions over this way. It fills the box and
+    stops there rather than asking on the reader's behalf: the research path
+    costs money, and a link that spent it on being clicked would make the free
+    page in front of it feel expensive.
+    """
     examples = "".join(
         f'<button type="button" class="example" data-q="{escape(q)}">'
         f"{escape(q)}</button>"
@@ -132,7 +146,7 @@ def render_research_page() -> str:
         '<form id="research-form" class="research-form">'
         '<textarea id="question" name="question" rows="2" '
         'placeholder="Does BTC perform better after cooler-than-expected CPI?"'
-        "></textarea>"
+        f">{escape(prefill[:MAX_PREFILL_CHARS])}</textarea>"
         '<button type="submit" class="btn" id="ask">Interpret</button>'
         "</form>"
         f'<div class="examples">{examples}</div>'

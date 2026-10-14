@@ -69,6 +69,7 @@ from backtool.web.event_page import (
 )
 from backtool.web.history_panel import HISTORY_SCRIPT, render_history
 from backtool.web.page import render_error, render_page, shell
+from backtool.web.prepare_page import build_preparation, render_preparation
 from backtool.web.research_page import (
     RESEARCH_SCRIPT,
     render_clarification,
@@ -221,6 +222,45 @@ async def event_detail(event_id: str, symbol: str = "BTCUSDT") -> HTMLResponse:
             script=script,
             # The chart library is only loaded on pages that actually chart.
             head_scripts=() if upcoming else (LIGHTWEIGHT_CHARTS_CDN,),
+        )
+    )
+
+
+@app.get("/event/{event_id}/prepare", response_class=HTMLResponse)
+async def event_prepare(event_id: str, symbol: str = "BTCUSDT") -> HTMLResponse:
+    """Everything a reader needs before one CPI release.
+
+    Rendered in full rather than filled in asynchronously, the way the event
+    page is. The difference is what the work is: the event page loads three
+    independent panels that each need their own fetch, where this is a single
+    study viewed five ways, and splitting one study across four requests would
+    run it four times to make the first paint arrive sooner.
+
+    Costs nothing to open. CPI is a curated calendar with a hand-verified
+    values file, so no planner, resolver or interpreter is involved.
+    """
+    event = _find_event(event_id)
+    if event.curated_type is not EventType.CPI:
+        # Deliberately narrow. The page reads a CPI values file and a CPI
+        # scenario rule, and rendering it for an event type that has neither
+        # would produce a convincing-looking page with nothing behind it.
+        raise HTTPException(
+            status_code=404,
+            detail="Event preparation is available for CPI releases.",
+        )
+
+    chosen = symbol.upper() if symbol.upper() in SYMBOLS else SYMBOLS[0]
+    now = dt.datetime.now(tz=UTC)
+    prep = await asyncio.to_thread(
+        build_preparation, event, symbol=chosen, now=now
+    )
+
+    body = render_preparation(prep, SYMBOLS)
+    return HTMLResponse(
+        shell(
+            f"backtool - {event.event_id} preparation",
+            body,
+            active="calendar",
         )
     )
 
@@ -483,16 +523,20 @@ def _event_history(*, event: MarketEvent, symbol: str, interval: str) -> str:
 
 
 @app.get("/research", response_class=HTMLResponse)
-async def research() -> HTMLResponse:
+async def research(q: str = "") -> HTMLResponse:
     """The conversational research workspace.
 
     The emerging primary surface. The calendar and event pages remain as
     discovery and deep-dive tools; this is where a question gets asked.
+
+    ``q`` arrives from a preparation page handing a question over. It fills the
+    box and nothing more -- the reader still presses the button, so following
+    a suggestion costs nothing until they decide it is worth it.
     """
     return HTMLResponse(
         shell(
             "backtool - research",
-            render_research_page(),
+            render_research_page(q),
             active="research",
             # The chart body first, then the page script that mounts it on
             # whatever answers the thread gains.

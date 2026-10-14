@@ -11,6 +11,7 @@ import datetime as dt
 from xml.sax.saxutils import escape
 
 from backtool.core.time import NEW_YORK, utc_to_local
+from backtool.core.types import EventType
 from backtool.events.meta import meta_for
 from backtool.events.models import MarketEvent
 
@@ -57,8 +58,13 @@ def _event_card(event: MarketEvent, now: dt.datetime) -> str:
     delta = event.timestamp_utc - now
     upcoming = delta.total_seconds() > 0
 
+    # A container rather than one big link, because the card now carries a
+    # second destination. The main link still covers the whole card -- through
+    # a stretched ::after in the stylesheet -- so the target is unchanged for
+    # anyone who just clicks it; Prepare sits above that layer.
     return (
-        f'<a class="event-card" href="/event/{escape(event.event_id)}">'
+        f'<div class="event-card">'
+        f'<a class="event-open" href="/event/{escape(event.event_id)}">'
         f'<span class="event-when">'
         f'<span class="event-date">{local:%a %d %b %Y}</span>'
         f'<span class="event-time">{local:%H:%M} ET &middot; '
@@ -69,12 +75,29 @@ def _event_card(event: MarketEvent, now: dt.datetime) -> str:
         f'<span class="event-sub">{escape(meta.source)}'
         f"{_note_suffix(event)}</span>"
         f"</span>"
+        f"</a>"
         f'<span class="event-meta">'
+        f"{_prepare_link(event)}"
         f'<span class="badge badge-{escape(meta.importance.value)}">'
         f"{escape(meta.importance.value)}</span>"
         f'<span class="event-countdown">{escape(format_delta(delta, upcoming))}</span>'
         f"</span>"
-        f"</a>"
+        f"</div>"
+    )
+
+
+def _prepare_link(event: MarketEvent) -> str:
+    """The action on a release that has a preparation page.
+
+    Only CPI has one: the page reads a CPI values file and a CPI scenario
+    rule, and offering the button on an event type with neither would promise
+    something the route correctly refuses.
+    """
+    if event.curated_type is not EventType.CPI:
+        return ""
+    return (
+        f'<a class="prep-prepare" href="/event/{escape(event.event_id)}/prepare">'
+        "Prepare</a>"
     )
 
 
@@ -113,12 +136,24 @@ def format_delta(delta: dt.timedelta, upcoming: bool) -> str:
 
 CALENDAR_STYLE = """
 .event-card {
-  display: grid; grid-template-columns: 190px 1fr auto; gap: 18px;
-  align-items: center; text-decoration: none; color: inherit;
+  display: grid; grid-template-columns: 1fr auto; gap: 18px;
+  align-items: center; color: inherit; position: relative;
   background: var(--surface-1); border: 1px solid var(--grid);
   border-radius: 10px; padding: 14px 18px; margin-bottom: 8px;
 }
 .event-card:hover { border-color: var(--accent); background: var(--surface-2); }
+/* The card's own grid, kept on the link so the date and title stay in the
+   columns they were in before the card gained a second destination. */
+.event-open {
+  display: grid; grid-template-columns: 190px 1fr; gap: 18px;
+  align-items: center; text-decoration: none; color: inherit; min-width: 0;
+}
+/* Covers the whole card, so clicking anywhere still opens the event. A nested
+   link would have been invalid; this is the same affordance without one. */
+.event-open::after { content: ""; position: absolute; inset: 0;
+                     border-radius: 10px; }
+/* Above the stretched layer, or Prepare would be unclickable. */
+.event-meta { position: relative; z-index: 1; }
 .event-when { display: flex; flex-direction: column; }
 .event-date { font-weight: 600; font-size: 14px; }
 .event-time { color: var(--text-muted); font-size: 12px;
@@ -138,7 +173,8 @@ CALENDAR_STYLE = """
 :root[data-theme="light"] .badge-medium { background: #fdf0d8; color: #8a5d00; }
 :root[data-theme="light"] .badge-low { background: #e6edf6; color: #2a5490; }
 @media (max-width: 640px) {
-  .event-card { grid-template-columns: 1fr; gap: 6px; }
-  .event-meta { justify-content: flex-start; }
+  .event-card { grid-template-columns: 1fr; gap: 10px; }
+  .event-open { grid-template-columns: 1fr; gap: 6px; }
+  .event-meta { justify-content: flex-start; flex-wrap: wrap; gap: 10px; }
 }
 """
