@@ -310,14 +310,50 @@ class TestTheCandleEndpoint:
     ) -> None:
         """A high is a statistic with a rule about which candles fall inside
         the window. Recomputing it in the browser would put a second
-        definition of it in the codebase."""
+        definition of it in the codebase.
+
+        Pinned to a release a day of data has long since closed over. Asking
+        for the most recent one made this fail on release days: a 24-hour
+        window from a release two hours old ends tomorrow, and refusing to
+        price it is the engine being right. That case is the next test.
+        """
         data = client.post(
-            "/api/research/chart", json=self.body(cpi_thesis("24h"))
+            "/api/research/chart",
+            json=self.body(cpi_thesis("24h"), event_id="CPI-2024-07-11"),
         ).json()
         band = data["windows"][0]
         assert band["high"] is not None
         assert band["low"] is not None
         assert band["high"] >= band["low"]
+
+    def test_a_window_the_data_does_not_reach_is_left_unpriced(
+        self, client: TestClient
+    ) -> None:
+        """The box is still drawn; the figures are withheld.
+
+        The span is a fact about the question, so it is shaded whether or not
+        the days it covers have happened. The high is a fact about the data,
+        and a high taken over the few hours that have closed so far is not the
+        high of a 24-hour window -- it is a shorter window wearing a longer
+        one's caption.
+
+        Stated as the rule rather than as a date, because the thing being
+        tested only occurs on release days and a test that cannot run today
+        is not a test of today's behaviour.
+        """
+        data = client.post(
+            "/api/research/chart", json=self.body(cpi_thesis("24h"))
+        ).json()
+        event = dt.datetime.fromtimestamp(data["event_time"], tz=dt.UTC)
+        last = dt.datetime.fromtimestamp(data["candles"][-1]["time"], tz=dt.UTC)
+        band = data["windows"][0]
+
+        assert band["title"] == "24 hours after"
+        assert band["end"] - band["start"] == 24 * 60 * 60
+
+        a_whole_day_has_closed = last - event >= dt.timedelta(hours=24)
+        assert (band["high"] is not None) is a_whole_day_has_closed
+        assert (band["low"] is not None) is a_whole_day_has_closed
 
     def test_it_defaults_to_the_most_recent_event(self, client: TestClient) -> None:
         data = client.post(
