@@ -89,7 +89,7 @@ def _event_card(event: MarketEvent, now: dt.datetime) -> str:
         f"</span>"
         f"</a>"
         f'<span class="event-meta">'
-        f"{_prepare_link(event)}"
+        f"{_prepare_link(event, upcoming=upcoming)}"
         f'<span class="badge badge-{escape(meta.importance.value)}">'
         f"{escape(meta.importance.value)}</span>"
         f'<span class="event-countdown">{escape(format_delta(delta, upcoming))}</span>'
@@ -98,14 +98,23 @@ def _event_card(event: MarketEvent, now: dt.datetime) -> str:
     )
 
 
-def _prepare_link(event: MarketEvent) -> str:
-    """The action on a release that has a preparation page.
+def _prepare_link(event: MarketEvent, *, upcoming: bool) -> str:
+    """The action on a release there is still time to prepare for.
 
-    Only CPI has one: the page reads a CPI values file and a CPI scenario
+    Two conditions, for two different reasons.
+
+    Only CPI has the page at all: it reads a CPI values file and a CPI scenario
     rule, and offering the button on an event type with neither would promise
     something the route correctly refuses.
+
+    And only ahead of the release, because that is what the word means. A
+    release that has already printed is read about rather than prepared for,
+    and the event page is where that reading lives. The preparation page still
+    answers on its own URL -- a link kept from last month goes on working, and
+    what it shows afterwards is deliberate -- it simply stops being offered
+    here, where every other card leads to the event page.
     """
-    if event.curated_type is not EventType.CPI:
+    if event.curated_type is not EventType.CPI or not upcoming:
         return ""
     return (
         f'<a class="prep-prepare" href="/event/{escape(event.event_id)}/prepare">'

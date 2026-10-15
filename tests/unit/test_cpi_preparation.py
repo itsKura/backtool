@@ -181,6 +181,31 @@ class TestThePageOpensFromTheCalendar:
         assert "/prepare" in html
         assert ">Prepare</a>" in html
 
+    def test_it_is_offered_only_before_the_release(
+        self, client: TestClient
+    ) -> None:
+        """Because that is what the word means. A release that has printed is
+        read about rather than prepared for, and every card already leads to
+        the event page where that reading lives.
+        """
+        html = client.get("/").text
+        now = dt.datetime.now(tz=dt.UTC)
+        upcoming = {
+            item.event_id
+            for item in load_events(EventType.CPI)
+            if item.timestamp_utc > now
+        }
+        offered = set(re.findall(r'href="/event/([^"]+)/prepare"', html))
+        assert offered, "the next release should still be offered"
+        assert offered <= upcoming, f"offered for a release that has happened: {offered - upcoming}"
+
+    def test_a_past_release_is_still_reachable_by_its_own_url(
+        self, client: TestClient
+    ) -> None:
+        """The button is gone, not the page. A link kept from last month goes
+        on working, and what it shows afterwards was built deliberately."""
+        assert client.get(f"/event/{PAST_EVENT}/prepare").status_code == 200
+
     def test_an_upcoming_release_renders(self, client: TestClient) -> None:
         response = client.get(f"/event/{NEXT_EVENT}/prepare")
         assert response.status_code == 200
