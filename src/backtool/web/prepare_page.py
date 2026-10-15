@@ -45,10 +45,13 @@ from backtool.events.meta import meta_for
 from backtool.events.models import MarketEvent
 from backtool.events.releases import (
     CPI_METRIC,
+    CPI_METRIC_SHORT,
     SCENARIO_ORDER,
     SCENARIO_RULES,
+    PublishedValue,
     ReleaseValues,
     load_releases,
+    release_figures,
 )
 from backtool.research.cohort import Cohort, split_study
 from backtool.research.metrics import WindowMetrics
@@ -67,7 +70,7 @@ from backtool.research.runner import run_study
 from backtool.research.spec import ResearchSpec
 from backtool.research.windows import REACTION_WINDOWS
 from backtool.web.calendar_page import SEPARATOR, format_delta
-from backtool.web.cohort_view import render_cohort_table, render_sample_badge
+from backtool.web.cohort_view import render_cohort_table
 from backtool.web.timefmt import local_stamp
 
 #: How many past releases the page considers. The whole supplied dataset fits
@@ -106,6 +109,19 @@ SERIES_CLASS: dict[str, str] = {
     "hotter": "prep-series-hotter",
     "in_line": "prep-series-inline",
     "cooler": "prep-series-cooler",
+}
+
+#: What each scenario actually tested, stated as the comparison it is.
+#:
+#: Spelled out beside every group because "cooler" on its own is a mood. The
+#: rule is a comparison a reader can redo against the two figures in the same
+#: table, which is the whole reason the classification is arithmetic and not a
+#: score. The thresholds stay abstract while no consensus is published for the
+#: upcoming release -- naming one would be inventing it.
+SCENARIO_RULE_TEXT: dict[str, str] = {
+    "hotter": "actual above consensus",
+    "in_line": "actual equals consensus",
+    "cooler": "actual below consensus",
 }
 
 #: Reader-facing names for the scenario keys, so no raw enum reaches the page.
@@ -328,15 +344,23 @@ def _why_missing(window: WindowMetrics, now: dt.datetime) -> str:
 
 
 def render_preparation(prep: Preparation, symbols: tuple[str, ...]) -> str:
-    """The page body, as a fragment."""
+    """The page body, as a fragment.
+
+    Ordered the way the question gets asked twenty minutes before a print:
+    what is coming, what the market is doing right now, what each outcome has
+    meant, the evidence behind that, and only then the method. An earlier
+    version put the historical sections first and the current one below a
+    chart, which is the order a report is written in rather than the order it
+    is read in.
+    """
     return (
         _header(prep)
         + _asset_row(prep, symbols)
         + render_reaction(prep)
         + _what_to_watch(prep)
+        + _context_section(prep)
         + _scenario_section(prep)
         + _horizon_chart(prep)
-        + _context_section(prep)
         + _occurrences(prep)
         + _methodology(prep)
         + _followup(prep)
@@ -344,7 +368,7 @@ def render_preparation(prep: Preparation, symbols: tuple[str, ...]) -> str:
 
 
 def _header(prep: Preparation) -> str:
-    """What is coming, when, and the three published figures."""
+    """What is coming, which figure it is, when, and the three published values."""
     meta = meta_for(EventType.CPI)
     local = utc_to_local(prep.event.timestamp_utc, NEW_YORK)
     delta = prep.event.timestamp_utc - prep.now
@@ -359,36 +383,6 @@ def _header(prep: Preparation) -> str:
         else f'<span class="prep-countdown">{escape(format_delta(delta, True))}</span>'
     )
 
-    values = prep.values
-    figures = "".join(
-        _figure(label, value, note)
-        for label, value, note in (
-            ("Previous", _pct(values.previous_yoy if values else None), ""),
-            (
-                "Consensus",
-                _pct(values.consensus_yoy if values else None),
-                _consensus_note(values),
-            ),
-            (
-                "Actual",
-                _pct(values.actual_yoy if values else None)
-                if prep.released
-                else "&mdash;",
-                "" if prep.released else "not yet published",
-            ),
-        )
-    )
-
-    landed = ""
-    key = prep.scenario_key
-    if key is not None:
-        surprise = prep.values.surprise_pp if prep.values else None
-        gap = f" &middot; {surprise:+.1f} pp vs consensus" if surprise is not None else ""
-        landed = (
-            f'<p class="prep-landed">This release printed '
-            f'<strong>{escape(SCENARIO_LABELS.get(key, key))}</strong>{gap}.</p>'
-        )
-
     # The release instant on the reader's own clock. Dropped by the browser for
     # anyone already in the release's timezone, where it would print the same
     # time twice -- which on a US release page is a good share of readers.
@@ -396,46 +390,66 @@ def _header(prep: Preparation) -> str:
         prep.event.timestamp_utc, lead=SEPARATOR, instead_of=f"{local:%H:%M}"
     )
 
+    figures = "".join(
+        _figure_cell(figure) for figure in release_figures(
+            prep.values, released=prep.released
+        )
+    )
+
+    landed = ""
+    key = prep.scenario_key
+    if key is not None:
+        surprise = prep.values.surprise_pp if prep.values else None
+        gap = (
+            f" &middot; {surprise:+.1f} pp against consensus"
+            if surprise is not None
+            else ""
+        )
+        landed = (
+            f'<p class="prep-landed">This release printed '
+            f'<strong>{escape(SCENARIO_LABELS.get(key, key))}</strong>{gap}.</p>'
+        )
+
     return (
         '<section class="prep-header">'
         '<p class="prep-kicker">Event preparation</p>'
         f"<h1>{escape(meta.label)}</h1>"
+        # The measure, directly under the name. Without it a reader has no way
+        # to tell whether 3.8% is headline or core, annual or monthly -- and
+        # those move in different directions on the same morning.
+        f'<p class="prep-measure">{escape(CPI_METRIC_SHORT)}</p>'
         f'<p class="prep-when">{local:%A %d %B %Y} &middot; '
         f"{local:%H:%M} ET{in_your_time}"
         f"{state}{countdown}</p>"
         f'<p class="prep-sub">{escape(meta.summary)}</p>'
-        f'<div class="prep-figures">{figures}</div>'
+        f'<div class="prep-figures prep-figures-headline">{figures}</div>'
         f"{landed}"
         "</section>"
     )
 
 
-def _figure(label: str, value: str, note: str) -> str:
-    hint = f'<span class="prep-figure-note">{escape(note)}</span>' if note else ""
+def _figure_cell(figure: PublishedValue) -> str:
+    """One published figure, or the reason there is not one.
+
+    The reason is the point. A dash alone collapses "nobody has forecast this
+    yet", "we have not transcribed it" and "it cannot exist until Tuesday" into
+    one shrug, and only one of those is a gap in this product.
+    """
+    classes = "prep-figure"
+    if not figure.is_known:
+        classes += " prep-figure-missing"
+    value = _pct(figure.value) if figure.value is not None else "&mdash;"
+    note = (
+        f'<span class="prep-figure-note">{escape(figure.note)}</span>'
+        if figure.note
+        else ""
+    )
     return (
-        '<div class="prep-figure">'
-        f'<span class="prep-figure-label">{escape(label)}</span>'
-        f'<span class="prep-figure-value">{value}</span>{hint}'
+        f'<div class="{classes}">'
+        f'<span class="prep-figure-label">{escape(figure.label)}</span>'
+        f'<span class="prep-figure-value">{value}</span>{note}'
         "</div>"
     )
-
-
-def _consensus_note(values: ReleaseValues | None) -> str:
-    """Why there is no consensus, when there is none.
-
-    Said rather than left blank. A dash with no explanation reads as a bug; the
-    actual situation is that a hand-verified dataset declined to record a figure
-    it could not source, which is a stronger statement than a number.
-    """
-    if values is None:
-        return "no values recorded for this release"
-    if values.consensus_yoy is None:
-        return "unavailable"
-    if values.consensus_conflict:
-        return "sources disagree"
-    if not values.consensus_verified:
-        return "unverified"
-    return ""
 
 
 def _pct(value: float | None) -> str:
@@ -447,8 +461,7 @@ def _what_to_watch(prep: Preparation) -> str:
 
     Every clause is a number from the study or the dataset. Nothing is
     predicted, nothing is recommended, and the verbs are historical: this
-    section exists to tell a reader what the evidence on the page says, not
-    what to do about it.
+    section says what the evidence on the page shows, not what to do about it.
     """
     lines = what_to_watch_lines(prep)
     if not lines:
@@ -468,23 +481,47 @@ def what_to_watch_lines(prep: Preparation) -> list[str]:
     """The summary sentences, as HTML fragments.
 
     Public so the behaviour can be tested without parsing a page, and so a
-    sentence that cannot be supported by the numbers is absent rather than
-    hedged into meaninglessness.
+    sentence the numbers cannot support is absent rather than hedged into
+    meaning nothing.
+
+    The first sentence ranks *every* group rather than comparing two. An
+    earlier version set cooler against hotter and stopped, which in this
+    dataset skipped the strongest of the three -- a true sentence that left the
+    reader with a false impression, which is the worse kind.
     """
     lines: list[str] = []
     name = SYMBOL_NAMES.get(prep.symbol, prep.symbol)
 
-    by_key = {cohort.key: cohort for cohort in prep.scenarios}
-    cooler = _median(by_key.get("cooler"), HEADLINE_WINDOW)
-    hotter = _median(by_key.get("hotter"), HEADLINE_WINDOW)
-    if cooler is not None and hotter is not None:
-        stronger, weaker = ("cooler", "hotter") if cooler > hotter else ("hotter", "cooler")
+    ranked = sorted(
+        (
+            (cohort, median)
+            for cohort in prep.scenarios
+            if (median := _median(cohort, HEADLINE_WINDOW)) is not None
+        ),
+        key=lambda pair: pair[1],
+        reverse=True,
+    )
+    if ranked:
+        parts = [
+            f"{escape(SCENARIO_LABELS.get(cohort.key, cohort.label)).lower()} "
+            f"({_signed(median)}, n={cohort.sample_size})"
+            for cohort, median in ranked
+        ]
         lines.append(
-            f"Historically, <strong>{stronger}-than-expected</strong> releases have "
-            f"produced stronger 24-hour {escape(name)} outcomes than {weaker} ones "
-            f"in this sample ({_signed(max(cooler, hotter))} against "
-            f"{_signed(min(cooler, hotter))} median)."
+            f"In this sample, median 24-hour {escape(name)} outcomes ran "
+            + ", then ".join(parts)
+            + "."
         )
+        # Named rather than left to the badge on a card further down. A median
+        # over three releases and one over thirty read identically in a
+        # sentence, and this is the sentence people quote.
+        smallest = min(ranked, key=lambda pair: pair[0].sample_size)[0]
+        if smallest.quality.needs_warning:
+            lines.append(
+                f"The {escape(SCENARIO_LABELS.get(smallest.key, smallest.label)).lower()} "
+                f"group holds only <strong>{smallest.sample_size}</strong> "
+                "releases, which is too few to describe a tendency."
+            )
 
     entry = prep.entry_return_pct
     if entry is not None:
@@ -500,7 +537,7 @@ def what_to_watch_lines(prep: Preparation) -> list[str]:
         window = match.windows.get(HEADLINE_WINDOW)
         if window is not None and window.sample_size:
             lines.append(
-                f"Other releases the asset entered the same way: "
+                "Other releases the asset entered the same way: "
                 f"<strong>n&nbsp;=&nbsp;{match.sample_size}</strong>, median 24-hour "
                 f"outcome {_signed(window.median_return_pct)}, positive "
                 f"{window.up_count} of {window.sample_size}."
@@ -508,7 +545,7 @@ def what_to_watch_lines(prep: Preparation) -> list[str]:
 
     if prep.released and prep.scenario_key:
         lines.append(
-            f"This release landed "
+            "This release landed "
             f"<strong>{escape(SCENARIO_LABELS.get(prep.scenario_key, prep.scenario_key))}"
             "</strong>; the matching scenario is highlighted below."
         )
@@ -546,10 +583,10 @@ def _asset_row(prep: Preparation, symbols: tuple[str, ...]) -> str:
 
 
 def _scenario_section(prep: Preparation) -> str:
-    """One card per outcome, summary first, full grid behind a disclosure."""
+    """The playbook: a table to scan, then a card per outcome to read."""
     if not prep.scenarios:
         return (
-            '<section class="prep-scenarios"><h2>Historical scenarios</h2>'
+            '<section class="prep-scenarios"><h2>Scenario playbook</h2>'
             '<div class="panel-card empty-state"><p>No release in the dataset '
             "has a verified consensus, so none can be sorted into an outcome. "
             "The rest of this page still works.</p></div></section>"
@@ -558,32 +595,95 @@ def _scenario_section(prep: Preparation) -> str:
     cards = "".join(_scenario_card(prep, cohort) for cohort in prep.scenarios)
     return (
         '<section class="prep-scenarios">'
-        "<h2>Historical scenarios</h2>"
-        f'<p class="section-sub">How {escape(SYMBOL_NAMES.get(prep.symbol, prep.symbol))} '
-        "behaved after past releases, grouped by how the figure landed against "
-        "forecast. Each is measured from the release price.</p>"
+        "<h2>Scenario playbook</h2>"
+        f'<p class="section-sub">How '
+        f"{escape(SYMBOL_NAMES.get(prep.symbol, prep.symbol))} behaved after past "
+        f"releases, grouped by where the {escape(CPI_METRIC_SHORT)} figure "
+        "landed against the forecast. Each figure is measured from the release "
+        "price.</p>"
+        f"{_scenario_summary(prep)}"
         f'<div class="prep-cards">{cards}</div>'
         "</section>"
     )
 
 
+def _scenario_summary(prep: Preparation) -> str:
+    """The whole playbook in one scannable table.
+
+    Above the cards because the first question is comparative -- which outcome
+    has meant what -- and three cards side by side answer that only after being
+    read three times.
+    """
+    rows = ""
+    for cohort in prep.scenarios:
+        window = cohort.windows.get(HEADLINE_WINDOW)
+        label = SCENARIO_LABELS.get(cohort.key, cohort.label)
+        rule = SCENARIO_RULE_TEXT.get(cohort.key, "")
+        occurred = ' class="prep-row-occurred"' if prep.scenario_key == cohort.key else ""
+        if window is None or not window.sample_size:
+            rows += (
+                f"<tr{occurred}><th>{escape(label)}</th>"
+                f'<td class="prep-rule">{escape(rule)}</td>'
+                f"<td>{cohort.sample_size}</td>"
+                '<td class="prep-none" colspan="2">not measurable</td></tr>'
+            )
+            continue
+        rows += (
+            f"<tr{occurred}><th>{escape(label)}</th>"
+            f'<td class="prep-rule">{escape(rule)}</td>'
+            f"<td>{cohort.sample_size}</td>"
+            f'<td class="{_sign(window.median_return_pct)}">'
+            f"{_signed(window.median_return_pct)}</td>"
+            f"<td>{window.up_count} / {window.sample_size}</td></tr>"
+        )
+
+    baseline = ""
+    if prep.baseline is not None:
+        window = prep.baseline.windows.get(HEADLINE_WINDOW)
+        if window is not None and window.sample_size:
+            baseline = (
+                '<tr class="prep-row-baseline"><th>All releases</th>'
+                '<td class="prep-rule">every measured release, however it '
+                "landed</td>"
+                f"<td>{prep.baseline.sample_size}</td>"
+                f'<td class="{_sign(window.median_return_pct)}">'
+                f"{_signed(window.median_return_pct)}</td>"
+                f"<td>{window.up_count} / {window.sample_size}</td></tr>"
+            )
+
+    return (
+        '<div class="prep-scroll panel-card prep-summary">'
+        '<table class="prep-table"><thead><tr>'
+        "<th>Scenario</th><th>Rule</th><th>n</th>"
+        "<th>Median 24h</th><th>Positive</th>"
+        f"</tr></thead><tbody>{rows}{baseline}</tbody></table></div>"
+    )
+
+
 def _scenario_card(prep: Preparation, cohort: Cohort) -> str:
+    """One outcome: the three horizons, the frequency, the excursions.
+
+    The sample warning is a badge and at most one sentence. An earlier version
+    repeated the band, a description and a caveat on every card, which is three
+    ways of saying the same thing and made the numbers harder to find than the
+    hedging around them.
+    """
     label = SCENARIO_LABELS.get(cohort.key, cohort.label)
     occurred = prep.scenario_key == cohort.key
-    rows = "".join(
-        _card_row(cohort, name, prep.baseline) for name in CARD_WINDOWS
-    )
+    rows = "".join(_card_row(cohort, name, prep.baseline) for name in CARD_WINDOWS)
     headline = cohort.windows.get(HEADLINE_WINDOW)
+
     frequency = (
-        f'<p class="prep-freq">Positive after 24 hours: '
+        '<p class="prep-freq">Positive after 24 hours '
         f"<strong>{headline.up_count} of {headline.sample_size}</strong></p>"
         if headline is not None and headline.sample_size
         else '<p class="prep-freq muted">No release in this group has a '
         "complete 24-hour window.</p>"
     )
     path = (
-        f'<p class="prep-path">Median best move {_signed(headline.mean_mfe_pct)} '
-        f"&middot; median worst {_signed(headline.mean_mae_pct)}</p>"
+        f'<p class="prep-path">Best move {_signed(headline.mean_mfe_pct)} '
+        f"&middot; worst {_signed(headline.mean_mae_pct)}, on average, within "
+        "the 24 hours</p>"
         if headline is not None and headline.sample_size
         else ""
     )
@@ -592,13 +692,11 @@ def _scenario_card(prep: Preparation, cohort: Cohort) -> str:
         f'<article class="prep-card{" prep-card-occurred" if occurred else ""}">'
         + ('<span class="prep-occurred">This is what happened</span>' if occurred else "")
         + f"<h3>{escape(label)}</h3>"
-        + f'<p class="prep-n">{render_sample_badge(cohort)}</p>'
+        + f'<p class="prep-rule-line">{escape(SCENARIO_RULE_TEXT.get(cohort.key, ""))}</p>'
+        + _card_sample(cohort)
         + f'<table class="prep-rows"><tbody>{rows}</tbody></table>'
         + frequency
         + path
-        # The shared grid is wider than a phone. Wrapped so it scrolls inside
-        # its own box: without this it is clipped at the card edge, which hides
-        # columns rather than offering them.
         + "<details><summary>Full reaction grid</summary>"
         + '<div class="prep-scroll">'
         + render_cohort_table(cohort, REACTION_WINDOWS)
@@ -607,19 +705,46 @@ def _scenario_card(prep: Preparation, cohort: Cohort) -> str:
     )
 
 
+def _card_sample(cohort: Cohort) -> str:
+    """The count, its band, and one sentence only when one is needed.
+
+    The shared badge carries a description and a caveat as well, which is right
+    on a page showing one cohort and repetitive on a page showing three side by
+    side. The honesty is in the count and the band; the prose was decoration
+    around them.
+    """
+    quality = cohort.quality
+    band = (
+        f'<span class="cohort-quality quality-{quality.name.lower()}">'
+        f"{escape(quality.value)} sample</span>"
+        if quality.needs_warning
+        else ""
+    )
+    caveat = (
+        '<p class="prep-caveat">Too few to describe a tendency. Read these as '
+        "individual cases.</p>"
+        if quality.needs_warning and not cohort.is_reliable
+        else ""
+    )
+    return (
+        f'<p class="prep-n"><span class="cohort-n">n={cohort.sample_size}</span>'
+        f"{band}</p>{caveat}"
+    )
+
+
 def _card_row(cohort: Cohort, name: str, baseline: Cohort | None) -> str:
     """One horizon: this cohort's median, and how it sits against all releases.
 
     The difference is the only arithmetic this module performs, and it is a
     subtraction of two medians the research layer computed. Quoted in
-    percentage points because a difference between two percentages is not
+    percentage points because the difference between two percentages is not
     itself a percentage.
     """
     aggregate = cohort.windows.get(name)
     label = WINDOW_LABELS.get(name, name)
     if aggregate is None or not aggregate.sample_size:
         return (
-            f'<tr><th>{escape(label)}</th>'
+            f"<tr><th>{escape(label)}</th>"
             '<td class="prep-none" colspan="2">not measurable</td></tr>'
         )
 
@@ -627,9 +752,7 @@ def _card_row(cohort: Cohort, name: str, baseline: Cohort | None) -> str:
     against = ""
     if base is not None:
         gap = aggregate.median_return_pct - base
-        against = (
-            f'<td class="prep-vs {_sign(gap)}">{gap:+.1f} pp vs all</td>'
-        )
+        against = f'<td class="prep-vs {_sign(gap)}">{gap:+.1f} pp vs all</td>'
 
     return (
         f"<tr><th>{escape(label)}</th>"
@@ -645,14 +768,18 @@ def _sign(value: float | None) -> str:
 
 
 def _horizon_chart(prep: Preparation) -> str:
-    """Median return by horizon, one line per scenario, against the baseline.
+    """Median return at each horizon, grouped by outcome.
 
-    Drawn from the aggregates already on the page rather than from candles, so
-    there is nothing to downsample and nothing to fetch: five numbers per
-    cohort, which is the whole series. The reaction windows are deliberately
-    readable as a sequence -- a move that shows at 5m and holds to 24h is a
-    different event from one that is gone by 1h -- and that sequence is exactly
-    what a reader cannot see in a table of five rows.
+    Bars rather than lines, and that is the whole point of the change. These
+    five numbers are *separate measurements from the same anchor* -- the 24h
+    median is not the 4h median plus something -- so a line joining them draws a
+    journey nobody measured and invites a reader to see momentum in it. The
+    reaction windows are meant to be read as a sequence of comparisons, and
+    bars put the comparison where it belongs: between the groups at one
+    horizon, not along one group across horizons.
+
+    Drawn from the aggregates already on the page: five numbers per cohort is
+    the whole series, so there is nothing to fetch and nothing to downsample.
     """
     series: list[tuple[str, list[float | None], str]] = []
     for cohort in prep.scenarios:
@@ -673,29 +800,44 @@ def _horizon_chart(prep: Preparation) -> str:
     if len(series) < 2:
         return ""
 
-    every = [v for _label, values, _base in series for v in values if v is not None]
+    every = [v for _label, values, _klass in series for v in values if v is not None]
     low, high = min(every + [0.0]), max(every + [0.0])
-    pad = max((high - low) * 0.15, 0.2)
+    pad = max((high - low) * 0.12, 0.15)
     low, high = low - pad, high + pad
 
-    width, height, left, bottom = 640, 240, 48, 28
+    width, height, left, bottom, top = 640, 260, 52, 30, 10
     names = list(WINDOW_LABELS)
-
-    def x(index: int) -> float:
-        return left + index * (width - left - 12) / max(len(names) - 1, 1)
+    plot = width - left - 12
+    group = plot / len(names)
+    # A gutter between groups, then one bar per series inside each.
+    bar = (group * 0.74) / len(series)
 
     def y(value: float) -> float:
-        return (height - bottom) - (value - low) / (high - low) * (height - bottom - 12)
+        span = height - bottom - top
+        return (height - bottom) - (value - low) / (high - low) * span
 
-    zero = (
-        f'<line class="prep-axis" x1="{left}" y1="{y(0.0):.1f}" '
-        f'x2="{width - 12}" y2="{y(0.0):.1f}" />'
-        if low <= 0 <= high
-        else ""
+    zero = y(0.0)
+    bars = ""
+    for order, (_label, values, klass) in enumerate(series):
+        for index, value in enumerate(values):
+            if value is None:
+                continue
+            x = left + index * group + group * 0.13 + order * bar
+            top_y, bottom_y = min(y(value), zero), max(y(value), zero)
+            bars += (
+                f'<rect class="prep-bar {klass}" x="{x:.1f}" y="{top_y:.1f}" '
+                f'width="{max(bar - 1.5, 1):.1f}" height="{max(bottom_y - top_y, 0.8):.1f}">'
+                f"<title>{escape(_label)} at {escape(list(WINDOW_LABELS.values())[index])}: "
+                f"{_signed(value)} median</title></rect>"
+            )
+
+    axis = (
+        f'<line class="prep-axis" x1="{left}" y1="{zero:.1f}" '
+        f'x2="{width - 12}" y2="{zero:.1f}" />'
     )
     ticks = "".join(
-        f'<text class="prep-tick" x="{x(index):.1f}" y="{height - 8}" '
-        f'text-anchor="middle">{escape(label)}</text>'
+        f'<text class="prep-tick" x="{left + index * group + group / 2:.1f}" '
+        f'y="{height - 10}" text-anchor="middle">{escape(label)}</text>'
         for index, label in enumerate(WINDOW_LABELS.values())
     )
     scale = "".join(
@@ -704,41 +846,27 @@ def _horizon_chart(prep: Preparation) -> str:
         for value in (high - pad / 2, 0.0, low + pad / 2)
         if low <= value <= high
     )
-
-    lines = ""
-    legend = ""
-    for label, values, klass in series:
-        points = " ".join(
-            f"{x(index):.1f},{y(value):.1f}"
-            for index, value in enumerate(values)
-            if value is not None
-        )
-        lines += (
-            f'<polyline class="prep-series {klass}" points="{points}" '
-            'fill="none" />'
-        )
-        dots = "".join(
-            f'<circle class="prep-dot {klass}" cx="{x(index):.1f}" '
-            f'cy="{y(value):.1f}" r="2.5" />'
-            for index, value in enumerate(values)
-            if value is not None
-        )
-        lines += dots
-        legend += (
-            f'<span class="prep-legend-item"><i class="prep-key {klass}"></i>'
-            f"{escape(label)}</span>"
-        )
+    legend = "".join(
+        f'<span class="prep-legend-item"><i class="prep-key {klass}"></i>'
+        f"{escape(label)}</span>"
+        for label, _values, klass in series
+    )
 
     return (
         '<section class="prep-chart panel-card">'
         "<h2>Median reaction by horizon</h2>"
-        '<p class="section-sub">Each point is the median across that group, '
-        "measured from the release price. Separate measurements, not a path "
-        "one release took.</p>"
+        '<p class="section-sub">Each bar is the median across that group, '
+        "measured from the release price. Five separate measurements from the "
+        "same instant, not a path any release followed &mdash; the 24-hour "
+        "figure is not the 4-hour figure plus something.</p>"
         f'<div class="prep-legend">{legend}</div>'
-        f'<svg viewBox="0 0 {width} {height}" class="prep-svg" '
-        'role="img" aria-label="Median return by horizon for each scenario">'
-        f"{zero}{scale}{ticks}{lines}</svg>"
+        # Scrolls rather than shrinks on a narrow screen. Scaling a 640-wide
+        # drawing into 300 pixels takes the axis text with it, and a chart
+        # whose labels cannot be read is a decoration.
+        '<div class="prep-scroll">'
+        f'<svg viewBox="0 0 {width} {height}" class="prep-svg" role="img" '
+        'aria-label="Median return at each horizon, grouped by CPI outcome">'
+        f"{scale}{axis}{ticks}{bars}</svg></div>"
         "</section>"
     )
 
@@ -788,8 +916,21 @@ def _context_section(prep: Preparation) -> str:
 
 
 def _context_cell(label: str, value: float | None) -> str:
+    """One return over the run-up.
+
+    Its own markup rather than the published-figure cell: that one carries a
+    status explaining why a number is absent from a dataset, and a return that
+    cannot be measured is absent for an entirely different reason -- the
+    candles are not there.
+    """
     if value is None:
-        return _figure(label, "&mdash;", "not measurable")
+        return (
+            '<div class="prep-figure prep-figure-missing">'
+            f'<span class="prep-figure-label">{escape(label)}</span>'
+            '<span class="prep-figure-value">&mdash;</span>'
+            '<span class="prep-figure-note">no candles for this window</span>'
+            "</div>"
+        )
     return (
         '<div class="prep-figure">'
         f'<span class="prep-figure-label">{escape(label)}</span>'
@@ -837,7 +978,7 @@ def _similar(prep: Preparation) -> str:
         f"24 hours: <strong>n&nbsp;=&nbsp;{match.sample_size}</strong>. "
         f"Median 24-hour outcome {_signed(window.median_return_pct)}, positive "
         f"{window.up_count} of {window.sample_size}.{escape(against)}</p>"
-        f'<p class="prep-n">{render_sample_badge(match)}</p>'
+        f"{_card_sample(match)}"
         "</div>"
     )
 
@@ -916,7 +1057,16 @@ def _methodology(prep: Preparation) -> str:
     counted = len(study.events) if study is not None else 0
     rows = (
         ("Event", "US CPI, from the curated release calendar"),
-        ("Series", CPI_METRIC),
+        ("Measure", CPI_METRIC),
+        # Said as plainly as what is covered, because a reader who assumes core
+        # or month-over-month is reading a different release's statistics off
+        # this page and nothing else here would tell them.
+        (
+            "Not covered",
+            "Core CPI and month-over-month are different series that can "
+            "surprise in opposite directions on the same morning. Neither is "
+            "in this dataset, and nothing on this page describes them.",
+        ),
         ("Asset", f"{SYMBOL_NAMES.get(prep.symbol, prep.symbol)} ({prep.symbol})"),
         ("Price data", "Binance candles, 5-minute, from our own cache"),
         ("Measured from", "The release instant, 08:30 America/New_York"),
@@ -1049,7 +1199,11 @@ PREPARE_STYLE = """
 .prep-header { margin: 0 0 22px; }
 .prep-kicker { margin: 0 0 6px; font-size: 12px; letter-spacing: 0.08em;
                text-transform: uppercase; color: var(--text-muted); }
-.prep-header h1 { font-size: 30px; margin: 0 0 8px; letter-spacing: -0.02em; }
+.prep-header h1 { font-size: 30px; margin: 0 0 4px; letter-spacing: -0.02em; }
+/* The exact series, directly under the name. Quiet but never absent: a reader
+   who assumes core or month-over-month is reading different statistics. */
+.prep-measure { margin: 0 0 10px; font-size: 13px; font-weight: 500;
+                color: var(--text-secondary); letter-spacing: 0.01em; }
 .prep-when { margin: 0 0 6px; font-size: 13px; color: var(--text-secondary);
              display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .prep-sub { margin: 0 0 16px; color: var(--text-muted); font-size: 14px;
@@ -1068,7 +1222,12 @@ PREPARE_STYLE = """
                      text-transform: uppercase; color: var(--text-muted); }
 .prep-figure-value { font-size: 21px; font-weight: 600;
                      font-variant-numeric: tabular-nums; }
-.prep-figure-note { font-size: 11px; color: var(--text-muted); }
+.prep-figure-note { font-size: 11px; color: var(--text-muted);
+                     line-height: 1.35; }
+/* A figure we do not have reads as quieter than one we do, rather than as an
+   error. The note beside it says which kind of absence it is. */
+.prep-figure-missing .prep-figure-value { color: var(--text-muted); }
+.prep-figures-headline .prep-figure { min-height: 76px; }
 .prep-landed { margin: 14px 0 0; font-size: 14px; }
 
 .prep-watch { margin: 0 0 22px; }
@@ -1084,6 +1243,18 @@ PREPARE_STYLE = """
 .section-sub { margin: 0 0 14px; color: var(--text-muted); font-size: 13px;
                max-width: 76ch; }
 
+.prep-summary { padding: 4px 16px 10px; margin: 0 0 16px; }
+.prep-summary .prep-table th:first-child { width: 26%; }
+.prep-summary .prep-table th:not(:first-child),
+.prep-summary .prep-table td:not(:first-child):not(.prep-rule) {
+  text-align: right; }
+.prep-summary tbody th { font-weight: 600; color: var(--text-primary);
+                         font-size: 13px; }
+.prep-rule { color: var(--text-muted); font-size: 12px; }
+.prep-row-occurred th, .prep-row-occurred td { background: var(--surface-2); }
+.prep-row-baseline th, .prep-row-baseline td { color: var(--text-muted); }
+.prep-row-baseline th { font-weight: 500; }
+
 .prep-cards { display: grid; gap: 14px;
               grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
 .prep-card { background: var(--surface-1); border: 1px solid var(--grid);
@@ -1094,13 +1265,18 @@ PREPARE_STYLE = """
                  letter-spacing: 0.06em; text-transform: uppercase;
                  background: var(--accent); color: #fff; padding: 2px 8px;
                  border-radius: 999px; font-weight: 600; }
-.prep-n { margin: 0 0 12px; font-size: 12px; display: flex; flex-wrap: wrap;
+.prep-rule-line { margin: 0 0 10px; font-size: 12px; color: var(--text-muted); }
+.prep-n { margin: 0 0 10px; font-size: 12px; display: flex; flex-wrap: wrap;
           gap: 6px; align-items: baseline; }
+/* One sentence, and only for a sample too small to describe a tendency. The
+   band beside the count already carries the warning for everything else. */
+.prep-caveat { margin: -4px 0 10px; font-size: 12px; line-height: 1.45;
+               color: var(--warn, #c9a227); }
 .prep-rows { width: 100%; border-collapse: collapse; margin: 0 0 12px; }
 .prep-rows th { text-align: left; font-weight: 500; color: var(--text-muted);
                 font-size: 12px; padding: 4px 0; width: 48px; }
-.prep-rows td { padding: 4px 0; font-variant-numeric: tabular-nums;
-                font-size: 14px; }
+.prep-rows td { padding: 5px 0; font-variant-numeric: tabular-nums;
+                font-size: 15px; }
 .prep-val { font-weight: 600; }
 .prep-vs { text-align: right; font-size: 12px; color: var(--text-muted); }
 .prep-none { color: var(--text-muted); }
@@ -1109,30 +1285,27 @@ PREPARE_STYLE = """
 .prep-card details summary { font-size: 12px; color: var(--text-muted);
                              cursor: pointer; }
 
-.prep-svg { width: 100%; height: auto; }
+.prep-svg { width: 100%; height: auto; min-width: 460px; }
 .prep-axis { stroke: var(--grid); stroke-width: 1; }
 .prep-tick { fill: var(--text-muted); font-size: 10px; }
-.prep-series { stroke-width: 2; }
-.prep-series-hotter { stroke: #d9644a; }
-.prep-series-inline { stroke: #c9a227; }
-.prep-series-cooler { stroke: #4d9ef6; }
-.prep-series-other { stroke: #8a7fd4; }
-.prep-series-base { stroke: var(--text-muted); stroke-dasharray: 4 3; }
-.prep-dot.prep-series-hotter { fill: #d9644a; stroke: none; }
-.prep-dot.prep-series-inline { fill: #c9a227; stroke: none; }
-.prep-dot.prep-series-cooler { fill: #4d9ef6; stroke: none; }
-.prep-dot.prep-series-other { fill: #8a7fd4; stroke: none; }
-.prep-dot.prep-series-base { fill: var(--text-muted); stroke: none; }
+/* Bars, not a line. These are five separate measurements from one anchor,
+   and a line between them draws a journey nobody measured. */
+.prep-bar { stroke: none; }
+.prep-bar.prep-series-hotter { fill: #d9644a; }
+.prep-bar.prep-series-inline { fill: #c9a227; }
+.prep-bar.prep-series-cooler { fill: #4d9ef6; }
+.prep-bar.prep-series-other { fill: #8a7fd4; }
+.prep-bar.prep-series-base { fill: var(--text-muted); opacity: 0.55; }
 .prep-legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 0 0 10px;
                font-size: 12px; color: var(--text-secondary); }
 .prep-legend-item { display: inline-flex; align-items: center; gap: 6px; }
-.prep-key { width: 14px; height: 2px; display: inline-block; }
-.prep-key { height: 3px; border-radius: 2px; }
+.prep-key { width: 11px; height: 11px; display: inline-block;
+             border-radius: 2px; }
 .prep-key.prep-series-hotter { background: #d9644a; }
 .prep-key.prep-series-inline { background: #c9a227; }
 .prep-key.prep-series-cooler { background: #4d9ef6; }
 .prep-key.prep-series-other { background: #8a7fd4; }
-.prep-key.prep-series-base { background: var(--text-muted); }
+.prep-key.prep-series-base { background: var(--text-muted); opacity: 0.55; }
 
 .prep-similar { margin: 16px 0 0; padding: 14px 0 0;
                 border-top: 1px solid var(--grid); }

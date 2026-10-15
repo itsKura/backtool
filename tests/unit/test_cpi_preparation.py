@@ -39,6 +39,8 @@ from backtool.research.windows import REACTION_WINDOWS
 from backtool.web.app import app
 from backtool.web.prepare_page import (
     HEADLINE_WINDOW,
+    SCENARIO_LABELS,
+    WINDOW_LABELS,
     Preparation,
     _reaction_for,
     build_preparation,
@@ -666,7 +668,10 @@ class TestMissingValuesDoNotBreakThePage:
         assert response.status_code == 200
         text = plain(response.text)
         assert "Consensus" in text
-        assert "unavailable" in text or "no values recorded" in text
+        # Said as the specific thing it is. "Unavailable" would cover a
+        # forecast nobody has published and one we simply have not transcribed,
+        # and only the second is ours to fix.
+        assert "not yet collected for this release" in text
 
     def test_consensus_is_never_invented(self, client: TestClient) -> None:
         """The upcoming release has no published consensus in our data. A
@@ -702,7 +707,7 @@ class TestMissingValuesDoNotBreakThePage:
         )
         html = render_preparation(stripped, ("BTCUSDT",))
         assert "cannot be measured" in plain(html)
-        assert "Historical scenarios" in plain(html)
+        assert "Scenario playbook" in plain(html)
 
 
 # --- M: the sample is inspectable ------------------------------------------
@@ -783,11 +788,306 @@ class TestWhatToWatchIsTemplatedNotWritten:
             assert forbidden not in text
 
     def test_it_speaks_historically_rather_than_causally(self) -> None:
+        """Every claim is scoped to the sample it came from. "In this sample"
+        does that work at least as well as "historically", and does it in the
+        clause where the number actually appears."""
         prep = build_preparation(_event(PAST_EVENT), symbol="BTCUSDT", now=_now())
         text = plain(render_preparation(prep, ("BTCUSDT",))).lower()
-        assert "historically" in text
-        for causal in ("causes", "will push", "leads to"):
+        assert "in this sample" in text
+        assert "historical frequencies from the sample" in text
+        for causal in ("causes", "will push", "leads to", "because cpi"):
             assert causal not in text
+
+
+class TestTheReaderKnowsWhichFigureThisIs:
+    """"US Consumer Price Index" does not say whether 3.8% is headline or core,
+    annual or monthly. Those surprise in opposite directions on the same
+    morning, so a reader who assumes the wrong one is reading a different
+    release's statistics off this page with nothing to warn them.
+    """
+
+    def page(self) -> str:
+        return render_preparation(
+            build_preparation(_event(PAST_EVENT), symbol="BTCUSDT", now=_now()),
+            ("BTCUSDT",),
+        )
+
+    def test_the_measure_is_under_the_title(self) -> None:
+        from backtool.events.releases import CPI_METRIC_SHORT
+
+        assert CPI_METRIC_SHORT == "Headline CPI, year-over-year"
+        assert f'<p class="prep-measure">{CPI_METRIC_SHORT}</p>' in self.page()
+
+    def test_the_methodology_states_it_in_full(self) -> None:
+        from backtool.events.releases import CPI_METRIC
+
+        assert "year-over-year" in CPI_METRIC
+        assert CPI_METRIC in plain(self.page())
+
+    def test_nothing_claims_core_or_month_over_month(self) -> None:
+        """The dataset holds neither. A page that implied otherwise would be
+        describing a series it has never measured."""
+        text = plain(self.page()).lower()
+        assert "core cpi" in text, "it should say so, to rule it out"
+        assert "not covered" in text
+        # And never as a thing being reported.
+        assert "core cpi yoy:" not in text
+        assert "month-over-month reading" not in text
+
+    def test_the_dataset_really_only_holds_headline_yearly(self) -> None:
+        """The claim above is only honest while this holds. If a core or
+        monthly column is ever added, this fails and the wording has to be
+        revisited rather than quietly becoming wrong."""
+        import csv
+        from importlib import resources
+
+        with resources.files("backtool.events.data").joinpath(
+            "releases.csv"
+        ).open(encoding="utf-8") as handle:
+            columns = set(next(csv.reader(handle)))
+        assert {"previous_yoy", "consensus_yoy", "actual_yoy"} <= columns
+        assert not any("core" in name or "_mom" in name for name in columns)
+
+
+class TestTheCurrentSetupComesFirst:
+    """Somebody opening this twenty minutes before a print wants the current
+    situation, not a report that opens with history. The evidence is context
+    for today; today is the subject.
+    """
+
+    def body(self) -> str:
+        return render_preparation(
+            build_preparation(_event(NEXT_EVENT), symbol="BTCUSDT", now=_now()),
+            ("BTCUSDT",),
+        )
+
+    def test_the_market_now_sits_above_the_playbook(self) -> None:
+        html = self.body()
+        assert html.index('class="prep-context"') < html.index(
+            'class="prep-scenarios"'
+        )
+
+    def test_and_above_the_chart(self) -> None:
+        html = self.body()
+        assert html.index('class="prep-context"') < html.index('"prep-chart')
+
+    def test_the_header_is_still_first_and_method_still_last(self) -> None:
+        html = self.body()
+        order = [
+            html.index('class="prep-header"'),
+            html.index('class="prep-watch'),
+            html.index('class="prep-context"'),
+            html.index('class="prep-scenarios"'),
+            html.index('"prep-chart'),
+            html.index('class="prep-occurrences"'),
+            html.index('class="prep-method"'),
+            html.index('class="prep-followup'),
+        ]
+        assert order == sorted(order)
+
+
+class TestTheSummaryTableMatchesTheCohorts:
+    def prep(self) -> Preparation:
+        return build_preparation(_event(PAST_EVENT), symbol="BTCUSDT", now=_now())
+
+    def test_every_scenario_has_a_row(self) -> None:
+        prep = self.prep()
+        html = render_preparation(prep, ("BTCUSDT",))
+        table = html.split("prep-summary")[1].split("</table>")[0]
+        for cohort in prep.scenarios:
+            assert SCENARIO_LABELS[cohort.key] in table
+
+    def test_the_figures_are_the_aggregates(self) -> None:
+        """D and I. The table is a view of the cohorts, not a second
+        calculation of them."""
+        prep = self.prep()
+        table = (
+            render_preparation(prep, ("BTCUSDT",))
+            .split("prep-summary")[1]
+            .split("</table>")[0]
+        )
+        for cohort in prep.scenarios:
+            window = cohort.windows[HEADLINE_WINDOW]
+            assert f">{cohort.sample_size}</td>" in table
+            assert f"{window.median_return_pct:+.1f}%" in table
+            assert f"{window.up_count} / {window.sample_size}" in table
+
+    def test_the_counts_match_the_release_lists(self) -> None:
+        """E. A count is only honest if it is the length of the list the next
+        section shows."""
+        prep = self.prep()
+        for cohort in prep.scenarios:
+            assert cohort.sample_size == len(cohort.event_ids)
+
+    def test_the_baseline_is_in_the_table_and_marked_apart(self) -> None:
+        prep = self.prep()
+        html = render_preparation(prep, ("BTCUSDT",))
+        assert "prep-row-baseline" in html
+        assert "All releases" in html
+
+    def test_the_rule_is_stated_without_inventing_a_threshold(self) -> None:
+        """A number here would be a consensus for a release that has none."""
+        text = plain(render_preparation(self.prep(), ("BTCUSDT",)))
+        assert "actual above consensus" in text
+        assert "actual below consensus" in text
+        assert "actual equals consensus" in text
+
+
+class TestTheChartIsBarsNotAPath:
+    """Five medians from one anchor. A line between them draws a journey
+    nobody measured, and invites a reader to see momentum in the gaps.
+    """
+
+    def svg(self) -> str:
+        html = render_preparation(
+            build_preparation(_event(PAST_EVENT), symbol="BTCUSDT", now=_now()),
+            ("BTCUSDT",),
+        )
+        return html.split('class="prep-chart')[1].split("</section>")[0]
+
+    def test_it_draws_bars(self) -> None:
+        assert "<rect" in self.svg()
+
+    def test_no_path_semantics_survive(self) -> None:
+        """G. Not just "there is no polyline" -- no line joining the horizons
+        at all, by any element."""
+        svg = self.svg()
+        assert "polyline" not in svg
+        assert "<path" not in svg
+        assert "prep-dot" not in svg
+
+    def test_it_says_so_in_words_as_well(self) -> None:
+        text = plain(self.svg())
+        assert "not a path any release followed" in text
+
+    def test_each_bar_carries_its_own_horizon_value(self) -> None:
+        """F. The bars are the independent medians, not a cumulative series."""
+        prep = build_preparation(_event(PAST_EVENT), symbol="BTCUSDT", now=_now())
+        svg = self.svg()
+        cohort = next(c for c in prep.scenarios if c.sample_size)
+        for name, label in WINDOW_LABELS.items():
+            median = cohort.windows[name].median_return_pct
+            assert f"at {label}: {median:+.1f}% median" in svg
+
+    def test_every_horizon_is_on_the_axis(self) -> None:
+        svg = self.svg()
+        for label in WINDOW_LABELS.values():
+            assert f">{label}</text>" in svg
+
+
+class TestTheMissingConsensusIsExplained:
+    """J and K. The biggest gap on the page, and the one most tempting to fill
+    with a number from somewhere.
+    """
+
+    def test_no_figure_is_invented_for_the_next_release(self) -> None:
+        from backtool.events.releases import load_releases
+
+        assert load_releases().get(NEXT_EVENT) is None
+        text = plain(
+            render_preparation(
+                build_preparation(_event(NEXT_EVENT), symbol="BTCUSDT", now=_now()),
+                ("BTCUSDT",),
+            )
+        )
+        assert "Consensus - " in text or "Consensus -" in text
+
+    def test_the_three_kinds_of_absence_are_distinguished(self) -> None:
+        """A dash means "no number here", which is the same appearance for a
+        forecast nobody has published, one we have not transcribed, and an
+        actual that cannot exist yet."""
+        from backtool.events.releases import ValueStatus, release_figures
+
+        upcoming = {f.label: f for f in release_figures(None, released=False)}
+        assert upcoming["Consensus"].status is ValueStatus.NOT_COLLECTED
+        assert upcoming["Actual"].status is ValueStatus.AWAITING_RELEASE
+        assert "not published until the release" in upcoming["Actual"].note
+
+    def test_a_status_never_claims_a_number_we_do_not_have(self) -> None:
+        """PUBLISHED means "we have it". A figure carrying that status beside
+        no value is the kind of thing a later caller trusts and a reader never
+        sees, so it is the kind worth pinning."""
+        from backtool.events.releases import ValueStatus, release_figures
+
+        for released in (True, False):
+            for figure in release_figures(None, released=released):
+                assert figure.status is not ValueStatus.PUBLISHED, figure.label
+                assert not figure.is_known
+
+    def test_an_actual_that_does_not_exist_is_not_called_a_gap(self) -> None:
+        """It is not missing from our data. It has not happened."""
+        text = plain(
+            render_preparation(
+                build_preparation(_event(NEXT_EVENT), symbol="BTCUSDT", now=_now()),
+                ("BTCUSDT",),
+            )
+        )
+        assert "not published until the release" in text
+
+    def test_a_disputed_consensus_is_shown_as_disputed(self) -> None:
+        """Rather than resolved by taking whichever source happens to be
+        stored first."""
+        from backtool.events.releases import (
+            ReleaseValues,
+            ValueStatus,
+            release_figures,
+        )
+
+        disputed = ReleaseValues(
+            event_id="X",
+            consensus_yoy=2.5,
+            actual_yoy=2.6,
+            consensus_verified=True,
+            consensus_conflict=True,
+        )
+        figures = {f.label: f for f in release_figures(disputed, released=True)}
+        assert figures["Consensus"].status is ValueStatus.DISPUTED
+        assert "disagree" in figures["Consensus"].note
+
+
+class TestTheSummaryCoversTheWholeSample:
+    """It compared cooler against hotter and stopped, which in this dataset
+    skipped the strongest of the three groups -- a true sentence leaving a
+    false impression, which is the worse kind.
+    """
+
+    def lines(self) -> str:
+        prep = build_preparation(_event(PAST_EVENT), symbol="BTCUSDT", now=_now())
+        return " ".join(what_to_watch_lines(prep))
+
+    def test_every_measurable_scenario_is_named(self) -> None:
+        prep = build_preparation(_event(PAST_EVENT), symbol="BTCUSDT", now=_now())
+        text = self.lines().lower()
+        for cohort in prep.scenarios:
+            if cohort.windows[HEADLINE_WINDOW].sample_size:
+                assert SCENARIO_LABELS[cohort.key].lower() in text
+
+    def test_they_are_ranked_by_outcome(self) -> None:
+        prep = build_preparation(_event(PAST_EVENT), symbol="BTCUSDT", now=_now())
+        text = self.lines()
+        ranked = sorted(
+            (c for c in prep.scenarios if c.windows[HEADLINE_WINDOW].sample_size),
+            key=lambda c: c.windows[HEADLINE_WINDOW].median_return_pct,
+            reverse=True,
+        )
+        seen = [text.index(SCENARIO_LABELS[c.key].lower()) for c in ranked]
+        assert seen == sorted(seen)
+
+    def test_the_counts_travel_with_the_medians(self) -> None:
+        """So a three-release median and a thirty-release one do not read
+        identically in the sentence people quote."""
+        prep = build_preparation(_event(PAST_EVENT), symbol="BTCUSDT", now=_now())
+        text = self.lines()
+        for cohort in prep.scenarios:
+            if cohort.windows[HEADLINE_WINDOW].sample_size:
+                assert f"n={cohort.sample_size}" in text
+
+    def test_the_smallest_group_is_called_out_when_it_is_too_small(self) -> None:
+        prep = build_preparation(_event(PAST_EVENT), symbol="BTCUSDT", now=_now())
+        smallest = min(prep.scenarios, key=lambda c: c.sample_size)
+        if not smallest.quality.needs_warning:
+            pytest.skip("no group small enough in the dataset as it stands")
+        assert "too few to describe a tendency" in self.lines()
 
 
 # --- N, O: nothing that worked before stopped --------------------------------

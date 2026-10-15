@@ -50,6 +50,14 @@ from backtool.core.types import EventType
 #: The single series every figure in this module describes.
 CPI_METRIC = "Headline CPI-U, all items, year-over-year, not seasonally adjusted"
 
+#: The same thing in the space a page header has.
+#:
+#: Worth a second constant rather than a truncation: a reader needs to know at
+#: a glance that 3.8% is a year-over-year headline figure and not core, and not
+#: month-over-month, because those surprise in different directions on the same
+#: morning. The full sentence is still quoted in the methodology.
+CPI_METRIC_SHORT = "Headline CPI, year-over-year"
+
 #: The file rows are read from.
 RELEASES_FILE = "releases.csv"
 
@@ -71,6 +79,141 @@ class CPIScenario(StrEnum):
     HOTTER = "hotter"
     IN_LINE = "in_line"
     COOLER = "cooler"
+
+
+class ValueStatus(StrEnum):
+    """Why a published figure is, or is not, on the page.
+
+    A dash means "we are not showing you a number", which is the same
+    appearance for several different facts. These are those facts.
+    """
+
+    #: We have it, from a verified source.
+    PUBLISHED = "published"
+    #: The release has not happened, so no actual exists anywhere yet. Not a
+    #: gap in our data -- the number does not exist.
+    AWAITING_RELEASE = "awaiting_release"
+    #: Forecasts exist in the world; this dataset has not been extended to this
+    #: release. Ours to fix, and the page says so rather than implying nobody
+    #: has one.
+    NOT_COLLECTED = "not_collected"
+    #: Recorded but not verified against a source, so not used.
+    UNVERIFIED = "unverified"
+    #: Sources disagree. Shown as disputed rather than resolved by picking the
+    #: one that happens to be stored.
+    DISPUTED = "disputed"
+
+
+@dataclass(frozen=True)
+class PublishedValue:
+    """One figure a release page shows, with why it is or is not there."""
+
+    label: str
+    value: float | None
+    status: ValueStatus
+    #: Reader-facing, and empty when the number speaks for itself.
+    note: str = ""
+    #: Where the figure came from, when there is one.
+    source: str = ""
+
+    @property
+    def is_known(self) -> bool:
+        return self.value is not None and self.status is ValueStatus.PUBLISHED
+
+
+def release_figures(
+    values: ReleaseValues | None, *, released: bool
+) -> tuple[PublishedValue, ...]:
+    """The three figures a reader looks for, each with its own standing.
+
+    Args:
+        values: What the dataset holds for this release, or ``None`` when it
+            holds nothing -- which happens for any release past the last one
+            transcribed, including the next one.
+        released: Whether the announcement instant has passed. An actual is
+            absent for two entirely different reasons either side of it.
+    """
+    if values is None:
+        gap = "not yet collected for this release"
+        return (
+            PublishedValue("Previous", None, ValueStatus.NOT_COLLECTED, gap),
+            PublishedValue("Consensus", None, ValueStatus.NOT_COLLECTED, gap),
+            # Either the figure does not exist yet or we have not transcribed
+            # it. Never PUBLISHED: a status saying we have the number, beside
+            # no number, is the kind of thing a later caller trusts and a
+            # reader never sees.
+            PublishedValue(
+                "Actual",
+                None,
+                ValueStatus.NOT_COLLECTED if released else ValueStatus.AWAITING_RELEASE,
+                gap if released else "not published until the release",
+            ),
+        )
+
+    return (
+        _figure("Previous", values.previous_yoy, values.actual_source),
+        _consensus_figure(values),
+        _actual_figure(values, released=released),
+    )
+
+
+def _figure(label: str, value: float | None, source: str) -> PublishedValue:
+    if value is None:
+        return PublishedValue(
+            label, None, ValueStatus.NOT_COLLECTED, "not recorded for this release"
+        )
+    return PublishedValue(label, value, ValueStatus.PUBLISHED, source=source)
+
+
+def _consensus_figure(values: ReleaseValues) -> PublishedValue:
+    """The forecast, and the three ways it can be absent.
+
+    Each is a different claim. "Nobody surveyed economists" is not what any of
+    them mean, and a page that said so by implication would be wrong about the
+    world rather than about itself.
+    """
+    if values.consensus_yoy is None:
+        return PublishedValue(
+            "Consensus",
+            None,
+            ValueStatus.NOT_COLLECTED,
+            "no verified forecast recorded for this release",
+        )
+    if values.consensus_conflict:
+        return PublishedValue(
+            "Consensus",
+            values.consensus_yoy,
+            ValueStatus.DISPUTED,
+            "sources disagree, so this release is not classified",
+            values.consensus_source,
+        )
+    if not values.consensus_verified:
+        return PublishedValue(
+            "Consensus",
+            values.consensus_yoy,
+            ValueStatus.UNVERIFIED,
+            "not verified against a source",
+            values.consensus_source,
+        )
+    return PublishedValue(
+        "Consensus",
+        values.consensus_yoy,
+        ValueStatus.PUBLISHED,
+        source=values.consensus_source,
+    )
+
+
+def _actual_figure(values: ReleaseValues, *, released: bool) -> PublishedValue:
+    if values.actual_yoy is None:
+        return PublishedValue(
+            "Actual",
+            None,
+            ValueStatus.PUBLISHED if released else ValueStatus.AWAITING_RELEASE,
+            "not recorded yet" if released else "not published until the release",
+        )
+    return PublishedValue(
+        "Actual", values.actual_yoy, ValueStatus.PUBLISHED, source=values.actual_source
+    )
 
 
 class ConsensusMethod(StrEnum):
@@ -382,6 +525,10 @@ def _method(raw: str | None) -> ConsensusMethod | None:
 
 __all__ = [
     "CPI_METRIC",
+    "CPI_METRIC_SHORT",
+    "PublishedValue",
+    "ValueStatus",
+    "release_figures",
     "SCENARIO_ORDER",
     "SCENARIO_RULES",
     "CPIScenario",
