@@ -194,6 +194,29 @@ class TestTheRefreshFillsGapsAndNothingElse:
             y2025m08=323.976,
         )
 
+    def test_the_real_upcoming_release_has_its_previous(self) -> None:
+        """Against the shipped file rather than a fixture: the next release is
+        the page this exists to fix."""
+        from backtool.core.types import EventType as _EventType
+        from backtool.events import load_events as _load_events
+
+        now = dt.datetime.now(tz=dt.UTC)
+        upcoming = sorted(
+            (
+                item
+                for item in _load_events(_EventType.CPI)
+                if item.timestamp_utc > now
+            ),
+            key=lambda item: item.timestamp_utc,
+        )
+        if not upcoming:
+            pytest.skip("no CPI release ahead in the calendar")
+        values = load_releases().get(upcoming[0].event_id)
+        assert values is not None, "the refresh has reached the next release"
+        assert values.previous_yoy is not None
+        assert values.actual_yoy is None
+        assert values.consensus_yoy is None
+
     def test_it_adds_a_release_the_file_had_not_reached(self) -> None:
         report = refresh_releases(
             existing={},
@@ -304,17 +327,86 @@ class TestTheRefreshFillsGapsAndNothingElse:
         assert after.consensus_verified
         assert after.consensus_source == "https://example.invalid/forecast"
 
-    def test_a_release_that_has_not_happened_gets_no_row(self) -> None:
-        """An empty row would turn "not yet" into "we are missing this", which
-        is the distinction the page's figure statuses exist to keep."""
+    def test_an_upcoming_release_gets_its_previous_figure(self) -> None:
+        """The page a trader actually opens is the next release, and its
+        previous is simply the last figure published -- knowable now, and one
+        of the three numbers they came for. An earlier version skipped every
+        future release and left that page showing three dashes.
+        """
         report = refresh_releases(
             existing={},
-            calendar=[event("CPI-2026-12-10", dt.datetime(2026, 12, 10, 13, 30, tzinfo=dt.UTC))],
+            calendar=[
+                event("CPI-2026-11-10", dt.datetime(2026, 11, 10, 13, 30, tzinfo=dt.UTC))
+            ],
             levels=self.table(),
             now=NOW,
         )
-        assert report.changes == ()
+        assert [c.change for c in report.changes] == [Change.ADDED]
+        added = report.rows["CPI-2026-11-10"]
+        assert added.previous_yoy == 3.7
+        assert added.actual_yoy is None
+
+    def test_an_upcoming_release_never_carries_an_actual(self) -> None:
+        """Even where BLS already holds the month. Before the print the figure
+        does not exist as a release, and publishing it early here would put a
+        number on the page nobody has announced."""
+        ahead = dict(self.table())
+        ahead.update(levels(y2026m10=338.0, y2025m10=326.0))
+        report = refresh_releases(
+            existing={},
+            calendar=[
+                event("CPI-2026-11-10", dt.datetime(2026, 11, 10, 13, 30, tzinfo=dt.UTC))
+            ],
+            levels=ahead,
+            now=NOW,
+        )
+        added = report.rows["CPI-2026-11-10"]
+        assert added.actual_yoy is None
+        assert not added.first_release_verified
+        assert added.actual_source == "", "no source is claimed for a figure not held"
+
+    def test_a_release_whose_previous_is_unpublished_waits(self) -> None:
+        """December reports November, whose previous is October -- published
+        with the November release. Nothing to put in the row yet."""
+        report = refresh_releases(
+            existing={},
+            calendar=[
+                event("CPI-2026-12-10", dt.datetime(2026, 12, 10, 13, 30, tzinfo=dt.UTC))
+            ],
+            levels=self.table(),
+            now=NOW,
+        )
+        assert [c.change for c in report.changes] == [Change.AWAITING_DATA]
         assert report.rows == {}
+
+    def test_the_actual_arrives_once_the_release_happens(self) -> None:
+        """The row filled in two passes: previous before, actual after."""
+        before = refresh_releases(
+            existing={},
+            calendar=[
+                event("CPI-2026-10-14", dt.datetime(2026, 10, 14, 12, 30, tzinfo=dt.UTC))
+            ],
+            levels=self.table(),
+            now=dt.datetime(2026, 10, 1, tzinfo=dt.UTC),
+        )
+        waiting = before.rows["CPI-2026-10-14"]
+        assert waiting.previous_yoy == 3.4
+        assert waiting.actual_yoy is None
+
+        after = refresh_releases(
+            existing=before.rows,
+            calendar=[
+                event("CPI-2026-10-14", dt.datetime(2026, 10, 14, 12, 30, tzinfo=dt.UTC))
+            ],
+            levels=self.table(),
+            now=NOW,
+        )
+        assert after.of(Change.FILLED)
+        filled = after.rows["CPI-2026-10-14"]
+        assert filled.actual_yoy == 3.7
+        assert filled.previous_yoy == 3.4
+        assert filled.first_release_verified
+        assert filled.actual_source == CPI_SERIES_URL
 
     def test_a_month_bls_has_not_published_is_reported_not_filled(self) -> None:
         report = refresh_releases(

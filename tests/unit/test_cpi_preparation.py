@@ -679,9 +679,12 @@ class TestMissingValuesDoNotBreakThePage:
         text = plain(response.text)
         assert "Consensus" in text
         # Said as the specific thing it is. "Unavailable" would cover a
-        # forecast nobody has published and one we simply have not transcribed,
-        # and only the second is ours to fix.
-        assert "not yet collected for this release" in text
+        # forecast nobody has published and one we simply have not
+        # transcribed, and only the second is ours to fix.
+        assert "no verified forecast recorded for this release" in text
+        # And the two figures around it are no longer blank, which is the
+        # whole point of wiring BLS in.
+        assert "not published until the release" in text
 
     def test_consensus_is_never_invented(self, client: TestClient) -> None:
         """The upcoming release has no published consensus in our data. A
@@ -991,9 +994,16 @@ class TestTheMissingConsensusIsExplained:
     """
 
     def test_no_figure_is_invented_for_the_next_release(self) -> None:
+        """The row now exists -- `refresh-cpi` fills its previous from the
+        published series -- so the thing to pin is no longer "there is no row".
+        It is that the one number nobody publishes is still absent."""
         from backtool.events.releases import load_releases
 
-        assert load_releases().get(NEXT_EVENT) is None
+        values = load_releases().get(NEXT_EVENT)
+        assert values is not None
+        assert values.consensus_yoy is None
+        assert values.actual_yoy is None
+        assert values.previous_yoy is not None
         text = plain(
             render_preparation(
                 build_preparation(_event(NEXT_EVENT), symbol="BTCUSDT", now=_now()),

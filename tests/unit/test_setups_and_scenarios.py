@@ -308,12 +308,19 @@ class TestScenarioClassification:
 
     def test_every_row_is_well_formed(self) -> None:
         """What the count was standing in for. A row that parsed into nothing
-        would pass a length check and break every cohort."""
+        would pass a length check and break every cohort.
+
+        An actual is required only of a release that has happened. The file now
+        also carries the next one, which has its previous figure and cannot
+        have an actual -- that absence is the schedule, not a gap.
+        """
+        today = dt.date.today()
         for event_id, entry in load_releases().items():
             assert entry.event_id == event_id
             assert entry.release_date is not None, event_id
             assert entry.reference_month, event_id
-            assert entry.actual_yoy is not None, event_id
+            if entry.release_date <= today:
+                assert entry.actual_yoy is not None, event_id
 
     def test_enough_releases_are_classifiable_to_split(self) -> None:
         """The property the dataset exists for. Rows without a verified
@@ -478,7 +485,23 @@ class TestScenarioDataset:
                 assert values.actual_source.startswith("http")
 
     def test_all_actuals_are_first_release_verified(self) -> None:
-        assert all(v.first_release_verified for v in load_releases().values())
+        """Scoped to what the name says: rows that *have* an actual.
+
+        The file now also carries the next release, which has its previous
+        figure and no actual yet. Marking that one verified would claim a
+        first-release reading for a release that has not happened.
+        """
+        with_actual = [v for v in load_releases().values() if v.actual_yoy is not None]
+        assert with_actual
+        assert all(v.first_release_verified for v in with_actual)
+
+    def test_a_row_without_an_actual_claims_nothing_about_one(self) -> None:
+        """The other half. A pending row must not carry a source or a
+        verification flag for a figure it does not hold."""
+        for values in load_releases().values():
+            if values.actual_yoy is None:
+                assert not values.first_release_verified, values.event_id
+                assert values.actual_source == "", values.event_id
 
 
 class TestReactionWindows:

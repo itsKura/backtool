@@ -94,9 +94,10 @@ def refresh_releases(
             is missing. A file with no row for next month is not incomplete
             until the calendar says that release happened.
         levels: Published index levels by ``(year, month)``.
-        now: The current instant. A release in the future gets no row: there is
-            nothing to put in it, and an empty row would turn "not yet" into
-            "we are missing this".
+        now: The current instant, which decides whether an actual can exist
+            yet. It does not decide whether a row can: the *previous* figure
+            for a release still weeks away is simply the last one published,
+            and it is one of the three numbers somebody opens the page to see.
 
     Returns:
         The rows as they would be, and a line per release explaining itself.
@@ -105,20 +106,23 @@ def refresh_releases(
     changes: list[RowChange] = []
 
     for event in sorted(calendar, key=lambda item: item.timestamp_utc):
-        if event.timestamp_utc > now:
-            continue
-
         release_date = event.timestamp_utc.date()
         year, month = reference_month(release_date)
-        actual = year_over_year(levels, year, month)
         previous = year_over_year(levels, *_month_before(year, month))
+        # An actual cannot exist before the release, whatever BLS holds.
+        actual = (
+            year_over_year(levels, year, month)
+            if event.timestamp_utc <= now
+            else None
+        )
 
-        if actual is None:
+        if actual is None and previous is None:
             changes.append(
                 RowChange(
                     event.event_id,
                     Change.AWAITING_DATA,
-                    f"BLS has not published {year}-{month:02d} yet",
+                    f"BLS has published neither {year}-{month:02d} nor the "
+                    "month before it",
                 )
             )
             continue
@@ -128,13 +132,11 @@ def refresh_releases(
             rows[event.event_id] = _new_row(
                 event.event_id, release_date, year, month, actual, previous
             )
+            figures = [f"actual {actual:.1f}%"] if actual is not None else []
+            if previous is not None:
+                figures.append(f"previous {previous:.1f}%")
             changes.append(
-                RowChange(
-                    event.event_id,
-                    Change.ADDED,
-                    f"actual {actual:.1f}%"
-                    + (f", previous {previous:.1f}%" if previous is not None else ""),
-                )
+                RowChange(event.event_id, Change.ADDED, ", ".join(figures))
             )
             continue
 
@@ -145,7 +147,7 @@ def refresh_releases(
 
 def _reconcile(
     current: ReleaseValues,
-    actual: float,
+    actual: float | None,
     previous: float | None,
     rows: dict[str, ReleaseValues],
 ) -> RowChange:
@@ -154,9 +156,17 @@ def _reconcile(
     A disagreement is reported rather than resolved. Two things produce one --
     a transcription error and a revision -- and they want opposite responses,
     so the refresh stops and says what it found.
+
+    ``actual`` is ``None`` for a release that has not happened, where there is
+    nothing to compare and nothing to fill. Its *previous* can still arrive, so
+    the row is still worth visiting.
     """
     disagreements: list[str] = []
-    if current.actual_yoy is not None and not _same(current.actual_yoy, actual):
+    if (
+        actual is not None
+        and current.actual_yoy is not None
+        and not _same(current.actual_yoy, actual)
+    ):
         disagreements.append(f"actual stored {current.actual_yoy:.1f}%, BLS {actual:.1f}%")
     if (
         previous is not None
@@ -171,7 +181,7 @@ def _reconcile(
 
     filled: list[str] = []
     updated = current
-    if current.actual_yoy is None:
+    if actual is not None and current.actual_yoy is None:
         updated = replace(
             updated,
             actual_yoy=actual,
@@ -195,7 +205,7 @@ def _new_row(
     release_date: dt.date,
     year: int,
     month: int,
-    actual: float,
+    actual: float | None,
     previous: float | None,
 ) -> ReleaseValues:
     """A row for a release the file had not reached.
@@ -206,7 +216,13 @@ def _new_row(
     its history table without adding them to the statistics -- which is
     correct, and worth knowing before anybody wonders why the counts held
     still.
+
+    An upcoming release gets a row too, carrying its previous figure and no
+    actual. The two absences are different and the page already renders them
+    differently: a missing actual before the print is "not published until the
+    release", not a gap in this dataset.
     """
+    carries_actual = actual is not None
     return ReleaseValues(
         event_id=event_id,
         source_id=event_id.lower().replace("-", "_"),
@@ -215,13 +231,21 @@ def _new_row(
         previous_yoy=previous,
         consensus_yoy=None,
         actual_yoy=actual,
-        actual_source=CPI_SERIES_URL,
-        first_release_verified=True,
+        # Provenance belongs to a figure, not to an intention. A row still
+        # waiting for its actual claims no source for it.
+        actual_source=CPI_SERIES_URL if carries_actual else "",
+        first_release_verified=carries_actual,
         consensus_verified=False,
         notes=(
             f"{dt.date(year, month, 1):%B %Y} reference month. "
-            "Actual and previous from the BLS published series; no consensus "
-            "recorded, so this release is not sorted into a scenario."
+            + (
+                "Actual and previous from the BLS published series"
+                if carries_actual
+                else "Previous from the BLS published series; actual is not "
+                "published until the release"
+            )
+            + "; no consensus recorded, so this release is not sorted into a "
+            "scenario."
         ),
     )
 
