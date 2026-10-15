@@ -146,6 +146,40 @@ class TestEventRoutes:
         assert "Expected" in html
         assert 'class="expect-value">&mdash;' in html
 
+    def test_a_cpi_event_shows_the_figures_it_has(
+        self, client: TestClient
+    ) -> None:
+        """The row printed three dashes over figures sitting in the repository.
+        Nobody noticed while the preparation page was a click away from every
+        card; taking that button off past releases left the placeholder as the
+        only thing a reader sees."""
+        from backtool.events.releases import load_releases
+
+        values = load_releases()["CPI-2026-09-11"]
+        assert values.actual_yoy is not None
+        html = client.get("/event/CPI-2026-09-11").text
+        assert f"{values.actual_yoy:.1f}%" in html
+        assert f"{values.previous_yoy:.1f}%" in html  # type: ignore[union-attr]
+
+    def test_a_cpi_event_names_the_absence_it_has(
+        self, client: TestClient
+    ) -> None:
+        """A figure we do not hold says which kind of absence it is, rather
+        than leaving a reader to guess between "nobody published it" and "we
+        have not got to it"."""
+        html = client.get("/event/CPI-2026-10-14").text
+        assert "no verified forecast recorded for this release" in html
+
+    def test_an_untracked_event_type_borrows_no_wording_from_cpi(
+        self, client: TestClient
+    ) -> None:
+        """The values file covers one event type. Giving an FOMC decision a
+        row reading "Consensus -- not yet collected" would promise a dataset
+        nobody is building."""
+        html = client.get("/event/FOMC-2026-06-17").text
+        assert "not yet collected for this release" not in html
+        assert "Expected" in html
+
     def test_no_development_terminology_reaches_the_page(
         self, client: TestClient
     ) -> None:

@@ -183,7 +183,7 @@ async def event_detail(event_id: str, symbol: str = "BTCUSDT") -> HTMLResponse:
     body = (
         render_event_header(event, now=now)
         + (render_upcoming_notice(event) if upcoming else "")
-        + render_expectations()
+        + render_expectations(event, now=now)
         + render_asset_selector(event, SYMBOLS, chosen)
         + render_price_chart(event, chosen, available=not upcoming)
         + '<section class="reaction" id="reaction-summary">'

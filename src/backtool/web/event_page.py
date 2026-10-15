@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape
 
 from backtool.core.time import NEW_YORK, utc_to_local
-from backtool.core.types import Interval
+from backtool.core.types import EventType, Interval
 from backtool.events.meta import meta_for
 from backtool.events.models import MarketEvent
 from backtool.research.windows import (
@@ -351,7 +351,23 @@ def _clock(local: dt.datetime) -> str:
 #: Hover text for each expectations cell. All three are unavailable today, but
 #: for different reasons, and the difference is the honest part: two are a
 #: wiring job against a public agency feed, one has no free source at all.
-_EXPECTATION_CELLS: tuple[tuple[str, str], ...] = (
+#: What each cell means, for the tooltip. Keyed by the label the figure
+#: carries, so a renamed figure takes its explanation with it.
+_EXPECTATION_HINTS: dict[str, str] = {
+    "Previous": "The figure published at the preceding release.",
+    "Consensus": (
+        "Consensus forecasts are compiled by commercial survey providers and "
+        "are not available under a free licence, so none is shown unless one "
+        "has been transcribed by hand from a cited source."
+    ),
+    "Actual": "The figure published at the release instant.",
+}
+
+
+#: The row for an event type whose published figures this product does not
+#: track. Generic on purpose: an FOMC decision has no previous CPI print, and
+#: borrowing CPI's wording for it would describe a dataset that does not exist.
+_UNTRACKED_CELLS: tuple[tuple[str, str], ...] = (
     ("Previous", "The figure published at the preceding release."),
     (
         "Expected",
@@ -363,19 +379,49 @@ _EXPECTATION_CELLS: tuple[tuple[str, str], ...] = (
 )
 
 
-def render_expectations() -> str:
-    """Previous, expected and actual for this release.
+def render_expectations(event: MarketEvent, *, now: dt.datetime) -> str:
+    """Previous, consensus and actual for this release.
 
-    All three read as em dashes today, and stating that is better than omitting
-    the row: a reader can see what the product tracks and that it has nothing
-    yet, rather than wondering whether it was measured and found to be nothing.
+    These read as three em dashes for a long time, and the row said so on
+    purpose: better to show what the product tracks and that it has nothing
+    than to omit it and leave a reader wondering whether it was measured.
+
+    That stopped being true for CPI once the values file was wired up, and the
+    row did not notice -- it kept printing dashes over figures sitting in the
+    repository. It reads them now, through the same seam the preparation page
+    uses, so an absent figure says *which* absence it is rather than leaving a
+    reader to guess between "nobody published it" and "we have not got to it".
+
+    Only CPI. The values file covers one event type, and giving an FOMC
+    decision a row labelled "Consensus &mdash; not yet collected" would promise
+    a dataset nobody is building.
     """
-    rendered = "".join(
-        f'<div class="expect-cell" title="{escape(hint)}">'
-        f'<span class="expect-label">{escape(label)}</span>'
-        '<span class="expect-value">&mdash;</span></div>'
-        for label, hint in _EXPECTATION_CELLS
+    if event.curated_type is not EventType.CPI:
+        rendered = "".join(
+            f'<div class="expect-cell expect-cell-missing" title="{escape(hint)}">'
+            f'<span class="expect-label">{escape(label)}</span>'
+            '<span class="expect-value">&mdash;</span></div>'
+            for label, hint in _UNTRACKED_CELLS
+        )
+        return f'<div class="expectations">{rendered}</div>'
+
+    from backtool.events.releases import load_releases, release_figures
+
+    figures = release_figures(
+        load_releases().get(event.event_id),
+        released=event.timestamp_utc <= now,
     )
+
+    rendered = ""
+    for figure in figures:
+        hint = figure.note or _EXPECTATION_HINTS.get(figure.label, "")
+        value = f"{figure.value:.1f}%" if figure.value is not None else "&mdash;"
+        missing = "" if figure.is_known else " expect-cell-missing"
+        rendered += (
+            f'<div class="expect-cell{missing}" title="{escape(hint)}">'
+            f'<span class="expect-label">{escape(figure.label)}</span>'
+            f'<span class="expect-value">{value}</span></div>'
+        )
     return f'<div class="expectations">{rendered}</div>'
 
 
@@ -1197,6 +1243,10 @@ EVENT_STYLE = """
 .chart-switch button[aria-selected="true"] { background: var(--surface-0);
                                              color: var(--text-primary); }
 .chart-view[hidden] { display: none; }
+/* A figure we do not have reads as quieter than one we do, rather than as
+   a fault. Its tooltip says which kind of absence it is. */
+.expect-cell-missing .expect-value { color: var(--text-muted); }
+
 .chart-note { color: var(--text-muted); font-size: 12px; margin: 4px 0 0;
               max-width: 70ch; }
 
