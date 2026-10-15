@@ -264,6 +264,87 @@ def _cmd_cache(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 
+def _cmd_refresh_cpi(args: argparse.Namespace) -> int:
+    """Fill the release file from the published BLS series.
+
+    Actual and previous only. Consensus is a survey somebody sells, so no
+    agency publishes it and nothing here invents one -- a release this adds
+    arrives without a forecast and is therefore excluded from the scenario
+    cohorts rather than counted as in line.
+    """
+    import datetime as dt
+
+    from backtool.core.types import EventType
+    from backtool.data.bls import BLSClient, BLSError
+    from backtool.events import load_events
+    from backtool.events.cpi_refresh import Change, refresh_releases
+    from backtool.events.releases import load_releases, releases_path, to_csv
+
+    now = dt.datetime.now(tz=dt.UTC)
+    existing = load_releases()
+    calendar = [
+        event
+        for event in load_events(EventType.CPI)
+        if event.curated_type is EventType.CPI
+    ]
+
+    try:
+        with BLSClient() as client:
+            span = min(client.max_years, now.year - 2015)
+            levels = client.index_by_month(
+                start_year=now.year - span + 1, end_year=now.year
+            )
+    except BLSError as exc:
+        print(f"Could not read the BLS series: {exc}")
+        return 1
+
+    report = refresh_releases(
+        existing=existing, calendar=calendar, levels=levels, now=now
+    )
+
+    for change in report.changes:
+        if change.is_notable:
+            print(f"  {change.change.value:<14} {change.event_id}  {change.detail}")
+
+    added = len(report.of(Change.ADDED))
+    filled = len(report.of(Change.FILLED))
+    waiting = len(report.of(Change.AWAITING_DATA))
+    print(
+        f"{chr(10)}{len(report.changes)} release(s) examined: "
+        f"{added} to add, {filled} to fill, {waiting} awaiting BLS, "
+        f"{len(report.of(Change.UNCHANGED))} already correct."
+    )
+
+    if report.has_conflicts:
+        # Two things produce a disagreement -- a transcription error and a
+        # revision -- and they want opposite responses. Resolving it here would
+        # destroy the evidence needed to tell them apart.
+        print(
+            f"{chr(10)}Stopping: stored figures disagree with the published "
+            "series, listed above. Nothing was written. Check whether the row "
+            "was mistyped or the series was revised, then fix it by hand."
+        )
+        return 1
+
+    if not report.wrote_anything:
+        print("Nothing to do.")
+        return 0
+
+    if not args.write:
+        print(f"{chr(10)}Dry run. Pass --write to apply this to the release file.")
+        return 0
+
+    path = releases_path()
+    path.write_text(to_csv(report.rows), encoding="utf-8")
+    print(f"{chr(10)}Wrote {path}.")
+    print(
+        "Consensus is untouched -- no public source publishes it -- so any "
+        "release added above is in the header and the history table, and not "
+        "in the scenario statistics."
+    )
+    return 0
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     """Start the web interface."""
     from backtool.web import serve
@@ -342,6 +423,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     cache = subparsers.add_parser("cache", help="show what is stored locally")
     cache.set_defaults(func=_cmd_cache)
+
+    refresh = subparsers.add_parser(
+        "refresh-cpi",
+        help="fill actual and previous in the release file from BLS",
+    )
+    refresh.add_argument(
+        "--write",
+        action="store_true",
+        help="apply the changes; without it the command only reports them",
+    )
+    refresh.set_defaults(func=_cmd_refresh_cpi)
 
     serve = subparsers.add_parser("serve", help="run the web interface")
     serve.add_argument("--host", default="127.0.0.1")

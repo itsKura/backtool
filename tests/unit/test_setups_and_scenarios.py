@@ -294,9 +294,40 @@ class TestScenarioClassification:
         )
 
     def test_the_dataset_loads(self) -> None:
+        """What the count has to be is "enough to split", not a literal.
+
+        The file used to be typed by hand and 27 was a fact about it. It is
+        now extended by `backtool refresh-cpi` as releases happen, so a literal
+        count is a test that fails every month for the one reason that is not a
+        regression -- and gets edited to the new number each time until nobody
+        reads it.
+        """
         values = load_releases()
-        assert len(values) == 27
+        assert len(values) >= 27
         assert "CPI-2026-09-11" in values
+
+    def test_every_row_is_well_formed(self) -> None:
+        """What the count was standing in for. A row that parsed into nothing
+        would pass a length check and break every cohort."""
+        for event_id, entry in load_releases().items():
+            assert entry.event_id == event_id
+            assert entry.release_date is not None, event_id
+            assert entry.reference_month, event_id
+            assert entry.actual_yoy is not None, event_id
+
+    def test_enough_releases_are_classifiable_to_split(self) -> None:
+        """The property the dataset exists for. Rows without a verified
+        consensus are expected -- the refresh adds them, since no public source
+        publishes a forecast -- but the classified set must stay large enough
+        to produce the three cohorts the page is built on."""
+        values = load_releases()
+        classified = [v for v in values.values() if classify_cpi(v) is not None]
+        assert len(classified) >= 20
+        assert {classify_cpi(v)[0] for v in classified} == {  # type: ignore[index]
+            "hotter",
+            "in_line",
+            "cooler",
+        }
 
     def test_strict_three_way_comparison(self) -> None:
         assert classify_cpi(self._values(3.0, 2.9))[0] == "hotter"  # type: ignore[index]

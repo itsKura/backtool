@@ -39,11 +39,13 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import io
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import lru_cache
 from importlib import resources
+from pathlib import Path
 
 from backtool.core.types import EventType
 
@@ -483,6 +485,86 @@ def load_releases() -> dict[str, ReleaseValues]:
     return values
 
 
+#: The file's column order, which is also the order a row is written back in.
+#:
+#: Named once and used by both the writer and the header check, so a column
+#: added to the file and forgotten here fails loudly instead of being dropped
+#: from every row the refresh touches.
+RELEASE_COLUMNS: tuple[str, ...] = (
+    "event_id",
+    "release_date",
+    "reference_month",
+    "previous_yoy",
+    "consensus_yoy",
+    "actual_yoy",
+    "actual_source",
+    "consensus_source",
+    "consensus_quote_or_paraphrase",
+    "first_release_verified",
+    "consensus_verified",
+    "consensus_method",
+    "consensus_conflict",
+    "notes",
+)
+
+
+def releases_path() -> Path:
+    """Where the file actually lives, for a writer that has to edit it."""
+    return Path(str(resources.files("backtool.events.data").joinpath(RELEASES_FILE)))
+
+
+def to_csv(values: dict[str, ReleaseValues]) -> str:
+    """Render rows as the file, newest release first.
+
+    Newest first because that is the order the file is already in, and a
+    refresh that reordered it would turn every run into a whole-file diff with
+    the one changed row buried in it.
+
+    Round-trips: everything written here is parsed back by
+    :func:`load_releases` into the values it came from. A missing figure is
+    written as ``NULL`` rather than blank, matching what the file already does
+    and keeping "we have no consensus" visibly different from an empty cell
+    somebody forgot to fill.
+    """
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=RELEASE_COLUMNS, lineterminator=chr(10))
+    writer.writeheader()
+    for row in sorted(
+        values.values(),
+        key=lambda item: (item.release_date or dt.date.min),
+        reverse=True,
+    ):
+        writer.writerow(_as_row(row))
+    return buffer.getvalue()
+
+
+def _as_row(value: ReleaseValues) -> dict[str, str]:
+    return {
+        "event_id": value.source_id or value.event_id.lower().replace("-", "_"),
+        "release_date": value.release_date.isoformat() if value.release_date else "",
+        "reference_month": value.reference_month,
+        "previous_yoy": _pct_cell(value.previous_yoy),
+        "consensus_yoy": _pct_cell(value.consensus_yoy),
+        "actual_yoy": _pct_cell(value.actual_yoy),
+        "actual_source": value.actual_source,
+        "consensus_source": value.consensus_source or "NULL",
+        "consensus_quote_or_paraphrase": value.consensus_quote or "NULL",
+        "first_release_verified": _flag_cell(value.first_release_verified),
+        "consensus_verified": _flag_cell(value.consensus_verified),
+        "consensus_method": value.consensus_method.value if value.consensus_method else "",
+        "consensus_conflict": _flag_cell(value.consensus_conflict),
+        "notes": value.notes,
+    }
+
+
+def _pct_cell(value: float | None) -> str:
+    return "NULL" if value is None else f"{value:.1f}%"
+
+
+def _flag_cell(value: bool) -> str:
+    return "true" if value else "false"
+
+
 def _percent(raw: str | None) -> float | None:
     """Parse ``3.4%`` into ``3.4``. Blank and ``NULL`` are missing, not zero.
 
@@ -525,6 +607,9 @@ def _method(raw: str | None) -> ConsensusMethod | None:
 
 __all__ = [
     "CPI_METRIC",
+    "RELEASE_COLUMNS",
+    "releases_path",
+    "to_csv",
     "CPI_METRIC_SHORT",
     "PublishedValue",
     "ValueStatus",
