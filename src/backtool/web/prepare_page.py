@@ -32,7 +32,7 @@ sentence a reader refreshes once and then stops reading.
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from urllib.parse import quote
 from xml.sax.saxutils import escape
 
@@ -58,12 +58,14 @@ from backtool.research.metrics import WindowMetrics
 from backtool.research.preparation import (
     CONTEXT_LABELS,
     CONTEXT_WINDOWS,
+    ENTERED_DOWN,
     ENTRY_WINDOW,
     MarketContext,
     baseline_cohort,
     build_market_context,
     cohort_for_entry,
     entry_cohorts,
+    intersection_cohorts,
 )
 from backtool.research.results import EventResult, StudyResult
 from backtool.research.runner import run_study
@@ -153,6 +155,10 @@ class Preparation:
     entry_match: Cohort | None
     all_values: dict[str, ReleaseValues]
     reaction: dict[str, object] | None = None
+    #: Scenario cohorts narrowed to releases the asset entered as today's is,
+    #: keyed by scenario. A scenario absent from this map had no release
+    #: matching both conditions, which the page states rather than omits.
+    intersections: dict[str, Cohort] = field(default_factory=dict)
 
     @property
     def entry_return_pct(self) -> float | None:
@@ -260,9 +266,31 @@ def build_preparation(
         all_values=values,
         reaction=_reaction_for(study, event, now) if released else None,
     )
-    # Selected after the rest is assembled, because which 24 hours count
+    # Both selected after the rest is assembled, because which 24 hours count
     # depends on whether the release has happened.
-    return replace(prep, entry_match=_match_for(study, prep))
+    return replace(
+        prep,
+        entry_match=_match_for(study, prep),
+        intersections=_intersections_for(study, prep, values),
+    )
+
+
+def _comparable(study: StudyResult, prep: Preparation) -> StudyResult:
+    """The releases this one may be compared against.
+
+    Itself removed, once it has happened. A comparison set containing the thing
+    it is explaining is not a comparison, and it pulls that release's own
+    outcome into the median it is being read against.
+    """
+    if not prep.released:
+        return study
+    return study.model_copy(
+        update={
+            "events": tuple(
+                item for item in study.events if item.event_id != prep.event.event_id
+            )
+        }
+    )
 
 
 def _match_for(study: StudyResult, prep: Preparation) -> Cohort | None:
@@ -270,9 +298,7 @@ def _match_for(study: StudyResult, prep: Preparation) -> Cohort | None:
 
     Delegates to :func:`cohort_for_entry` before the print, where the run-up to
     now is the reading. Afterwards the release has its own measured entry, so
-    the cohort is chosen by that instead -- and the page's own release is
-    excluded from the group it is being compared against, because a set that
-    contains the thing it is explaining is not a comparison.
+    the cohort is chosen by that instead.
     """
     direction = prep.entry_direction
     if direction is None:
@@ -280,16 +306,36 @@ def _match_for(study: StudyResult, prep: Preparation) -> Cohort | None:
     if not prep.released:
         return cohort_for_entry(study, prep.context)
 
-    wanted = "entered_down" if direction == "down" else "entered_up"
-    others = study.model_copy(
-        update={
-            "events": tuple(
-                item for item in study.events if item.event_id != prep.event.event_id
-            )
-        }
-    )
+    wanted = "entered_down" if direction == ENTERED_DOWN else "entered_up"
     return next(
-        (cohort for cohort in entry_cohorts(others) if cohort.key == wanted), None
+        (
+            cohort
+            for cohort in entry_cohorts(_comparable(study, prep))
+            if cohort.key == wanted
+        ),
+        None,
+    )
+
+
+def _intersections_for(
+    study: StudyResult, prep: Preparation, values: dict[str, ReleaseValues]
+) -> dict[str, Cohort]:
+    """Each scenario, narrowed to releases the asset entered as this one is.
+
+    The CPI rule passed here is the identical callable the scenario cards use,
+    bound to the identical values file, so the narrowed group cannot drift from
+    the group it claims to be part of.
+    """
+    direction = prep.entry_direction
+    if direction is None:
+        return {}
+    rule = SCENARIO_RULES[EventType.CPI]
+
+    def scenario(event: EventResult) -> tuple[str, str, str] | None:
+        return rule(values.get(event.event_id))
+
+    return intersection_cohorts(
+        _comparable(study, prep), scenario=scenario, direction=direction
     )
 
 
@@ -359,6 +405,7 @@ def render_preparation(prep: Preparation, symbols: tuple[str, ...]) -> str:
         + render_reaction(prep)
         + _what_to_watch(prep)
         + _context_section(prep)
+        + _similar_scenarios(prep)
         + _scenario_section(prep)
         + _horizon_chart(prep)
         + _occurrences(prep)
@@ -582,6 +629,133 @@ def _asset_row(prep: Preparation, symbols: tuple[str, ...]) -> str:
     )
 
 
+def _similar_scenarios(prep: Preparation) -> str:
+    """Each CPI outcome, narrowed to setups resembling this one.
+
+    The question people actually ask with both halves at once. Placed under the
+    setup panel because it is that panel's question made specific, and above
+    the playbook because the playbook is the wider sample to fall back on when
+    one of these runs thin -- which, over a dataset of this size, several do.
+    """
+    direction = prep.entry_direction
+    if direction is None or not prep.scenarios:
+        return ""
+
+    name = SYMBOL_NAMES.get(prep.symbol, prep.symbol)
+    moved = "falling" if direction == ENTERED_DOWN else "rising"
+    verb = "went into this release" if prep.released else "is entering this release"
+    entry = prep.entry_return_pct
+    reading = (
+        f"<strong>{'down' if direction == ENTERED_DOWN else 'up'} "
+        f"{abs(entry):.1f}%</strong>"
+        if entry is not None
+        else "<strong>" + moved + "</strong>"
+    )
+
+    rows = "".join(
+        _intersection_row(prep, cohort) for cohort in prep.scenarios
+    )
+    return (
+        '<section class="prep-similar-scenarios">'
+        "<h2>Similar historical setups</h2>"
+        f'<p class="section-sub">{escape(name)} {verb} {reading} over the '
+        f"previous 24 hours. These are past releases the asset also went into "
+        f"{moved}, grouped by how the figure landed &mdash; both conditions at "
+        "once, which is narrower than either section around it.</p>"
+        '<div class="prep-scroll panel-card">'
+        '<table class="prep-table"><thead><tr>'
+        "<th>If CPI lands</th><th>n</th><th>1h</th><th>4h</th><th>24h</th>"
+        "<th>Positive</th><th>Best</th><th>Worst</th>"
+        "<th>vs that scenario overall</th>"
+        f"</tr></thead><tbody>{rows}</tbody></table></div>"
+        '<p class="muted">Historical observations from this sample only. The '
+        "groups above are small; several are too small to describe a tendency, "
+        "and none of this is a forecast.</p>"
+        "</section>"
+    )
+
+
+def _intersection_row(prep: Preparation, scenario: Cohort) -> str:
+    """One scenario narrowed to today's setup, or a plain statement that it is
+    empty.
+
+    An empty intersection is the common case in a dataset this size, and it is
+    information: no release has ever printed that way with the asset going in
+    like this. A zero would be a statistic nobody computed and a blank row
+    would read as an oversight.
+    """
+    label = SCENARIO_LABELS.get(scenario.key, scenario.label)
+    narrowed = prep.intersections.get(scenario.key)
+    occurred = ' class="prep-row-occurred"' if prep.scenario_key == scenario.key else ""
+
+    if narrowed is None or not narrowed.sample_size:
+        return (
+            f"<tr{occurred}><th>{escape(label)}</th><td>0</td>"
+            '<td class="prep-none" colspan="7">No release matched both '
+            "conditions in this sample.</td></tr>"
+        )
+
+    window = narrowed.windows.get(HEADLINE_WINDOW)
+    if window is None or not window.sample_size:
+        return (
+            f"<tr{occurred}><th>{escape(label)}</th>"
+            f"<td>{narrowed.sample_size}</td>"
+            '<td class="prep-none" colspan="7">None of these has a complete '
+            "24-hour window.</td></tr>"
+        )
+
+    wider = _median(
+        next((c for c in prep.scenarios if c.key == scenario.key), None),
+        HEADLINE_WINDOW,
+    )
+    against = (
+        f'<td class="{_sign(window.median_return_pct - wider)}">'
+        f"{_difference(window.median_return_pct - wider)}</td>"
+        if wider is not None
+        else '<td class="prep-none">&mdash;</td>'
+    )
+
+    cells = "".join(
+        _intersection_cell(narrowed, name) for name in CARD_WINDOWS
+    )
+    return (
+        f"<tr{occurred}><th>{escape(label)}{_band(narrowed)}</th>"
+        f"<td>{narrowed.sample_size}</td>{cells}"
+        f"<td>{window.up_count} / {window.sample_size}</td>"
+        f'<td class="{_sign(window.mean_mfe_pct)}">'
+        f"{_signed(window.mean_mfe_pct)}</td>"
+        f'<td class="{_sign(window.mean_mae_pct)}">'
+        f"{_signed(window.mean_mae_pct)}</td>"
+        f"{against}</tr>"
+    )
+
+
+def _intersection_cell(cohort: Cohort, name: str) -> str:
+    window = cohort.windows.get(name)
+    if window is None or not window.sample_size:
+        return '<td class="prep-none">&mdash;</td>'
+    return (
+        f'<td class="{_sign(window.median_return_pct)}">'
+        f"{_signed(window.median_return_pct)}</td>"
+    )
+
+
+def _band(cohort: Cohort) -> str:
+    """The sample-quality word, beside the name it qualifies.
+
+    Inline rather than in its own column: these groups run from nothing to six
+    releases, and a reader scanning the row should meet the warning before the
+    figure rather than after it.
+    """
+    quality = cohort.quality
+    if not quality.needs_warning:
+        return ""
+    return (
+        f' <span class="cohort-quality quality-{quality.name.lower()}">'
+        f"{escape(quality.value)}</span>"
+    )
+
+
 def _scenario_section(prep: Preparation) -> str:
     """The playbook: a table to scan, then a card per outcome to read."""
     if not prep.scenarios:
@@ -759,6 +933,19 @@ def _card_row(cohort: Cohort, name: str, baseline: Cohort | None) -> str:
         f'<td class="prep-val {_sign(aggregate.median_return_pct)}">'
         f"{_signed(aggregate.median_return_pct)}</td>{against}</tr>"
     )
+
+
+def _difference(value: float) -> str:
+    """A difference in percentage points, without a signed zero.
+
+    "-0.0 pp" is what a difference of -0.03 rounds to, and it reads as a
+    direction that the figure does not actually support. Below the resolution
+    being printed, the honest statement is that the narrowing did not move the
+    median.
+    """
+    if abs(value) < 0.05:
+        return "no change"
+    return f"{value:+.1f} pp"
 
 
 def _sign(value: float | None) -> str:

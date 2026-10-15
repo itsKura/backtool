@@ -30,6 +30,7 @@ window rather than a filter on the outcome.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -169,6 +170,96 @@ def baseline_cohort(study: StudyResult) -> Cohort | None:
         ),
     )
     return cohorts[0] if cohorts else None
+
+
+#: A rule that sorts one release into a named group, or declines to.
+#:
+#: Already bound to whatever the rule needs to read -- the CPI classifier wants
+#: published figures, which live in a file this module has no business knowing
+#: about. Taking it pre-bound keeps this about composition and nothing else.
+ScenarioOf = Callable[[EventResult], "tuple[str, str, str] | None"]
+
+#: The two ways an asset can have gone into a release.
+#:
+#: Two rather than three: the dataset has no tolerance band around zero that
+#: would make "flat" mean anything, and inventing one would put releases in a
+#: bucket whose boundaries nobody chose. An exactly unchanged day is counted as
+#: up, which is stated rather than hidden, and is vanishingly rare in a float
+#: return over 24 hours.
+ENTERED_DOWN = "down"
+ENTERED_UP = "up"
+
+
+def entry_direction(event: EventResult) -> str | None:
+    """How the asset went into this release, or ``None`` if unmeasurable.
+
+    Reads ``pre_event_24h``, a window that ends *at* the release, so the answer
+    was knowable before the figure printed. An unmeasurable day is declined
+    rather than bucketed: it is not a flat one.
+    """
+    window = event.windows.get(ENTRY_WINDOW.name)
+    if window is None or not window.is_usable or window.return_pct is None:
+        return None
+    return ENTERED_DOWN if window.return_pct < 0 else ENTERED_UP
+
+
+def scenario_and_entry(scenario: ScenarioOf, *, direction: str) -> ScenarioOf:
+    """A classifier for releases that both printed a given way and began one.
+
+    Composed from the two splits rather than written as a third, so the
+    intersection cannot drift from the groups it claims to intersect: the CPI
+    rule here is the identical callable the scenario cards use, and the entry
+    rule is the identical window the setup panel reads.
+
+    Args:
+        scenario: The outcome rule, keyed on the release's own figures. Returns
+            ``None`` for a release it declines to classify -- no verified
+            consensus, or sources that disagree -- and a declined release is
+            absent from every intersection rather than defaulting into one.
+        direction: :data:`ENTERED_DOWN` or :data:`ENTERED_UP`. Only releases
+            the asset went into that way are kept.
+
+    Returns:
+        A classifier whose key is the scenario's, so the caller can look a
+        cohort up by the scenario it belongs to and report *no observations*
+        for one the intersection emptied.
+    """
+
+    def classify(event: EventResult) -> tuple[str, str, str] | None:
+        if entry_direction(event) != direction:
+            return None
+        landed = scenario(event)
+        if landed is None:
+            return None
+        key, label, _description = landed
+        moved = "fallen" if direction == ENTERED_DOWN else "risen"
+        return (
+            key,
+            label,
+            f"Releases that printed {label.lower()} and which the asset had "
+            f"{moved} into over the previous 24 hours.",
+        )
+
+    return classify
+
+
+def intersection_cohorts(
+    study: StudyResult, *, scenario: ScenarioOf, direction: str
+) -> dict[str, Cohort]:
+    """Intersection cohorts, keyed by the scenario each belongs to.
+
+    A dictionary rather than a list because the interesting case is the empty
+    one. A scenario with no matching release produces no cohort at all, and the
+    page has to say *no observations matched both* rather than quietly omitting
+    a row -- an absent row reads as an oversight, and a zero would be a
+    statistic nobody computed.
+    """
+    return {
+        cohort.key: cohort
+        for cohort in split_study(
+            study, scenario_and_entry(scenario, direction=direction)
+        )
+    }
 
 
 def entry_cohorts(study: StudyResult) -> list[Cohort]:

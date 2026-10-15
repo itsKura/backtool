@@ -15,23 +15,33 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+from dataclasses import replace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from backtool.core.types import EventType, Interval
 from backtool.events import load_events
-from backtool.events.releases import ReleaseValues, classify_cpi, load_releases
+from backtool.events.releases import (
+    SCENARIO_RULES,
+    ReleaseValues,
+    classify_cpi,
+    load_releases,
+)
 from backtool.research.aggregate import aggregate_window
+from backtool.research.cohort import split_study
 from backtool.research.metrics import Direction, WindowMetrics, WindowStatus
 from backtool.research.preparation import (
     CONTEXT_ENTRY_WINDOW,
+    ENTERED_DOWN,
+    ENTERED_UP,
     ENTRY_WINDOW,
     MarketContext,
     baseline_cohort,
     build_market_context,
     cohort_for_entry,
     entry_cohorts,
+    intersection_cohorts,
 )
 from backtool.research.results import EventResult, StudyResult
 from backtool.research.spec import ResearchSpec
@@ -1088,6 +1098,347 @@ class TestTheSummaryCoversTheWholeSample:
         if not smallest.quality.needs_warning:
             pytest.skip("no group small enough in the dataset as it stands")
         assert "too few to describe a tendency" in self.lines()
+
+
+class TestBothConditionsAtOnce:
+    """Scenario cohorts narrowed to setups resembling today's.
+
+    The playbook answers "if it lands cooler"; the setup panel answers "the
+    asset is going in falling". People ask them together, and the answers are
+    not the same question twice -- over this sample cooler CPI is +0.5%, and
+    cooler CPI the asset went into falling is +2.0%.
+    """
+
+    def labelled(self, rows: list[tuple[str, str, float, float]]) -> StudyResult:
+        """A study from ``(event_id, scenario, entry, outcome)``.
+
+        The scenario travels in the id so a test can state membership without
+        reaching for the real values file, and entry and outcome are set
+        independently so a rule that read the wrong one picks a visibly
+        different set.
+        """
+        return synthetic_study([(f"{key}:{eid}", entry, out) for eid, key, entry, out in rows])
+
+    def rule(self) -> object:
+        def scenario(event: EventResult) -> tuple[str, str, str] | None:
+            key = event.event_id.split(":")[0]
+            if key == "none":
+                return None
+            return (key, key.replace("_", " ").title(), "")
+
+        return scenario
+
+    def study(self) -> StudyResult:
+        return self.labelled(
+            [
+                ("a", "cooler", -2.0, +5.0),
+                ("b", "cooler", -1.0, -4.0),
+                ("c", "cooler", +3.0, +1.0),
+                ("d", "hotter", -2.5, +2.0),
+                ("e", "in_line", +1.0, -1.0),
+                ("f", "none", -1.5, +9.0),
+            ]
+        )
+
+    def test_a_negative_setup_selects_the_negative_releases(self) -> None:
+        """A. Both conditions, and only the releases meeting both."""
+        found = intersection_cohorts(
+            self.study(), scenario=self.rule(), direction=ENTERED_DOWN
+        )
+        assert set(found["cooler"].event_ids) == {"cooler:a", "cooler:b"}
+        assert set(found["hotter"].event_ids) == {"hotter:d"}
+
+    def test_a_positive_setup_selects_a_different_set(self) -> None:
+        """B. Otherwise the condition is decoration."""
+        found = intersection_cohorts(
+            self.study(), scenario=self.rule(), direction=ENTERED_UP
+        )
+        assert set(found["cooler"].event_ids) == {"cooler:c"}
+        assert "hotter" not in found
+        assert set(found["in_line"].event_ids) == {"in_line:e"}
+
+    def test_each_group_holds_only_its_own_scenario(self) -> None:
+        """C. A cohort whose members contradict its label would be the most
+        convincing wrong table this page could produce."""
+        for direction in (ENTERED_DOWN, ENTERED_UP):
+            for key, cohort in intersection_cohorts(
+                self.study(), scenario=self.rule(), direction=direction
+            ).items():
+                for event_id in cohort.event_ids:
+                    assert event_id.startswith(f"{key}:"), (key, event_id)
+
+    def test_a_release_the_rule_declines_is_in_no_group(self) -> None:
+        """No verified consensus is not "in line". It is unknown, and the two
+        must not collapse."""
+        found = intersection_cohorts(
+            self.study(), scenario=self.rule(), direction=ENTERED_DOWN
+        )
+        assert all(
+            "none:" not in event_id
+            for cohort in found.values()
+            for event_id in cohort.event_ids
+        )
+
+    def test_membership_does_not_move_when_the_outcomes_do(self) -> None:
+        """D, as a property rather than an example.
+
+        Every post-event return is negated and the membership re-derived. If
+        any outcome took part in selecting a cohort, flipping the sign of all
+        of them would move somebody -- so this fails for any rule that peeks,
+        not merely for the one way of peeking a hand-written case would check.
+
+        The scenario itself is *not* look-ahead: actual against consensus is
+        the condition being asked about, and the thing measured is the price
+        return, which is a different quantity. Selecting on the price and then
+        reporting the price is the circularity that matters.
+        """
+        original = self.study()
+        flipped = original.model_copy(
+            update={
+                "events": tuple(
+                    event.model_copy(
+                        update={
+                            "windows": {
+                                **event.windows,
+                                HEADLINE_WINDOW: window(
+                                    HEADLINE_WINDOW,
+                                    -event.windows[HEADLINE_WINDOW].return_pct,  # type: ignore[operator]
+                                ),
+                            }
+                        }
+                    )
+                    for event in original.events
+                )
+            }
+        )
+        for direction in (ENTERED_DOWN, ENTERED_UP):
+            before = {
+                key: set(cohort.event_ids)
+                for key, cohort in intersection_cohorts(
+                    original, scenario=self.rule(), direction=direction
+                ).items()
+            }
+            after = {
+                key: set(cohort.event_ids)
+                for key, cohort in intersection_cohorts(
+                    flipped, scenario=self.rule(), direction=direction
+                ).items()
+            }
+            assert before == after, direction
+
+    def test_the_selecting_window_still_ends_at_the_release(self) -> None:
+        assert ENTRY_WINDOW.end == "0h"
+        assert ENTRY_WINDOW.start.startswith("-")
+
+    def test_an_unmeasurable_entry_is_declined(self) -> None:
+        study = self.labelled([("a", "cooler", -1.0, 1.0)])
+        broken = study.model_copy(
+            update={
+                "events": (
+                    study.events[0].model_copy(
+                        update={
+                            "windows": {
+                                ENTRY_WINDOW.name: window(
+                                    ENTRY_WINDOW.name, None, ok=False
+                                ),
+                                HEADLINE_WINDOW: window(HEADLINE_WINDOW, 1.0),
+                            }
+                        }
+                    ),
+                )
+            }
+        )
+        assert (
+            intersection_cohorts(
+                broken, scenario=self.rule(), direction=ENTERED_DOWN
+            )
+            == {}
+        )
+
+
+class TestTheIntersectionOnThePage:
+    def prep(self, symbol: str = "BTCUSDT", event: str = NEXT_EVENT) -> Preparation:
+        return build_preparation(_event(event), symbol=symbol, now=_now())
+
+    def test_it_sits_between_the_setup_and_the_playbook(self) -> None:
+        html = render_preparation(self.prep(), ("BTCUSDT",))
+        assert (
+            html.index('class="prep-context"')
+            < html.index('class="prep-similar-scenarios"')
+            < html.index('class="prep-scenarios"')
+        )
+
+    def test_every_scenario_gets_a_row(self) -> None:
+        prep = self.prep()
+        table = render_preparation(prep, ("BTCUSDT",)).split(
+            "prep-similar-scenarios"
+        )[1].split("</table>")[0]
+        for cohort in prep.scenarios:
+            assert SCENARIO_LABELS[cohort.key] in table
+
+    def test_the_figures_are_the_cohort_aggregates(self) -> None:
+        """Not recomputed for display. The table is a view of what the research
+        layer produced."""
+        prep = self.prep()
+        table = render_preparation(prep, ("BTCUSDT",)).split(
+            "prep-similar-scenarios"
+        )[1].split("</table>")[0]
+        for key, cohort in prep.intersections.items():
+            assert key in SCENARIO_LABELS
+            metrics = cohort.windows[HEADLINE_WINDOW]
+            assert f"{metrics.median_return_pct:+.1f}%" in table
+            assert f"{metrics.up_count} / {metrics.sample_size}" in table
+
+    def test_an_empty_group_says_so_rather_than_showing_zero(self) -> None:
+        """F. It is information: no release has ever printed that way with the
+        asset going in like this. A 0.0% would be a statistic nobody computed,
+        and a missing row would read as an oversight.
+
+        Built rather than waited for. Whether an intersection is empty depends
+        on which way the market happens to be moving today, so a test that took
+        what it was given would quietly cover nothing on half the days it ran
+        -- and this is the branch most likely to be wrong.
+        """
+        prep = self.prep()
+        emptied = replace(prep, intersections={})
+        table = (
+            render_preparation(emptied, ("BTCUSDT",))
+            .split("prep-similar-scenarios")[1]
+            .split("</table>")[0]
+        )
+        assert table.count("No release matched both conditions in this sample.") == len(
+            prep.scenarios
+        )
+        assert "0.0%" not in table
+        for cohort in prep.scenarios:
+            assert SCENARIO_LABELS[cohort.key] in table
+
+    def test_a_group_that_exists_is_not_reported_as_empty(self) -> None:
+        """So the test above is evidence of a branch rather than of a constant."""
+        prep = self.prep()
+        if not prep.intersections:
+            pytest.skip("no measurable run-up right now")
+        table = (
+            render_preparation(prep, ("BTCUSDT",))
+            .split("prep-similar-scenarios")[1]
+            .split("</table>")[0]
+        )
+        assert table.count(
+            "No release matched both conditions in this sample."
+        ) == len(prep.scenarios) - len(prep.intersections)
+
+    def test_a_thin_group_carries_its_warning(self) -> None:
+        """G. These are the smallest groups on the page and the likeliest to be
+        quoted as if they were tendencies."""
+        prep = self.prep()
+        thin = [c for c in prep.intersections.values() if c.quality.needs_warning]
+        if not thin:
+            pytest.skip("no small intersection in the dataset as it stands")
+        html = render_preparation(prep, ("BTCUSDT",))
+        assert "cohort-quality" in html
+
+    def test_it_is_compared_against_the_wider_scenario(self) -> None:
+        """The number that makes the section worth having: the narrowing either
+        moved the median or it did not."""
+        prep = self.prep()
+        table = (
+            render_preparation(prep, ("BTCUSDT",))
+            .split("prep-similar-scenarios")[1]
+            .split("</table>")[0]
+        )
+        for key, narrowed in prep.intersections.items():
+            wider = next(c for c in prep.scenarios if c.key == key)
+            gap = (
+                narrowed.windows[HEADLINE_WINDOW].median_return_pct
+                - wider.windows[HEADLINE_WINDOW].median_return_pct
+            )
+            expected = "no change" if abs(gap) < 0.05 else f"{gap:+.1f} pp"
+            assert expected in table
+
+    def test_a_difference_too_small_to_print_is_not_given_a_direction(
+        self,
+    ) -> None:
+        """"-0.0 pp" is what -0.03 rounds to, and it reads as a direction the
+        figure does not support. Below the resolution being printed, the honest
+        statement is that the narrowing did not move the median."""
+        from backtool.web.prepare_page import _difference
+
+        assert _difference(-0.03) == "no change"
+        assert _difference(0.0) == "no change"
+        assert _difference(0.04) == "no change"
+        assert _difference(-1.4) == "-1.4 pp"
+        assert _difference(1.4) == "+1.4 pp"
+
+    def test_no_signed_zero_reaches_the_page(self) -> None:
+        table = (
+            render_preparation(self.prep(), ("BTCUSDT",))
+            .split("prep-similar-scenarios")[1]
+            .split("</table>")[0]
+        )
+        assert "-0.0 pp" not in table
+        assert "+0.0 pp" not in table
+
+    def test_it_never_claims_to_predict(self) -> None:
+        text = plain(render_preparation(self.prep(), ("BTCUSDT",))).lower()
+        assert "historical observations" in text
+        for forbidden in ("expected return", "likely outcome", "prediction"):
+            assert forbidden not in text
+
+    def test_the_two_assets_are_computed_separately(self) -> None:
+        """H. Membership can coincide -- the two move together most days -- so
+        what has to differ is the measurement, which is what the table shows."""
+        btc = self.prep("BTCUSDT")
+        eth = self.prep("ETHUSDT")
+        assert btc.intersections and eth.intersections
+        shared = set(btc.intersections) & set(eth.intersections)
+        assert shared
+        assert any(
+            btc.intersections[key].windows[HEADLINE_WINDOW].median_return_pct
+            != eth.intersections[key].windows[HEADLINE_WINDOW].median_return_pct
+            for key in shared
+        )
+
+    def test_an_upcoming_release_uses_the_run_up_to_now(self) -> None:
+        """I."""
+        prep = self.prep(event=NEXT_EVENT)
+        assert not prep.released
+        assert prep.entry_return_pct == prep.context.entry_return_pct
+
+    def test_a_released_one_uses_its_own_run_up(self) -> None:
+        """J. Not today's price action, which for a release months ago has
+        nothing to do with how it began."""
+        prep = self.prep(event=PAST_EVENT)
+        assert prep.released
+        assert prep.study is not None
+        own = next(e for e in prep.study.events if e.event_id == PAST_EVENT)
+        assert prep.entry_return_pct == own.windows[ENTRY_WINDOW.name].return_pct
+
+    def test_a_released_one_is_not_in_its_own_groups(self) -> None:
+        """E."""
+        prep = self.prep(event=PAST_EVENT)
+        for cohort in prep.intersections.values():
+            assert PAST_EVENT not in cohort.event_ids
+
+    def test_the_wider_scenario_statistics_are_untouched(self) -> None:
+        """K. The intersection is an extra layer, not a replacement -- and the
+        wider sample is what a reader should fall back to when one of these
+        runs thin."""
+        prep = self.prep()
+        assert prep.study is not None
+        values = load_releases()
+        rule = SCENARIO_RULES[EventType.CPI]
+        expected = split_study(
+            prep.study, lambda item: rule(values.get(item.event_id))
+        )
+        by_key = {cohort.key: cohort for cohort in expected}
+        for cohort in prep.scenarios:
+            assert cohort.windows == by_key[cohort.key].windows
+            assert cohort.event_ids == by_key[cohort.key].event_ids
+
+    def test_it_costs_nothing(self, client: TestClient, no_ai: None) -> None:
+        """L."""
+        assert client.get(f"/event/{NEXT_EVENT}/prepare").status_code == 200
+        assert client.get(f"/event/{PAST_EVENT}/prepare?symbol=ETHUSDT").status_code == 200
 
 
 # --- N, O: nothing that worked before stopped --------------------------------
