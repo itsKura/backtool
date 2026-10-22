@@ -344,18 +344,27 @@ class TestTheCandleEndpoint:
         Stated as the rule rather than as a date, because the thing being
         tested only occurs on release days and a test that cannot run today
         is not a test of today's behaviour.
+
+        The rule is about candle *closes*. A candle is stamped with the instant
+        it opens, so the last one in the series covers an interval beyond that
+        stamp -- and comparing the stamp against the window end declares a
+        complete window unfinished by exactly one interval. That went unnoticed
+        until the cache happened to end precisely on a boundary, which is the
+        one day in a hundred it is visible.
         """
         data = client.post(
             "/api/research/chart", json=self.body(cpi_thesis("24h"))
         ).json()
-        event = dt.datetime.fromtimestamp(data["event_time"], tz=dt.UTC)
-        last = dt.datetime.fromtimestamp(data["candles"][-1]["time"], tz=dt.UTC)
         band = data["windows"][0]
-
         assert band["title"] == "24 hours after"
         assert band["end"] - band["start"] == 24 * 60 * 60
 
-        a_whole_day_has_closed = last - event >= dt.timedelta(hours=24)
+        drawn = Interval(data["drawn_interval"])
+        last_open = dt.datetime.fromtimestamp(data["candles"][-1]["time"], tz=dt.UTC)
+        data_reaches = last_open + drawn.duration
+        window_end = dt.datetime.fromtimestamp(band["end"], tz=dt.UTC)
+
+        a_whole_day_has_closed = data_reaches >= window_end
         assert (band["high"] is not None) is a_whole_day_has_closed
         assert (band["low"] is not None) is a_whole_day_has_closed
 
