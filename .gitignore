@@ -37,6 +37,16 @@ htmlcov/
 Thumbs.db
 desktop.ini
 
+# Assistant and editor tooling. Local to whoever is working on the project and
+# specific to their machine -- the launch config here hardcodes a Windows
+# interpreter path -- so it is not a fact about the project. Everything the
+# project needs to run is in pyproject.toml and `backtool serve`.
+.claude/
+.cursor/
+.aider*
+.continue/
+.windsurf/
+
 # --- Generated reports (regenerable from a spec fingerprint) ---
 /reports/
 
