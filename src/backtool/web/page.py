@@ -20,6 +20,7 @@ from backtool.web.cohort_view import COHORT_STYLE
 from backtool.web.event_page import EVENT_STYLE
 from backtool.web.prepare_page import PREPARE_STYLE
 from backtool.web.research_page import RESEARCH_STYLE
+from backtool.web.taste_style import TASTE_FONTS, TASTE_STYLE
 from backtool.web.timefmt import LOCAL_TIME_SCRIPT
 
 _PAGE_STYLE = """
@@ -169,7 +170,9 @@ def shell(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{escape(title)}</title>
-<style>{REPORT_STYLE}{_PAGE_STYLE}{CALENDAR_STYLE}{EVENT_STYLE}{COHORT_STYLE}{RESEARCH_STYLE}{PREPARE_STYLE}{_NAV}</style>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="{TASTE_FONTS}">
+<style>{REPORT_STYLE}{_PAGE_STYLE}{CALENDAR_STYLE}{EVENT_STYLE}{COHORT_STYLE}{RESEARCH_STYLE}{PREPARE_STYLE}{_NAV}{TASTE_STYLE}</style>
 {"".join(f'<script src="{src}"></script>' for src in head_scripts)}
 </head>
 <body>

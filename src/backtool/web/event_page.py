@@ -1030,6 +1030,22 @@ window.backtoolCandleChart = function (options) {
     // container width first: asking for a coordinate from a chart that has not
     // been told how wide it is returns null for every one of them.
     fit();
+
+    // The bands were rebuilt from nothing a few lines up, so they cannot be
+    // transitioned from their old geometry -- and should not be. At this zoom
+    // the set itself differs: a window reaching past the view is clipped away
+    // and a narrower one becomes the truth about that box. Fading the layer
+    // says "these are different bands", which is what happened; sliding the
+    // old ones into the new would claim a continuity there isn't.
+    if (bandLayer) {
+      bandLayer.classList.add('bands-settling');
+      requestAnimationFrame(function () {
+        requestAnimationFrame(function () {
+          bandLayer.classList.remove('bands-settling');
+        });
+      });
+    }
+
     if (typeof options.onZoom === 'function') options.onZoom(hours);
   }
 
