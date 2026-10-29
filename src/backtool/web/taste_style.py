@@ -149,11 +149,14 @@ body { font-size: 13px; }
 .prep-similar-scenarios .prep-table td.down {
   color: var(--text-primary);
 }
-/* The exceptions the style allows. */
+/* The exception the style allows: the reaction to a release that has just
+   happened is the one place whose whole job is which way it went.
+
+   The run-up panel is NOT in this list. It carried no colour before this
+   sheet existed, and adding some under cover of "applying a style" would be
+   changing a decision that was already made, not applying one. */
 .prep-reaction .prep-figure-value.up { color: var(--up); }
 .prep-reaction .prep-figure-value.down { color: var(--down); }
-.prep-context .prep-figure-value.up { color: var(--up); }
-.prep-context .prep-figure-value.down { color: var(--down); }
 
 /* --- motion -------------------------------------------------------------
    Feedback only. Nothing performs an entrance: this page is opened twenty
@@ -231,8 +234,12 @@ body { font-size: 13px; }
 /* Section titles sit quieter than the figures under them. */
 .finding-sub, .section-sub { color: var(--text-muted); }
 
-/* Status pills keep their meaning but lose the saturated fill. */
-.badge, .prep-state, .cohort-quality {
+/* Status pills keep their meaning but lose the saturated fill.
+   .cohort-quality is deliberately NOT in this list. It is the sample-size
+   warning, and on a page whose whole job is not overstating a three-release
+   median, a grey "VERY LIMITED" reads as confident as a thirty-release one.
+   The style's restraint is right about decoration and wrong about this. */
+.badge, .prep-state {
   background: var(--surface-2);
   color: var(--text-secondary);
   border-radius: var(--radius-control);
