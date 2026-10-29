@@ -155,6 +155,60 @@ body { font-size: 13px; }
 .prep-context .prep-figure-value.up { color: var(--up); }
 .prep-context .prep-figure-value.down { color: var(--down); }
 
+/* --- motion -------------------------------------------------------------
+   Feedback only. Nothing performs an entrance: this page is opened twenty
+   times on a release morning, and an entrance is a toll paid every time.
+
+   Durations from the skill's table -- press 140ms, hover colour 180ms, panels
+   150ms -- and ease-out everywhere something enters or leaves, because
+   ease-in spends its first frames barely moving and reads as lag.
+
+   Everything here lives inside the no-preference query, so the reduced page
+   is the finished page rather than a degraded one. */
+@media (prefers-reduced-motion: no-preference) {
+  .btn, .asset-tab, .cohort-tab, .chart-range button, .prep-prepare,
+  .prep-ask, .example, .nav a {
+    transition: color 180ms ease, background-color 180ms ease,
+                border-color 180ms ease, box-shadow 180ms ease;
+  }
+
+  /* Press gives, briefly. The only transform in the sheet, and it moves a
+     control rather than any layout. */
+  .btn:active, .prep-prepare:active, .example:active,
+  .chart-range button:active {
+    transform: translateY(1px);
+    transition-duration: 140ms;
+  }
+
+  /* A panel swapped by the tabs crossfades instead of snapping. Seen many
+     times in a session, so it is fast and small. */
+  .cohort-panel, .prep-card details[open] > div {
+    animation: taste-fade 150ms ease-out;
+  }
+
+  /* The spinner's replacement arrives rather than appearing. */
+  .chart-canvas canvas, .prep-reaction, #slot-summary > * {
+    animation: taste-fade 200ms ease-out;
+  }
+
+  /* A row arriving -- the one entrance the house rule allows, and only for
+     the turn just appended, never the thread already on screen. */
+  #thread > .turn:last-child {
+    animation: taste-rise 200ms ease-out;
+  }
+
+  /* Bands are rebuilt on every zoom and the set genuinely changes, so this
+     is a crossfade and not a resize. Driven by the class the chart toggles. */
+  .chart-bands { transition: opacity 160ms ease-out; }
+  .chart-bands.bands-settling { opacity: 0; }
+}
+
+@keyframes taste-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes taste-rise {
+  from { opacity: 0; transform: translateY(3px); }
+  to   { opacity: 1; transform: none; }
+}
+
 /* --- surfaces and density ------------------------------------------------ */
 
 .panel-card, .prep-card, .event-card, .card, .panel, .chart-card,
