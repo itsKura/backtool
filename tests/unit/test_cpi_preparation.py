@@ -456,16 +456,31 @@ class TestTheSimilarCohortCannotSeeTheFuture:
         )
         assert entry_cohorts(broken) == []
 
-    def test_the_page_and_the_cohort_agree_on_today(self) -> None:
-        """A panel describing today as down beside a cohort selected as up
-        would be two correct halves making one wrong claim."""
-        prep = build_preparation(_event(PAST_EVENT), symbol="BTCUSDT", now=_now())
-        if prep.context.entry_direction is None or prep.entry_match is None:
-            pytest.skip("no measurable run-up in the cache right now")
-        expected = (
-            "entered_down" if prep.context.entry_direction == "down" else "entered_up"
-        )
+    @pytest.mark.parametrize("event_id", [PAST_EVENT, NEXT_EVENT])
+    def test_the_reading_and_the_cohort_agree(self, event_id: str) -> None:
+        """A panel describing the entry as down beside a cohort selected as up
+        would be two correct halves making one wrong claim.
+
+        Against the reading the page *displays*, which is ``entry_direction``.
+        An earlier version compared the run-up to **now** instead, and for a
+        released event those are deliberately different windows -- so it only
+        passed when the two happened to agree, and failed at random the rest of
+        the time. It had been green for a fortnight because BTC happened to sit
+        on the same side of zero both ways; it went red the morning the 24-hour
+        return crossed to -0.07%.
+        """
+        prep = build_preparation(_event(event_id), symbol="BTCUSDT", now=_now())
+        if prep.entry_direction is None or prep.entry_match is None:
+            pytest.skip("no measurable entry window in the cache right now")
+        expected = "entered_down" if prep.entry_direction == "down" else "entered_up"
         assert prep.entry_match.key == expected
+
+    def test_an_upcoming_release_reads_from_the_run_up_to_now(self) -> None:
+        """The one case where the two *are* the same window, kept so the fix
+        above cannot quietly become "compare a thing with itself"."""
+        prep = build_preparation(_event(NEXT_EVENT), symbol="BTCUSDT", now=_now())
+        assert not prep.released
+        assert prep.entry_direction == prep.context.entry_direction
 
 
 class TestWhichTwentyFourHoursCount:
