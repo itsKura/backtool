@@ -54,7 +54,9 @@ releases the asset entered the same way as today.
 | Automated data refresh | CPI actual and previous figures pulled from the BLS published series |
 
 Supported today: **BTCUSDT and ETHUSDT**, **FOMC and CPI**, candle intervals
-**5m / 15m / 1h**.
+**5m / 15m / 1h**. Charts offer a 4h view as well, aggregated from hourly
+candles for drawing only: the data layer stops at an hour because anything
+coarser cannot resolve the 1-hour post-event window the product reports.
 
 ---
 
