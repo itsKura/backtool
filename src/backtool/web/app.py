@@ -66,6 +66,7 @@ from backtool.web.event_page import (
     scenarios_load_script,
     setups_load_script,
     thin_for_display,
+    timeframe_by_label,
 )
 from backtool.web.history_panel import HISTORY_SCRIPT, render_history
 from backtool.web.page import render_error, render_page, shell
@@ -323,7 +324,7 @@ def _event_explain(*, event: MarketEvent, symbol: str, interval: str) -> str:
 
 @app.get("/api/event/{event_id}/candles")
 async def event_candles(
-    event_id: str, symbol: str = "BTCUSDT", interval: str = "5m"
+    event_id: str, symbol: str = "BTCUSDT", timeframe: str = "5m"
 ) -> dict[str, Any]:
     """Candles around one event, in the shape Lightweight Charts expects.
 
@@ -343,20 +344,22 @@ async def event_candles(
 
     try:
         candles, bands, grain = await asyncio.to_thread(
-            _event_candles, event=event, symbol=chosen, interval=interval
+            _event_candles, event=event, symbol=chosen, timeframe=timeframe
         )
     except Exception as exc:  # noqa: BLE001 - the chart shows the reason
         logger.exception("Candle fetch failed")
         return {"symbol": chosen, "candles": [], "message": f"{type(exc).__name__}: {exc}"}
 
+    picked = timeframe_by_label(timeframe)
     return {
         "symbol": chosen,
-        "interval": interval,
-        # What the candles on screen actually are, which is the fetched
-        # interval until a span is too wide to draw at it. Reported rather
-        # than inferred: a reader counting hours off a chart of daily candles
-        # would be reading it wrong with nothing on the page to say so.
-        "drawn_interval": grain or interval,
+        "interval": picked.fetch.value,
+        "timeframe": picked.label,
+        # What the candles on screen actually are. For 4h that is coarser than
+        # the hourly series behind it, and saying so matters: a reader counting
+        # hours off aggregated candles would be reading them wrong with nothing
+        # on the page to correct them.
+        "drawn_interval": grain or picked.fetch.value,
         "event_time": int(event.timestamp_utc.timestamp()),
         "candles": candles,
         # Derived from the same windows the statistics are measured over, and
@@ -368,7 +371,7 @@ async def event_candles(
 
 
 def _event_candles(
-    *, event: MarketEvent, symbol: str, interval: str
+    *, event: MarketEvent, symbol: str, timeframe: str
 ) -> tuple[list[dict[str, float | int]], list[dict[str, Any]], str | None]:
     """Fetch and shape the candles surrounding an event, plus the window boxes.
 
@@ -381,16 +384,21 @@ def _event_candles(
     arithmetic so the result does not depend on the frame's backing
     resolution -- the mistake that cost a debugging session earlier.
     """
-    resolved = Interval(interval.lower())
-    start = event.timestamp_utc - CHART_SPAN
-    end = event.timestamp_utc + CHART_SPAN
+    chosen = timeframe_by_label(timeframe)
+    resolved = chosen.fetch
+    # The widest window this page shades decides the minimum reach, so the
+    # day-long band stays whole at every candle size.
+    span = max(chosen.reach, CHART_SPAN)
+    start = event.timestamp_utc - span
+    end = event.timestamp_utc + span
 
     with MarketDataService.from_settings(Settings.from_env()) as service:
         frame = service.get_candles(symbol, resolved, start, end)
 
-    # Priced from the frame as fetched, before it is thinned for drawing.
-    bands = chart_window_bands(event.timestamp_utc, frame, resolved)
-    drawn, grain = thin_for_display(frame, resolved)
+    # Priced from the frame as fetched, before it is thinned for drawing, so
+    # a 4h chart still reports the high of the hourly series.
+    bands = chart_window_bands(event.timestamp_utc, frame, resolved, span=span)
+    drawn, grain = thin_for_display(frame, resolved, force=chosen.grain)
     return _shaped_candles(drawn), bands, grain
 
 
@@ -730,8 +738,6 @@ async def research_chart(payload: dict[str, Any]) -> dict[str, Any]:
     for. A chart that fetched its own data would be a second account of the
     same run, and the one a reader looks at would be the one nobody checked.
     """
-    from backtool.research.vocabulary import interval_for
-
     thesis = _previous_thesis(payload.get("thesis"))
     if thesis is None:
         return {"candles": [], "message": "That specification could not be read."}
@@ -741,7 +747,7 @@ async def research_chart(payload: dict[str, Any]) -> dict[str, Any]:
             _thesis_candles,
             thesis=thesis,
             event_id=str(payload.get("event_id") or ""),
-            interval=str(payload.get("interval") or interval_for(thesis.outcome.horizon)),
+            timeframe=str(payload.get("timeframe") or ""),
         )
     except ValueError as exc:
         return {"candles": [], "message": str(exc)}
@@ -767,7 +773,7 @@ def _measured_window(thesis: Thesis) -> WindowSpec | None:
 
 
 def _thesis_candles(
-    *, thesis: Thesis, event_id: str, interval: str
+    *, thesis: Thesis, event_id: str, timeframe: str
 ) -> dict[str, Any]:
     """Fetch the candles around one of a thesis's events, and shade its window.
 
@@ -790,12 +796,22 @@ def _thesis_candles(
     else:
         chosen = max(past, key=lambda event: event.timestamp_utc)
 
-    resolved = Interval(interval.lower())
+    # The window decides which timeframes exist at all, so a blank or stale
+    # label lands on this window's default rather than on a global one.
+    window_for_timeframe = _measured_window(thesis)
+    picked = (
+        timeframe_by_label(timeframe, window_for_timeframe)
+        if window_for_timeframe is not None
+        else timeframe_by_label(timeframe)
+    )
+    resolved = picked.fetch
     # The chart reaches as far as the window it shades, not a fixed day: a
     # ninety-day box on a chart spanning a day either side is a rectangle wider
     # than the canvas with none of the window inside it.
     window = _measured_window(thesis)
-    span = chart_span_for(window) if window is not None else CHART_SPAN
+    span = chart_span_for(window, picked) if window is not None else max(
+        picked.reach, CHART_SPAN
+    )
     start = chosen.timestamp_utc - span
     end = chosen.timestamp_utc + span
 
@@ -812,11 +828,12 @@ def _thesis_candles(
         if window is not None
         else []
     )
-    drawn, grain = thin_for_display(frame, resolved)
+    drawn, grain = thin_for_display(frame, resolved, force=picked.grain)
 
     return {
         "symbol": thesis.asset,
         "interval": resolved.value,
+        "timeframe": picked.label,
         "drawn_interval": grain or resolved.value,
         "event_id": chosen.event_id,
         "event_label": chosen.notes or chosen.event_id,

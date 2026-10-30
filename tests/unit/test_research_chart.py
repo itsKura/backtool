@@ -34,7 +34,9 @@ from backtool.web.event_page import (
     CANDLE_CHART_JS,
     CHART_SPAN,
     DISPLAY_BUDGET,
+    DISPLAY_GRAINS,
     EVENT_STYLE,
+    chart_default_timeframe,
     chart_span_for,
     chart_window_bands,
     display_grain,
@@ -43,6 +45,11 @@ from backtool.web.event_page import (
 from backtool.web.research_page import RESEARCH_SCRIPT, render_finding
 
 NOW = dt.datetime(2026, 10, 1, tzinfo=dt.UTC)
+
+
+def client_for_tests() -> TestClient:
+    """A client for tests that are not fixture-based."""
+    return TestClient(app)
 
 
 @pytest.fixture
@@ -650,11 +657,16 @@ class TestTheCaptionSaysWhatTheCandlesAre:
         standing where news should be, and every short question is that case."""
         assert "data.drawn_interval !== data.interval" in CANDLE_CHART_JS
 
+    def test_the_caption_clears_when_there_is_nothing_to_report(self) -> None:
+        """Switching from 4h back to 5m left the old caption behind, claiming
+        a candle size the chart no longer drew. Written *and* cleared."""
+        assert "? data.drawn_interval + ' candles'" in CANDLE_CHART_JS
+        assert ": ''" in CANDLE_CHART_JS
+
     def test_a_missing_slot_is_not_a_crash(self) -> None:
-        """The event page's chart is a fixed day at five minutes and never
-        thinned, so its slot stays empty -- and any other caller may not have
-        one at all."""
-        assert "options.grain &&" in CANDLE_CHART_JS
+        """A caller may mount the chart without a caption slot at all, and
+        the chart has no business requiring one to draw candles."""
+        assert "if (options.grain) {" in CANDLE_CHART_JS
 
     def test_the_separator_only_shows_on_a_filled_slot(self) -> None:
         """Otherwise every short chart carries a trailing middot pointing at
@@ -813,33 +825,126 @@ class TestZoomingInDoesNotDeleteTheZone:
         assert "←" not in source
 
 
-class TestTheCaptionDescribesTheView:
-    """The other half, and not a defect: the zoom narrows the series.
+class TestTheTimeframeControl:
+    """The toolbar changes the candle size, not how much of the chart is shown.
 
-    `fitContent`, `setVisibleRange` and `setVisibleLogicalRange` are accepted
-    and ignored by this build, so narrowing the data is the only lever that
-    moves the view. The price axis then rescales to what is shown and the
-    last-price line follows the last visible candle -- three endpoints of one
-    series, which reads as three different prices unless the caption says what
-    is being shown.
+    Zoom offered three widths of the same five-minute candles -- how much to
+    look at, never what to look at it in. A trading chart's control is the
+    other one.
+    """
+
+    def body(self, thesis: Thesis, **extra: Any) -> dict[str, Any]:
+        return {"thesis": thesis.model_dump_json(), **extra}
+
+    def fetch(self, horizon: str, timeframe: str) -> dict[str, Any]:
+        response = client_for_tests().post(
+            "/api/research/chart",
+            json=self.body(
+                cpi_thesis(horizon),
+                event_id="CPI-2024-07-11",
+                timeframe=timeframe,
+            ),
+        )
+        return dict(response.json())
+
+    def test_each_timeframe_draws_its_own_candle_size(self) -> None:
+        for label in ("5m", "15m", "1h", "4h"):
+            data = self.fetch("24h", label)
+            assert data["timeframe"] == label
+            assert data["drawn_interval"] == label
+
+    def test_four_hours_is_fetched_hourly(self) -> None:
+        """It is not a fetchable interval and must not pretend to be. The data
+        layer stops at an hour because anything coarser cannot resolve a
+        one-hour post-event window -- a statistic this product reports. Four
+        hours is a drawing decision made on top of hourly candles."""
+        data = self.fetch("24h", "4h")
+        assert data["interval"] == "1h"
+        assert data["drawn_interval"] == "4h"
+
+    def test_every_timeframe_stays_drawable(self) -> None:
+        for horizon in ("24h", "30d", "2y"):
+            for label in ("5m", "1h", "4h"):
+                data = self.fetch(horizon, label)
+                assert len(data["candles"]) <= DISPLAY_BUDGET, (horizon, label)
+
+    def test_a_coarse_request_can_be_coarsened_further(self) -> None:
+        """Four-hour candles across two years is 8,760 of them. The size asked
+        for is a floor, not an answer; the budget may go coarser, and the
+        label then says what was actually drawn rather than what was asked."""
+        data = self.fetch("2y", "4h")
+        assert data["timeframe"] == "4h"
+        assert data["drawn_interval"] == "1d"
+
+    def test_a_timeframe_the_window_withdrew_falls_back(self) -> None:
+        """Five minutes across two years is an unanswerable fetch, so the
+        window does not offer it and a request for it lands on what the window
+        does offer."""
+        data = self.fetch("2y", "5m")
+        assert data["timeframe"] != "5m"
+        assert data["candles"]
+
+    def test_the_view_still_contains_the_window(self) -> None:
+        """The invariant carried over from the zoom ladder: whatever is
+        offered, the box the page exists to show fits inside the view.
+
+        Measured to the last candle's *close*. A candle is stamped with the
+        instant it opens, so comparing the stamp against the window end
+        declares a contained window short by exactly one interval -- the same
+        edge that caught me once already.
+        """
+        for label in ("5m", "15m", "1h", "4h"):
+            data = self.fetch("24h", label)
+            band = data["windows"][0]
+            # Not Interval(): "4h" is deliberately not one, which is the
+            # whole point of the timeframe. DISPLAY_GRAINS knows every size
+            # the chart can actually be drawn in.
+            sizes = dict(DISPLAY_GRAINS) | {i.value: i.duration for i in Interval}
+            drawn = sizes[data["drawn_interval"]]
+            first = data["candles"][0]["time"]
+            reaches = data["candles"][-1]["time"] + drawn.total_seconds()
+            assert first <= band["start"], label
+            assert band["end"] <= reaches, label
+
+    def test_no_statistic_moves_with_the_candle_size(self) -> None:
+        """The one that matters. The chart is a picture of the series the
+        numbers came from; a 4h view reporting a different high would make the
+        picture and the figures two accounts of one run."""
+        highs = {}
+        lows = {}
+        for label in ("5m", "15m", "1h", "4h"):
+            band = self.fetch("24h", label)["windows"][0]
+            highs[label] = band["high"]
+            lows[label] = band["low"]
+        assert len(set(highs.values())) == 1, highs
+        assert len(set(lows.values())) == 1, lows
+
+
+class TestTheCaptionDescribesTheView:
+    """The caption names the candles on screen.
+
+    It used to name how far the view reached, because that was what the
+    toolbar changed. The control is now the candle size, and the price axis
+    still rescales to whatever is drawn -- so a caption fixed at the size the
+    card opened with would describe a chart the reader has since changed.
     """
 
     def test_the_span_is_its_own_element(self) -> None:
         html = render_finding(finding_for(cpi_thesis()))
         assert 'class="chart-span"' in html
 
-    def test_it_starts_at_the_opening_zoom(self) -> None:
+    def test_it_starts_at_the_opening_timeframe(self) -> None:
         html = render_finding(finding_for(cpi_thesis()))
-        opening = int(CHART_SPAN.total_seconds() // 3600)
-        assert f">{opening}h either side</span>" in html
+        opening = chart_default_timeframe(_measured_window(cpi_thesis()))  # type: ignore[arg-type]
+        assert f">{opening.label} candles</span>" in html
 
-    def test_the_chart_rewrites_it_on_every_zoom(self) -> None:
+    def test_the_chart_rewrites_it_on_every_change(self) -> None:
         """The label comes off the pressed button rather than being built in
-        JavaScript, because formatting a duration belongs with the ladder that
-        defines the rungs -- "17520h" is not a label a reader can use."""
+        JavaScript, so the name of a timeframe lives with the ladder that
+        defines it."""
         assert "onZoom" in RESEARCH_SCRIPT
         assert "dataset.label" in RESEARCH_SCRIPT
-        assert "either side" in RESEARCH_SCRIPT
+        assert "candles" in RESEARCH_SCRIPT
 
     def test_the_chart_offers_the_hook_rather_than_requiring_it(self) -> None:
         """The event page passes no callback, and must keep working."""

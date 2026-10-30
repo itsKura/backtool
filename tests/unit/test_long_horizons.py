@@ -47,10 +47,12 @@ from backtool.research.windows import (
     window_title,
 )
 from backtool.web.event_page import (
-    CHART_ZOOM_LADDER,
-    chart_opening_for,
+    CHART_TIMEFRAMES,
+    MAX_RAW_CANDLES,
+    chart_default_timeframe,
     chart_span_for,
-    chart_zooms_for,
+    chart_timeframes_for,
+    timeframe_by_label,
 )
 
 LONG = ("7d", "30d", "90d", "180d", "1y", "2y")
@@ -145,56 +147,83 @@ class TestTheLabelsRead:
 
 class TestTheChartFollowsTheWindow:
     """A ninety-day box on a chart spanning a day either side is a rectangle
-    wider than the canvas with none of the window inside it."""
+    wider than the canvas with none of the window inside it.
 
-    def test_a_day_long_window_offers_what_it_always_did(self) -> None:
-        """The check that the rungs generalise rather than replace: this is
-        exactly the release page's old 24h / 4h / 1h."""
-        rungs = chart_zooms_for(spec_for("24h"))
-        assert [compact_duration(r) for r in rungs] == ["24h", "4h", "1h"]
-        assert chart_opening_for(spec_for("24h")) == dt.timedelta(hours=24)
+    The control used to be zoom -- three widths of the same five-minute
+    candles. It is now the candle size, which is what a trading chart's
+    toolbar changes. The invariant that mattered survives the swap: whatever
+    is offered, the window being shaded fits inside the view.
+    """
 
-    @pytest.mark.parametrize(
-        ("horizon", "expected"),
-        [
-            ("7d", ["7d", "24h", "4h"]),
-            ("90d", ["90d", "30d", "7d"]),
-            ("2y", ["2y", "1y", "180d"]),
-        ],
-    )
-    def test_long_windows_get_long_rungs(
-        self, horizon: str, expected: list[str]
-    ) -> None:
-        assert [compact_duration(r) for r in chart_zooms_for(spec_for(horizon))] == (
-            expected
-        )
-
-    def test_the_opening_rung_contains_the_window(self) -> None:
-        """Otherwise the box opens running off the edge."""
+    def test_the_view_always_contains_the_window(self) -> None:
+        """The one carried over from the zoom ladder, and the reason that
+        ladder was tested at all."""
         for horizon in OUTCOME_HORIZONS:
             window = spec_for(horizon)
-            assert chart_opening_for(window) >= window.end_offset - window.start_offset
+            measured = window.end_offset - window.start_offset
+            for timeframe in chart_timeframes_for(window):
+                assert chart_span_for(window, timeframe) >= measured, (
+                    horizon,
+                    timeframe.label,
+                )
 
-    def test_a_short_window_still_gets_three_rungs(self) -> None:
-        """It sits at the bottom of the ladder with nothing below to offer, so
-        it borrows from above -- a chart with one button has no zoom."""
-        assert len(chart_zooms_for(spec_for("5m"))) == 3
+    def test_a_short_window_offers_every_timeframe(self) -> None:
+        offered = [t.label for t in chart_timeframes_for(spec_for("24h"))]
+        assert offered == ["5m", "15m", "1h", "4h"]
 
-    def test_a_short_window_opens_tight_and_can_pull_out(self) -> None:
-        assert chart_opening_for(spec_for("5m")) == dt.timedelta(hours=1)
-        assert chart_span_for(spec_for("5m")) == dt.timedelta(hours=24)
+    def test_a_long_window_drops_the_fine_ones(self) -> None:
+        """Five minutes across two years is 420,000 candles: not a slow
+        request, an unanswerable one."""
+        offered = [t.label for t in chart_timeframes_for(spec_for("2y"))]
+        assert "5m" not in offered
+        assert "15m" not in offered
+        assert offered == ["1h", "4h"]
 
-    def test_the_fetch_covers_the_widest_rung_not_the_opening_one(self) -> None:
-        """Zooming narrows the series the client already holds, so anything it
-        can be pulled out to must have been fetched."""
+    def test_something_is_always_offered(self) -> None:
+        for horizon in OUTCOME_HORIZONS:
+            assert chart_timeframes_for(spec_for(horizon))
+
+    def test_no_offered_timeframe_asks_for_an_absurd_fetch(self) -> None:
         for horizon in OUTCOME_HORIZONS:
             window = spec_for(horizon)
-            assert chart_span_for(window) == max(chart_zooms_for(window))
+            for timeframe in chart_timeframes_for(window):
+                span = chart_span_for(window, timeframe)
+                raw = 2 * span.total_seconds() / timeframe.fetch.duration.total_seconds()
+                assert raw <= MAX_RAW_CANDLES, (horizon, timeframe.label, raw)
 
-    def test_every_rung_is_on_the_ladder(self) -> None:
+    def test_a_short_window_opens_on_the_finest(self) -> None:
+        assert chart_default_timeframe(spec_for("24h")).label == "5m"
+
+    def test_a_long_window_opens_on_a_coarse_one(self) -> None:
+        """Opening a two-year study on five-minute candles would be a wall of
+        hairlines even if it were affordable."""
+        assert chart_default_timeframe(spec_for("2y")).label == "4h"
+
+    def test_the_default_is_always_one_of_the_offered(self) -> None:
         for horizon in OUTCOME_HORIZONS:
-            for rung in chart_zooms_for(spec_for(horizon)):
-                assert rung in CHART_ZOOM_LADDER
+            window = spec_for(horizon)
+            assert chart_default_timeframe(window) in chart_timeframes_for(window)
+
+    def test_every_timeframe_fetches_an_interval_the_data_layer_has(self) -> None:
+        """4h is not fetchable and must not pretend to be. It is drawn from
+        hourly candles, which is a display decision, and the statistics beside
+        it stay hourly."""
+        for timeframe in CHART_TIMEFRAMES:
+            assert timeframe.fetch in set(Interval)
+        coarse = next(t for t in CHART_TIMEFRAMES if t.label == "4h")
+        assert coarse.fetch is Interval.H1
+        assert coarse.grain == "4h"
+
+    def test_an_unknown_label_falls_back_rather_than_failing(self) -> None:
+        """A stale link or a hand-edited query string takes the chart's
+        default, because a picture beside the numbers is not worth a 500."""
+        window = spec_for("24h")
+        assert timeframe_by_label("nonsense", window) is chart_default_timeframe(window)
+        assert timeframe_by_label("", window) is chart_default_timeframe(window)
+
+    def test_a_label_the_window_withdrew_falls_back_too(self) -> None:
+        window = spec_for("2y")
+        assert timeframe_by_label("5m", window) is chart_default_timeframe(window)
 
 
 class TestAStudyRunsOnTheRightFamily:

@@ -42,11 +42,10 @@ from backtool.research.vocabulary import (
 from backtool.research.windows import (
     REACTION_WINDOWS,
     WindowSpec,
-    compact_duration,
     window_title,
 )
 from backtool.web.cohort_view import render_cohort_table, render_sample_badge
-from backtool.web.event_page import chart_opening_for, chart_zooms_for
+from backtool.web.event_page import chart_default_timeframe, chart_timeframes_for
 
 #: Starting points, chosen to show the three shapes a question can take: a
 #: cohort comparison, a plain event study, and a conditional follow-up.
@@ -485,21 +484,20 @@ def _price_zone(finding: ResearchFinding) -> str:
             f'<select class="chart-event">{options}</select></label>'
         )
 
-    # The rungs follow the window: a ninety-day box needs a ninety-day view,
-    # and "17520h" is not a label. The widest is selected, so the window is
-    # whole on the opening view.
     measured = _measured_spec(finding.thesis.outcome.horizon)
-    rungs = chart_zooms_for(measured) if measured is not None else ()
-    opening = chart_opening_for(measured) if measured is not None else None
+    # Offered by the window: a two-year study drops the fine candle sizes
+    # because fetching them would be an unanswerable request, not a slow one.
+    rungs = chart_timeframes_for(measured) if measured is not None else ()
+    opening = chart_default_timeframe(measured) if measured is not None else None
     zooms = "".join(
-        f'<button type="button" data-hours="{rung.total_seconds() / 3600:g}" '
-        f"data-label={quoteattr(compact_duration(rung))} "
-        f'aria-selected="{str(rung == opening).lower()}">'
-        f"&plusmn;{escape(compact_duration(rung))}</button>"
+        f'<button type="button" data-timeframe="{rung.label}" '
+        f"data-label={quoteattr(rung.label)} "
+        f'aria-selected="{str(rung is opening).lower()}">'
+        f"{escape(rung.label)}</button>"
         for rung in rungs
     )
     window = window_title_for(finding.thesis.outcome.horizon)
-    reach = compact_duration(opening) if opening else "24h"
+    reach = opening.label if opening else "5m"
     return (
         '<div class="chart-block" data-chart>'
         '<p class="finding-sub">Price around the event</p>'
@@ -509,7 +507,7 @@ def _price_zone(finding: ResearchFinding) -> str:
         # levels read as three different charts: the view narrows the series,
         # so the price scale and the last-price line follow the last visible
         # candle rather than the last candle.
-        f'<span class="chart-span">{escape(reach)} either side</span>'
+        f'<span class="chart-span">{escape(reach)} candles</span>'
         + (f" &middot; shaded: {escape(window)}" if window else "")
         # Filled by the chart once it has the data, and only when the candles
         # on screen are coarser than the ones measured. Rendered empty rather
@@ -1093,12 +1091,13 @@ _RESEARCH_SCRIPT_TEMPLATE = """
       const status = block.querySelector('.chart-status');
       if (!thesis) { status?.remove(); continue; }
 
-      const load = () => fetch('/api/research/chart', {
+      const load = (timeframe) => fetch('/api/research/chart', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           thesis: thesis,
           event_id: picker ? picker.value : '',
+          timeframe: timeframe,
         }),
       });
 
@@ -1109,21 +1108,15 @@ _RESEARCH_SCRIPT_TEMPLATE = """
         bands: block.querySelector('.chart-bands'),
         grain: block.querySelector('.chart-grain'),
         toolbar: block.querySelector('.chart-range'),
-        // The opening rung is the card's own widest, not a constant: the
-        // ladder depends on the window being shaded.
-        zoom: Number(
-          (block.querySelector('.chart-range button[aria-selected="true"]')
-            || block.querySelector('.chart-range button'))?.dataset.hours || 24),
         marker: 'event',
         load: load,
-        // So the caption describes the view rather than the request. The
-        // price axis rescales to what is shown, so a caption that kept
-        // saying 24h made a narrower view look like different data.
+        // So the caption names the candles actually on screen rather than
+        // the ones the card opened with.
         onZoom: () => {
           const picked = block.querySelector(
             '.chart-range button[aria-selected="true"]');
           if (span && picked) {
-            span.textContent = picked.dataset.label + ' either side';
+            span.textContent = picked.dataset.label + ' candles';
           }
         },
       });

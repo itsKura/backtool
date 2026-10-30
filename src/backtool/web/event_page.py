@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape
 
@@ -53,74 +54,105 @@ LIGHTWEIGHT_CHARTS_CDN = (
 #: How far either side of the event the price chart reaches.
 CHART_SPAN = dt.timedelta(hours=24)
 
-#: Zoom presets offered above the chart, in hours either side of the release.
-#:
-#: The bands below are drawn from the measurement windows, and at the full
-#: 48-hour view a one-hour window is about two percent of the width -- a sliver
-#: too narrow to carry its own label. Rather than leave those two windows
-#: effectively invisible, the reader can pull the view in to where they are
-#: legible. Native scroll-zoom does the same thing; these just make it findable.
-CHART_ZOOMS: tuple[int, ...] = (24, 4, 1)
+@dataclass(frozen=True)
+class Timeframe:
+    """One candle size the chart can be drawn in.
 
-#: Zoom rungs a chart can offer, shortest first.
-#:
-#: A chart offers the rung its window sits on and the two below it, so the
-#: window is visible whole at the widest setting and examinable at the
-#: narrowest. For a 24-hour window that yields 24h, 4h, 1h -- which is what the
-#: release page offered before any of this existed, and is the check that these
-#: rungs generalise it rather than replace it.
-CHART_ZOOM_LADDER: tuple[dt.timedelta, ...] = (
-    dt.timedelta(hours=1),
-    dt.timedelta(hours=4),
-    dt.timedelta(hours=24),
-    dt.timedelta(days=7),
-    dt.timedelta(days=30),
-    dt.timedelta(days=90),
-    dt.timedelta(days=180),
-    dt.timedelta(days=365),
-    dt.timedelta(days=730),
+    ``fetch`` is what the cache is asked for and what every statistic beside
+    the chart was computed at. ``grain`` is a coarser size the drawn candles
+    are aggregated into, or ``None`` to draw what was fetched -- which is how
+    4h exists at all without widening the data layer's three intervals.
+    """
+
+    label: str
+    fetch: Interval
+    grain: str | None
+    #: How far either side of the event this timeframe reaches on its own.
+    #: Chosen so each one holds roughly 300-600 candles, which is a readable
+    #: chart rather than a dozen slabs or ten thousand hairlines.
+    reach: dt.timedelta
+
+
+CHART_TIMEFRAMES: tuple[Timeframe, ...] = (
+    Timeframe("5m", Interval.M5, None, dt.timedelta(hours=24)),
+    Timeframe("15m", Interval.M15, None, dt.timedelta(days=2)),
+    Timeframe("1h", Interval.H1, None, dt.timedelta(days=7)),
+    # Fetched hourly and drawn four at a time. The statistics stay hourly.
+    Timeframe("4h", Interval.H1, "4h", dt.timedelta(days=30)),
 )
 
-
-def chart_zooms_for(window: WindowSpec) -> tuple[dt.timedelta, ...]:
-    """The zoom rungs to offer for a chart shading this window, widest first.
-
-    The widest is the smallest rung that contains the window, so the shaded box
-    always fits on the opening view. Two narrower rungs come with it, because a
-    long window's interesting part is usually its first few percent and a
-    reader has no other way to get there.
-    """
-    index = CHART_ZOOM_LADDER.index(chart_opening_for(window))
-    chosen = CHART_ZOOM_LADDER[max(0, index - 2) : index + 1]
-    # Three rungs wherever the ladder allows it. A window at the bottom of the
-    # ladder has nothing below to offer, and a chart with one button is a
-    # chart with no zoom -- so it borrows from above instead.
-    if len(chosen) < 3:
-        chosen = CHART_ZOOM_LADDER[:3]
-    return tuple(reversed(chosen))
+#: The most candles a timeframe may ask the cache for before it is withdrawn.
+#:
+#: Five minutes across a two-year study is 420,000 candles, which is not a
+#: slow chart but an unanswerable request. The gate is on the raw fetch rather
+#: than the drawn count, because thinning happens after the fetch and cannot
+#: rescue a query that should never have been made.
+MAX_RAW_CANDLES = 40_000
 
 
-def chart_opening_for(window: WindowSpec) -> dt.timedelta:
-    """The rung a chart of this window opens on.
-
-    The tightest that still contains the window, so the box is whole and as
-    large as it can be. Not necessarily the widest offered: a five-minute
-    window opens at an hour and can still be pulled out to a day.
-    """
-    span = window.end_offset - window.start_offset
-    fits = [rung for rung in CHART_ZOOM_LADDER if rung >= span]
-    return fits[0] if fits else CHART_ZOOM_LADDER[-1]
-
-
-def chart_span_for(window: WindowSpec) -> dt.timedelta:
+def chart_span_for(
+    window: WindowSpec, timeframe: Timeframe | None = None
+) -> dt.timedelta:
     """How far either side of the event the chart's data must reach.
 
-    The *widest* rung offered, not the opening one: zooming narrows the series
-    the client already holds, so anything it can be pulled out to has to have
-    been fetched.
+    The timeframe's own reach, except where the window being shaded is wider.
+    A page that shades ninety days and draws five of them has hidden the thing
+    it was opened to show.
     """
-    return chart_zooms_for(window)[0]
+    measured = max(abs(window.start_offset), abs(window.end_offset))
+    if timeframe is None:
+        return max(measured, CHART_TIMEFRAMES[0].reach)
+    return max(timeframe.reach, measured)
 
+
+def chart_timeframes_for(window: WindowSpec) -> tuple[Timeframe, ...]:
+    """The timeframes worth offering for this window.
+
+    One is withdrawn when its fetch would be absurd rather than merely large,
+    so a two-year study offers hours and not five-minute candles. Always at
+    least one: the coarsest survives any window, because its reach grows with
+    the window rather than against it.
+    """
+    offered = tuple(
+        timeframe
+        for timeframe in CHART_TIMEFRAMES
+        if _raw_candles(window, timeframe) <= MAX_RAW_CANDLES
+    )
+    return offered or (CHART_TIMEFRAMES[-1],)
+
+
+def _raw_candles(window: WindowSpec, timeframe: Timeframe) -> float:
+    span = chart_span_for(window, timeframe)
+    return 2 * span.total_seconds() / timeframe.fetch.duration.total_seconds()
+
+
+def chart_default_timeframe(window: WindowSpec) -> Timeframe:
+    """The timeframe a page opens on.
+
+    The finest offered whose reach already covers the window, so the shaded
+    box arrives whole and at the best resolution that manages it. When none
+    covers it -- a long study -- the coarsest offered, whose reach is then
+    stretched to the window anyway.
+    """
+    offered = chart_timeframes_for(window)
+    measured = max(abs(window.start_offset), abs(window.end_offset))
+    fits = [timeframe for timeframe in offered if timeframe.reach >= measured]
+    return fits[0] if fits else offered[-1]
+
+
+def timeframe_by_label(label: str, window: WindowSpec | None = None) -> Timeframe:
+    """Resolve a label from a request, falling back rather than failing.
+
+    A label this window does not offer -- a stale link, a hand-edited URL --
+    becomes the default for the window instead of an error. The chart is a
+    picture beside the numbers; refusing to draw it because a query string was
+    wrong would take the page down for a decoration.
+    """
+    allowed = chart_timeframes_for(window) if window is not None else CHART_TIMEFRAMES
+    for timeframe in allowed:
+        if timeframe.label == label.strip().lower():
+            return timeframe
+    return chart_default_timeframe(window) if window is not None else CHART_TIMEFRAMES[0]
 
 
 def chart_window_bands(
@@ -257,7 +289,7 @@ def display_grain(rows: int, interval: Interval) -> tuple[str, dt.timedelta] | N
 
 
 def thin_for_display(
-    candles: pd.DataFrame | None, interval: Interval
+    candles: pd.DataFrame | None, interval: Interval, force: str | None = None
 ) -> tuple[pd.DataFrame | None, str | None]:
     """A frame reduced to what a chart can draw, and the size it is drawn at.
 
@@ -283,10 +315,30 @@ def thin_for_display(
     """
     if candles is None or candles.empty:
         return candles, None
-    grain = display_grain(len(candles), interval)
-    if grain is None:
-        return candles, None
-    label, size = grain
+
+    if force is not None:
+        # A timeframe the reader picked, treated as a floor rather than an
+        # answer. Four-hour candles across two years is 8,760 of them: the
+        # size was asked for, but the count still has to be drawable, so the
+        # coarser of the two wins and the label says what was actually drawn.
+        asked = next((g for g in DISPLAY_GRAINS if g[0] == force), None)
+        if asked is not None and asked[1] <= interval.duration:
+            asked = None
+        affordable = display_grain(len(candles), interval)
+
+        wanted = max(
+            [g for g in (asked, affordable) if g is not None],
+            key=lambda g: g[1],
+            default=None,
+        )
+        if wanted is None:
+            return candles, None
+        label, size = wanted
+    else:
+        grain = display_grain(len(candles), interval)
+        if grain is None:
+            return candles, None
+        label, size = grain
 
     buckets = candles["open_time"].dt.floor(size)
     drawn = (
@@ -483,19 +535,23 @@ def render_price_chart(event: MarketEvent, symbol: str, *, available: bool) -> s
             "</section>"
         )
 
-    hours = int(CHART_SPAN.total_seconds() // 3600)
+    # The event page shades the four reaction windows, the widest of which is
+    # a day, so it offers the whole ladder and opens on the finest.
+    offered = CHART_TIMEFRAMES
+    opening = offered[0]
     zooms = "".join(
-        f'<button type="button" data-hours="{value}" '
-        f'aria-selected="{str(value == CHART_ZOOMS[0]).lower()}">&plusmn;{value}h</button>'
-        for value in CHART_ZOOMS
+        f'<button type="button" data-timeframe="{timeframe.label}" '
+        f'aria-selected="{str(timeframe is opening).lower()}">'
+        f"{timeframe.label}</button>"
+        for timeframe in offered
     )
     return (
         '<section class="price">'
         '<div class="section-head">'
         "<h2>Price around the release</h2>"
         f'<p class="section-sub"><span class="mono">{escape(symbol)}</span> '
-        f"&middot; {hours}h either side &middot; shaded bands are the windows "
-        "the statistics below are measured over"
+        "&middot; shaded bands are the windows the statistics below are "
+        "measured over"
         # Empty unless the chart reports drawing something coarser than it
         # measured, which a fixed day at five minutes never does. Here so the
         # two pages share the mechanism as well as the chart itself.
@@ -507,7 +563,7 @@ def render_price_chart(event: MarketEvent, symbol: str, *, available: bool) -> s
         '<span><i class="band-key band-key-before"></i>before the release</span>'
         '<span><i class="band-key band-key-after"></i>after the release</span>'
         "</div>"
-        f'<div class="chart-range" role="group" aria-label="Zoom">{zooms}</div>'
+        f'<div class="chart-range" role="group" aria-label="Timeframe">{zooms}</div>'
         "</div>"
         '<div id="price-chart"><div id="price-bands" aria-hidden="true"></div></div>'
         '<p class="status" id="price-chart-status">'
@@ -837,7 +893,17 @@ window.backtoolCandleChart = function (options) {
   let candleTimes = [];
   let eventTime = null;
 
-  options.load()
+  // The timeframe the toolbar is currently on. The server decides what a
+  // label means -- which interval to fetch and how far to reach -- so this is
+  // only ever passed through.
+  let timeframe = (options.toolbar &&
+    options.toolbar.querySelector('button[aria-selected="true"]')
+  )?.dataset.timeframe || '5m';
+
+  function reload() {
+    if (status) status.textContent = 'Loading candles\u2026';
+    loaded = false;
+    options.load(timeframe)
     .then(r => r.json())
     .then(data => {
       if (!data.candles || !data.candles.length) {
@@ -860,9 +926,14 @@ window.backtoolCandleChart = function (options) {
       // interval it was measured at, and a reader counting hours off daily
       // candles would be reading the chart wrong with nothing on the page to
       // say so. On a short question the two are equal and this stays empty.
-      if (options.grain && data.drawn_interval
-          && data.drawn_interval !== data.interval) {
-        options.grain.textContent = data.drawn_interval + ' candles';
+      if (options.grain) {
+        // Cleared when there is nothing to report, not just written when
+        // there is. Switching from 4h back to 5m used to leave the old
+        // caption behind, claiming a candle size the chart no longer drew.
+        options.grain.textContent =
+          (data.drawn_interval && data.drawn_interval !== data.interval)
+            ? data.drawn_interval + ' candles'
+            : '';
       }
       // Widest first, so a nested shorter window paints on top of the one that
       // contains it and reads as the stronger of the two.
@@ -871,10 +942,15 @@ window.backtoolCandleChart = function (options) {
       );
 
       loaded = true;
-      setZoom(options.zoom);
-      status.remove();
+      render();
+      // Hidden, not removed: a timeframe change needs somewhere to report
+      // from, and the first version deleted the node on the first load.
+      if (status) status.hidden = true;
     })
-    .catch(e => { status.textContent = 'Could not load candles: ' + e; });
+    .catch(e => { if (status) status.textContent = 'Could not load candles: ' + e; });
+  }
+
+  reload();
 
   // A band boundary is snapped to a real candle before it is asked for a
   // coordinate. timeToCoordinate answers for points on the data grid; an
@@ -967,22 +1043,16 @@ window.backtoolCandleChart = function (options) {
     }
   }
 
-  // Zoom by changing what the series holds, not by moving the viewport.
-  // fitContent, setVisibleRange and setVisibleLogicalRange are all accepted
-  // and then ignored by this build of the library -- the range stays pinned
-  // wherever it started. Narrowing the data is the one lever that does move
-  // the view, and it rescales the price axis to the window being examined,
-  // which is what a reader zooming in wants anyway.
-  //
-  // The opening view calls this too, so "what the chart shows on load" and
-  // "what the 24h button does" are the same code path and cannot drift apart.
-  function setZoom(hours) {
+  // Draw everything that arrived. The server decided how far the timeframe
+  // reaches, so there is nothing left to slice here -- which is also why the
+  // price axis now scales to the whole fetched span rather than to a zoom
+  // window the client invented.
+  function render() {
     if (eventTime === null) return;
-    const low = eventTime - hours * 3600;
-    const high = eventTime + hours * 3600;
-
-    const visible = allCandles.filter(c => c.time >= low && c.time <= high);
+    const visible = allCandles;
     if (!visible.length) return;
+    const low = visible[0].time;
+    const high = visible[visible.length - 1].time;
     series.setData(visible);
     candleTimes = visible.map(c => c.time);
 
@@ -1088,13 +1158,19 @@ window.backtoolCandleChart = function (options) {
 
   timeScale.subscribeVisibleLogicalRangeChange(drawBands);
 
-  for (const btn of options.toolbar.querySelectorAll('button')) {
-    btn.addEventListener('click', () => {
-      for (const other of options.toolbar.querySelectorAll('button')) {
-        other.setAttribute('aria-selected', String(other === btn));
-      }
-      setZoom(Number(btn.dataset.hours));
-    });
+  if (options.toolbar) {
+    for (const btn of options.toolbar.querySelectorAll('button')) {
+      btn.addEventListener('click', () => {
+        if (btn.dataset.timeframe === timeframe) return;
+        for (const other of options.toolbar.querySelectorAll('button')) {
+          other.setAttribute('aria-selected', String(other === btn));
+        }
+        timeframe = btn.dataset.timeframe;
+        // A different candle size is a different series, so this goes back to
+        // the server rather than re-slicing what is already here.
+        reload();
+      });
+    }
   }
 
   new ResizeObserver(fit).observe(el);
@@ -1117,9 +1193,9 @@ def price_chart_script(event_id: str, symbol: str) -> str:
     bands: document.getElementById('price-bands'),
     grain: document.getElementById('price-chart-grain'),
     toolbar: document.querySelector('.chart-range'),
-    zoom: {CHART_ZOOMS[0]},
     marker: 'release',
-    load: () => fetch('/api/event/{event_id}/candles?symbol={symbol}'),
+    load: (timeframe) => fetch(
+      '/api/event/{event_id}/candles?symbol={symbol}&timeframe=' + timeframe),
   }});
 }})();
 """
