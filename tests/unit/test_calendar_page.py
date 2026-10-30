@@ -8,6 +8,7 @@ include that release in the history it presents as prior context.
 from __future__ import annotations
 
 import datetime as dt
+import re
 
 import pytest
 from fastapi.testclient import TestClient
@@ -179,6 +180,65 @@ class TestEventRoutes:
         html = client.get("/event/FOMC-2026-06-17").text
         assert "not yet collected for this release" not in html
         assert "Expected" in html
+
+    def test_an_actual_that_cannot_exist_yet_gets_no_cell(
+        self, client: TestClient
+    ) -> None:
+        """Before the release the row is two cells, not three.
+
+        The third was a box that said "not published until the release" every
+        single time anyone opened the page, which is the header's own state
+        badge and countdown said a third time -- and a box that is always
+        empty reads as broken rather than as scheduled.
+        """
+        html = client.get("/event/CPI-2026-11-10").text
+        labels = re.findall(r'expect-label">([^<]*)', html)
+        assert labels == ["Previous", "Consensus"]
+        assert "not published until the release" not in html
+
+    def test_the_actual_appears_once_the_release_has_happened(
+        self, client: TestClient
+    ) -> None:
+        """Withheld until it exists, not dropped from the product. The whole
+        dataset is built around this figure."""
+        html = client.get("/event/CPI-2026-09-11").text
+        assert re.findall(r'expect-label">([^<]*)', html) == [
+            "Previous",
+            "Consensus",
+            "Actual",
+        ]
+
+    def test_an_untracked_event_type_follows_the_same_rule(
+        self, client: TestClient
+    ) -> None:
+        """An FOMC row has no dataset behind any of its cells, which is a
+        different absence from this one -- but "the figure published at the
+        release instant" cannot exist before the release either way, and a
+        reader looking at the two pages should not have to work out why one
+        holds a box open and the other does not."""
+        upcoming = client.get("/event/FOMC-2026-12-09").text
+        assert re.findall(r'expect-label">([^<]*)', upcoming) == [
+            "Previous",
+            "Expected",
+        ]
+        past = client.get("/event/FOMC-2026-10-28").text
+        assert re.findall(r'expect-label">([^<]*)', past) == [
+            "Previous",
+            "Expected",
+            "Actual",
+        ]
+
+    def test_the_model_keeps_the_distinction_the_page_stops_drawing(
+        self,
+    ) -> None:
+        """The reason an actual is absent is still carried, and still
+        different either side of the release. Only the cell went away."""
+        from backtool.events.releases import ValueStatus, release_figures
+
+        before = {f.label: f for f in release_figures(None, released=False)}
+        assert before["Actual"].status is ValueStatus.AWAITING_RELEASE
+        after = {f.label: f for f in release_figures(None, released=True)}
+        assert after["Actual"].status is not ValueStatus.AWAITING_RELEASE
 
     def test_no_development_terminology_reaches_the_page(
         self, client: TestClient

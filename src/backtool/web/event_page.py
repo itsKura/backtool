@@ -447,21 +447,32 @@ def render_expectations(event: MarketEvent, *, now: dt.datetime) -> str:
     Only CPI. The values file covers one event type, and giving an FOMC
     decision a row labelled "Consensus &mdash; not yet collected" would promise
     a dataset nobody is building.
+
+    Before the release the row is two cells, not three: see
+    :func:`~backtool.events.releases.shown_figures` for why the actual does not
+    get an empty box of its own.
     """
+    released = event.timestamp_utc <= now
+
     if event.curated_type is not EventType.CPI:
         rendered = "".join(
             f'<div class="expect-cell expect-cell-missing" title="{escape(hint)}">'
             f'<span class="expect-label">{escape(label)}</span>'
             '<span class="expect-value">&mdash;</span></div>'
+            # Same rule the tracked row follows: there is no actual before the
+            # release, so there is no cell for one. The reason differs -- this
+            # row has no dataset behind any of its cells -- but the absence a
+            # reader is looking at is the same absence.
             for label, hint in _UNTRACKED_CELLS
+            if released or label != "Actual"
         )
         return f'<div class="expectations">{rendered}</div>'
 
-    from backtool.events.releases import load_releases, release_figures
+    from backtool.events.releases import load_releases, shown_figures
 
-    figures = release_figures(
+    figures = shown_figures(
         load_releases().get(event.event_id),
-        released=event.timestamp_utc <= now,
+        released=released,
     )
 
     rendered = ""
@@ -1083,8 +1094,8 @@ window.backtoolCandleChart = function (options) {
 
     // Where clipping has reduced two windows of the same phase to the same
     // span, they are one rectangle with two labels disagreeing about what it
-    // means. The narrower window is the one that actually describes it -- at
-    // the one-hour zoom "1 hour before" is the truth about that box and
+    // means. The narrower window is the one that actually describes it -- in
+    // a view this tight "1 hour before" is the truth about that box and
     // "24 hours before" is an accident of where the view stops.
     const bySpan = {};
     for (const band of clipped) {
@@ -1116,7 +1127,10 @@ window.backtoolCandleChart = function (options) {
       });
     }
 
-    if (typeof options.onZoom === 'function') options.onZoom(hours);
+    // Said, not described. What was drawn is on the toolbar the page already
+    // owns, and the one time this handed something across -- the zoom ladder's
+    // `hours` -- the variable was deleted a commit before the call to it was.
+    if (typeof options.onRender === 'function') options.onRender();
   }
 
   // fitContent() is accepted and ignored by this build of the library: the
@@ -1179,6 +1193,52 @@ window.backtoolCandleChart = function (options) {
 """
 
 
+#: A chart plus the control that chooses which event it draws.
+#:
+#: Two pages now show "here are the releases behind that number, look at one":
+#: a research answer over its own sample, and the preparation page over the
+#: releases the asset entered the same way. The markup is the same and so is
+#: the rebuild rule below, which exists because of a bug rather than a
+#: preference -- having it written down twice is how a fix like that gets lost.
+#:
+#: The loader is the part that differs and so it is the part passed in: one
+#: posts a thesis, the other knows a calendar id.
+CHART_BLOCK_JS = """
+window.backtoolChartBlock = function (block, options) {
+  const picker = block.querySelector('.chart-event');
+  const mount = () => window.backtoolCandleChart({
+    canvas: block.querySelector('.chart-canvas'),
+    status: block.querySelector('.chart-status'),
+    bands: block.querySelector('.chart-bands'),
+    grain: block.querySelector('.chart-grain'),
+    toolbar: block.querySelector('.chart-range'),
+    marker: options.marker,
+    load: (timeframe) => options.load(timeframe, picker ? picker.value : ''),
+    onRender: options.onRender,
+  });
+
+  // Switching event rebuilds the chart rather than re-pointing it: the
+  // library holds the series, the bands and the zoom state together, and
+  // feeding one of them a different event leaves the other two describing the
+  // previous one.
+  if (picker) {
+    picker.addEventListener('change', () => {
+      const canvas = block.querySelector('.chart-canvas');
+      canvas.innerHTML = '<div class="chart-bands" aria-hidden="true"></div>';
+      if (!block.querySelector('.chart-status')) {
+        canvas.insertAdjacentHTML('afterend',
+          '<p class="status chart-status">' +
+          '<span class="spinner"></span>Loading candles\\u2026</p>');
+      }
+      mount();
+    });
+  }
+
+  mount();
+};
+"""
+
+
 def price_chart_script(event_id: str, symbol: str) -> str:
     """Mount the shared chart on this page's elements, for one calendar event.
 
@@ -1213,7 +1273,13 @@ EVENT_STYLE = """
 .event-summary { margin: 0; color: var(--text-secondary); font-size: 15px;
                  max-width: 68ch; line-height: 1.6; }
 
-.expectations { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+/* Columns from the cell count rather than a fixed three: before a release the
+   row is two cells, and a third track held open for the one that was removed
+   would put the empty box back as whitespace. Not repeat(auto-fit, ...), which
+   sizes the repetition from the track minimum and collapses to one column when
+   that minimum is zero. */
+.expectations { display: grid; grid-auto-flow: column;
+                grid-auto-columns: minmax(0, 1fr);
                 border: 1px solid var(--grid); border-radius: 8px;
                 overflow: hidden; margin: 0 0 28px; }
 .expect-cell { padding: 12px 16px; border-right: 1px solid var(--grid); }

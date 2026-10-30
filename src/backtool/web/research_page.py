@@ -1081,38 +1081,30 @@ _RESEARCH_SCRIPT_TEMPLATE = """
   // what lets several answers in one thread each hold their own chart, which
   // ids in a shared script could not.
   function mountCharts(scope) {
-    if (typeof window.backtoolCandleChart !== 'function') return;
+    if (typeof window.backtoolChartBlock !== 'function') return;
     for (const block of scope.querySelectorAll('[data-chart]')) {
       if (block.dataset.mounted) continue;
       block.dataset.mounted = '1';
 
       const thesis = block.querySelector('script.thesis')?.textContent;
-      const picker = block.querySelector('.chart-event');
       const status = block.querySelector('.chart-status');
       if (!thesis) { status?.remove(); continue; }
 
-      const load = (timeframe) => fetch('/api/research/chart', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          thesis: thesis,
-          event_id: picker ? picker.value : '',
-          timeframe: timeframe,
-        }),
-      });
-
       const span = block.querySelector('.chart-span');
-      const mount = () => window.backtoolCandleChart({
-        canvas: block.querySelector('.chart-canvas'),
-        status: block.querySelector('.chart-status'),
-        bands: block.querySelector('.chart-bands'),
-        grain: block.querySelector('.chart-grain'),
-        toolbar: block.querySelector('.chart-range'),
+      window.backtoolChartBlock(block, {
         marker: 'event',
-        load: load,
+        load: (timeframe, eventId) => fetch('/api/research/chart', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            thesis: thesis,
+            event_id: eventId,
+            timeframe: timeframe,
+          }),
+        }),
         // So the caption names the candles actually on screen rather than
         // the ones the card opened with.
-        onZoom: () => {
+        onRender: () => {
           const picked = block.querySelector(
             '.chart-range button[aria-selected="true"]');
           if (span && picked) {
@@ -1120,23 +1112,6 @@ _RESEARCH_SCRIPT_TEMPLATE = """
           }
         },
       });
-
-      // Switching event rebuilds the chart rather than re-pointing it: the
-      // library holds the series, the bands and the zoom state together, and
-      // feeding one of them a different event leaves the other two describing
-      // the previous one.
-      picker?.addEventListener('change', () => {
-        const canvas = block.querySelector('.chart-canvas');
-        canvas.innerHTML = '<div class="chart-bands" aria-hidden="true"></div>';
-        if (!block.querySelector('.chart-status')) {
-          canvas.insertAdjacentHTML('afterend',
-            '<p class="status chart-status">' +
-            '<span class="spinner"></span>Loading candles\u2026</p>');
-        }
-        mount();
-      });
-
-      mount();
     }
   }
 

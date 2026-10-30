@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from typing import Any
 
 import pytest
@@ -32,6 +33,7 @@ from backtool.research.windows import DEFAULT_WINDOWS, WindowSpec
 from backtool.web.app import _measured_window, app
 from backtool.web.event_page import (
     CANDLE_CHART_JS,
+    CHART_BLOCK_JS,
     CHART_SPAN,
     DISPLAY_BUDGET,
     DISPLAY_GRAINS,
@@ -647,7 +649,11 @@ class TestTheCaptionSaysWhatTheCandlesAre:
         assert '<span class="chart-grain"></span>' in html
 
     def test_the_script_is_given_the_slot(self) -> None:
-        assert "grain: block.querySelector('.chart-grain')" in RESEARCH_SCRIPT
+        """In the shared block, which is where the wiring moved once the
+        preparation page grew a chart of its own. Both pages reach the slot
+        through it, so asserting on the research script alone would now pass
+        for one page and say nothing about the other."""
+        assert "grain: block.querySelector('.chart-grain')" in CHART_BLOCK_JS
 
     def test_the_chart_writes_the_size_it_drew(self) -> None:
         assert "data.drawn_interval + ' candles'" in CANDLE_CHART_JS
@@ -942,10 +948,31 @@ class TestTheCaptionDescribesTheView:
         """The label comes off the pressed button rather than being built in
         JavaScript, so the name of a timeframe lives with the ladder that
         defines it."""
-        assert "onZoom" in RESEARCH_SCRIPT
+        assert "onRender" in RESEARCH_SCRIPT
         assert "dataset.label" in RESEARCH_SCRIPT
         assert "candles" in RESEARCH_SCRIPT
 
     def test_the_chart_offers_the_hook_rather_than_requiring_it(self) -> None:
         """The event page passes no callback, and must keep working."""
-        assert "typeof options.onZoom === 'function'" in CANDLE_CHART_JS
+        assert "typeof options.onRender === 'function'" in CANDLE_CHART_JS
+
+    def test_the_hook_hands_nothing_across(self) -> None:
+        """It says a draw happened; what was drawn is on the toolbar, which
+        the page owns and can read.
+
+        This is the fix for a live bug rather than a preference. The callback
+        used to be handed `hours`, a variable of the zoom ladder, and the
+        ladder was deleted a commit before the call to it was: every research
+        chart threw a ReferenceError on load and showed "Could not load
+        candles" over candles it had already drawn. Nothing in this file
+        noticed, because every assertion here reads the script as text.
+        """
+        assert "options.onRender()" in CANDLE_CHART_JS
+
+    def test_nothing_in_the_chart_still_reaches_for_the_zoom_ladder(self) -> None:
+        """The general form of the same bug: a name that outlives what
+        defined it. Code only -- the prose around it is free to say "hours"
+        about a window, and does."""
+        code = re.sub(r"//.*", "", CANDLE_CHART_JS)
+        assert not re.search(r"hours", code)
+        assert not re.search(r"zoom", code, re.IGNORECASE)

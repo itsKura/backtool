@@ -34,7 +34,7 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass, field, replace
 from urllib.parse import quote
-from xml.sax.saxutils import escape
+from xml.sax.saxutils import escape, quoteattr
 
 from backtool.config import Settings
 from backtool.core.time import NEW_YORK, utc_to_local
@@ -51,7 +51,7 @@ from backtool.events.releases import (
     PublishedValue,
     ReleaseValues,
     load_releases,
-    release_figures,
+    shown_figures,
 )
 from backtool.research.cohort import Cohort, split_study
 from backtool.research.metrics import WindowMetrics
@@ -73,6 +73,7 @@ from backtool.research.spec import ResearchSpec
 from backtool.research.windows import REACTION_WINDOWS
 from backtool.web.calendar_page import SEPARATOR, format_delta
 from backtool.web.cohort_view import render_cohort_table
+from backtool.web.event_page import CHART_TIMEFRAMES
 from backtool.web.timefmt import local_stamp
 
 #: How many past releases the page considers. The whole supplied dataset fits
@@ -438,7 +439,7 @@ def _header(prep: Preparation) -> str:
     )
 
     figures = "".join(
-        _figure_cell(figure) for figure in release_figures(
+        _figure_cell(figure) for figure in shown_figures(
             prep.values, released=prep.released
         )
     )
@@ -1166,8 +1167,121 @@ def _similar(prep: Preparation) -> str:
         f"Median 24-hour outcome {_signed(window.median_return_pct)}, positive "
         f"{window.up_count} of {window.sample_size}.{escape(against)}</p>"
         f"{_card_sample(match)}"
+        f"{_similar_chart(prep)}"
         "</div>"
     )
+
+
+def comparable_releases(prep: Preparation) -> tuple[tuple[str, EventResult], ...]:
+    """The releases behind the comparable-cohort count, in picker order.
+
+    One list, read by the markup that offers them and by the route deciding
+    whether this page needs a charting library at all. Two answers to "is there
+    a chart here" is how a page ends up loading 200 kB for an element it did
+    not render.
+
+    This release is dropped if it ever appears. Selection is a window ending at
+    the release, so an upcoming one cannot qualify, but a page that charts the
+    event it is preparing you for as evidence about itself is wrong in a way
+    worth one line of defence rather than an argument.
+    """
+    match = prep.entry_match
+    if match is None or prep.study is None:
+        return ()
+    by_id = {event.event_id: event for event in prep.study.events}
+    return tuple(
+        (event_id, by_id[event_id])
+        for event_id in match.event_ids
+        if event_id in by_id and event_id != prep.event.event_id
+    )
+
+
+def _similar_chart(prep: Preparation) -> str:
+    """The releases behind the median, one at a time.
+
+    The paragraph above reports a median over a dozen-odd releases, and a
+    median is a claim about a group that no single member of it need resemble.
+    The only way to find out which ones it is standing in for is to look at
+    them, so the cohort becomes a list you can step through rather than a count
+    you take on trust.
+
+    Nothing new is computed here. The chart draws the same cached candles the
+    statistics were measured from, through the endpoint the event page already
+    uses, so a release cannot be shown moving one way while the table beside it
+    reports the other.
+    """
+    releases = comparable_releases(prep)
+    if not releases:
+        return ""
+
+    options = "".join(
+        f"<option value={quoteattr(event_id)}>{_release_option(event)}</option>"
+        for event_id, event in releases
+    )
+    opening = CHART_TIMEFRAMES[0]
+    timeframes = "".join(
+        f'<button type="button" data-timeframe="{escape(frame.label)}" '
+        f'aria-selected="{str(frame is opening).lower()}">'
+        f"{escape(frame.label)}</button>"
+        for frame in CHART_TIMEFRAMES
+    )
+    return (
+        '<div class="chart-block" data-prep-chart>'
+        '<p class="chart-note">Each of these releases, from the same candles '
+        "the figures above were measured from &middot; shaded bands are the "
+        "outcome windows"
+        # Written by the chart only when the candles drawn are coarser than
+        # the ones fetched, which is how 4h announces itself as aggregated.
+        '<span class="chart-grain"></span></p>'
+        '<div class="chart-toolbar">'
+        '<label class="chart-pick">Release '
+        f'<select class="chart-event">{options}</select></label>'
+        '<div class="chart-range" role="group" aria-label="Timeframe">'
+        f"{timeframes}</div>"
+        "</div>"
+        '<div class="chart-canvas"><div class="chart-bands" aria-hidden="true">'
+        "</div></div>"
+        '<p class="status chart-status">'
+        '<span class="spinner"></span>Loading candles&hellip;</p>'
+        "</div>"
+    )
+
+
+def _release_option(event: EventResult) -> str:
+    """One release in the picker: its date, and how it turned out.
+
+    The outcome rides on the option rather than waiting for the chart to draw
+    it, because the sentence above this one is a median. A reader scrolling a
+    list that reads +1.6%, -0.4%, +3.0% is auditing that number; a reader
+    scrolling bare dates is clicking at random.
+    """
+    window = event.windows.get(HEADLINE_WINDOW)
+    outcome = (
+        f"24h {window.return_pct:+.1f}%"
+        if window is not None and window.is_usable and window.return_pct is not None
+        else "24h not measurable"
+    )
+    return f"{event.local_date:%d %b %Y} &middot; {escape(outcome)}"
+
+
+def prepare_chart_script(symbol: str) -> str:
+    """Mount the shared chart block on the comparable-releases panel.
+
+    The block itself is :data:`~backtool.web.event_page.CHART_BLOCK_JS`; this
+    is the two lines saying which endpoint answers for a release.
+    """
+    return f"""
+(function () {{
+  const block = document.querySelector('[data-prep-chart]');
+  if (!block || typeof window.backtoolChartBlock !== 'function') return;
+  window.backtoolChartBlock(block, {{
+    marker: 'release',
+    load: (timeframe, eventId) => fetch(
+      '/api/event/' + encodeURIComponent(eventId)
+      + '/candles?symbol={quote(symbol)}&timeframe=' + timeframe),
+  }});
+}})();
+"""
 
 
 def _occurrences(prep: Preparation) -> str:

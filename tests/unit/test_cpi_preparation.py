@@ -27,6 +27,7 @@ from backtool.events.releases import (
     ReleaseValues,
     classify_cpi,
     load_releases,
+    shown_figures,
 )
 from backtool.research.aggregate import aggregate_window
 from backtool.research.cohort import split_study
@@ -47,6 +48,7 @@ from backtool.research.results import EventResult, StudyResult
 from backtool.research.spec import ResearchSpec
 from backtool.research.windows import REACTION_WINDOWS
 from backtool.web.app import app
+from backtool.web.event_page import CHART_BLOCK_JS
 from backtool.web.prepare_page import (
     HEADLINE_WINDOW,
     SCENARIO_LABELS,
@@ -54,6 +56,8 @@ from backtool.web.prepare_page import (
     Preparation,
     _reaction_for,
     build_preparation,
+    comparable_releases,
+    prepare_chart_script,
     render_preparation,
     what_to_watch_lines,
 )
@@ -722,9 +726,14 @@ class TestMissingValuesDoNotBreakThePage:
         # forecast nobody has published and one we simply have not
         # transcribed, and only the second is ours to fix.
         assert "no verified forecast recorded for this release" in text
-        # And the two figures around it are no longer blank, which is the
-        # whole point of wiring BLS in.
-        assert "not published until the release" in text
+        # And the figure beside it is no longer blank, which is the whole
+        # point of wiring BLS in.
+        values = load_releases().get(NEXT_EVENT)
+        assert values is not None and values.previous_yoy is not None
+        assert f"{values.previous_yoy:.1f}%" in text
+        # The third, which cannot exist until Tuesday, gets no box to be
+        # empty in.
+        assert "not published until the release" not in text
 
     def test_consensus_is_never_invented(self, client: TestClient) -> None:
         """The upcoming release has no published consensus in our data. A
@@ -1074,15 +1083,39 @@ class TestTheMissingConsensusIsExplained:
                 assert figure.status is not ValueStatus.PUBLISHED, figure.label
                 assert not figure.is_known
 
-    def test_an_actual_that_does_not_exist_is_not_called_a_gap(self) -> None:
-        """It is not missing from our data. It has not happened."""
+    def test_an_actual_that_does_not_exist_gets_no_cell(self) -> None:
+        """It is not missing from our data; it has not happened.
+
+        The page used to say exactly that, in a box of its own. Two things
+        were wrong with it: the header states the same fact twice already, as
+        a state badge and a countdown in days, and a box that is empty every
+        single time anyone opens the page reads as something broken rather
+        than as something scheduled.
+
+        The distinction itself is not lost -- :func:`release_figures` still
+        carries it, and
+        :meth:`test_the_three_kinds_of_absence_are_distinguished` pins it.
+        What changed is that the page stops drawing a cell for it.
+        """
         text = plain(
             render_preparation(
                 build_preparation(_event(NEXT_EVENT), symbol="BTCUSDT", now=_now()),
                 ("BTCUSDT",),
             )
         )
-        assert "not published until the release" in text
+        assert "not published until the release" not in text
+
+        shown = shown_figures(load_releases().get(NEXT_EVENT), released=False)
+        assert [figure.label for figure in shown] == ["Previous", "Consensus"]
+
+    def test_the_actual_comes_back_once_it_exists(self) -> None:
+        """The cell is withheld before the release, not removed from the
+        product. A page that dropped it permanently would be hiding the one
+        figure the whole dataset is built around."""
+        shown = shown_figures(load_releases().get(PAST_EVENT), released=True)
+        labels = [figure.label for figure in shown]
+        assert labels == ["Previous", "Consensus", "Actual"]
+        assert shown[-1].is_known
 
     def test_a_disputed_consensus_is_shown_as_disputed(self) -> None:
         """Rather than resolved by taking whichever source happens to be
@@ -1595,3 +1628,103 @@ def test_the_run_up_is_measured_by_the_research_layer(
         frame, symbol="BTCUSDT", now=_now(), interval=Interval.M5
     )
     assert seen == ["last_1h", "last_4h", "last_24h"]
+
+
+class TestTheComparableReleasesCanBeLookedAt:
+    """"n = 14" is a number a reader either trusts or checks, and until now
+    there was no way to check it.
+
+    The panel reports a median over the releases the asset entered the same
+    way. A median is a claim about a group that no single member of it need
+    resemble, so the cohort becomes a list you can step through: each release
+    with its date and its own outcome, and a chart of the one you pick.
+
+    Nothing new is measured. The chart draws the cached candles the statistics
+    came from, which is why these tests can insist that the list and the
+    sentence above it agree.
+    """
+
+    def prep(self) -> Preparation:
+        return build_preparation(_event(NEXT_EVENT), symbol="BTCUSDT", now=_now())
+
+    def test_the_offered_releases_are_the_cohort(self) -> None:
+        prep = self.prep()
+        match = prep.entry_match
+        assert match is not None
+        offered = [event_id for event_id, _ in comparable_releases(prep)]
+        assert offered
+        assert set(offered) <= set(match.event_ids)
+
+    def test_the_release_being_prepared_is_never_offered(self) -> None:
+        """A page that charted the release it is preparing you for, as
+        evidence about that release, would be arguing in a circle."""
+        prep = self.prep()
+        assert prep.event.event_id not in dict(comparable_releases(prep))
+
+    def test_every_offered_release_already_happened(self) -> None:
+        """The chart endpoint has nothing to draw for a future one, and the
+        selection window ends *at* each release -- so an upcoming release
+        cannot qualify. This says the two agree."""
+        prep = self.prep()
+        for _, event in comparable_releases(prep):
+            assert event.event_time_utc < prep.event.timestamp_utc
+
+    def test_the_listed_outcomes_reproduce_the_claim_above_them(self) -> None:
+        """The test worth having. The paragraph says "positive 10 of 14"; the
+        list says +0.3%, +2.5%, -0.6% and so on. If the picker ever showed a
+        different window, a different cohort or a different sign convention,
+        the two would stop adding up -- and a reader auditing the median by
+        clicking through would be the one to find out.
+        """
+        prep = self.prep()
+        match = prep.entry_match
+        assert match is not None
+        window = match.windows[HEADLINE_WINDOW]
+
+        measured = [
+            event.windows[HEADLINE_WINDOW]
+            for _, event in comparable_releases(prep)
+            if HEADLINE_WINDOW in event.windows
+            and event.windows[HEADLINE_WINDOW].is_usable
+        ]
+        assert len(measured) == window.sample_size
+        ups = sum(1 for metrics in measured if metrics.direction is Direction.UP)
+        assert ups == window.up_count
+
+    def test_an_option_carries_the_date_and_the_outcome(self) -> None:
+        """Bare dates would make this sightseeing. The outcome on the option
+        is what turns scrolling the list into reading the sample."""
+        html = render_preparation(self.prep(), ("BTCUSDT",))
+        options = re.findall(r"<option value=\"[^\"]*\">([^<]*)</option>", html)
+        assert options
+        for option in options:
+            assert re.match(r"^\d{2} \w{3} \d{4} &middot; 24h ", option), option
+
+    def test_there_is_one_option_per_comparable_release(self) -> None:
+        prep = self.prep()
+        html = render_preparation(prep, ("BTCUSDT",))
+        assert html.count("<option value=") == len(comparable_releases(prep))
+
+    def test_the_chart_reads_the_endpoint_the_statistics_came_from(self) -> None:
+        """Not a second source. A chart fed from somewhere else could show a
+        release moving one way while the table beside it reported the other,
+        and nothing on the page would say which to believe."""
+        script = prepare_chart_script("BTCUSDT")
+        assert "/api/event/" in script
+        assert "/candles?symbol=BTCUSDT" in script
+
+    def test_the_page_loads_the_charting_library_only_when_it_charts(
+        self, client: TestClient
+    ) -> None:
+        """It is 200 kB. Asked for by the same list the markup is built from,
+        so the two cannot disagree about whether there is a chart."""
+        html = client.get(f"/event/{NEXT_EVENT}/prepare").text
+        assert bool(comparable_releases(self.prep())) is ("lightweight-charts" in html)
+        assert "data-prep-chart" in html
+
+    def test_switching_release_rebuilds_rather_than_re_points(self) -> None:
+        """The library holds the series, the bands and the view together.
+        Feeding one of them a different release leaves the other two
+        describing the previous one, which is a chart that lies quietly."""
+        assert "canvas.innerHTML" in CHART_BLOCK_JS
+        assert "picker.addEventListener('change'" in CHART_BLOCK_JS

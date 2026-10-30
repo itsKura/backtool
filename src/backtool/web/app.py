@@ -47,6 +47,7 @@ from backtool.research.windows import DEFAULT_WINDOWS, WindowSpec, window_title
 from backtool.web.calendar_page import render_calendar
 from backtool.web.event_page import (
     CANDLE_CHART_JS,
+    CHART_BLOCK_JS,
     CHART_SPAN,
     LIGHTWEIGHT_CHARTS_CDN,
     ai_summary_script,
@@ -70,7 +71,12 @@ from backtool.web.event_page import (
 )
 from backtool.web.history_panel import HISTORY_SCRIPT, render_history
 from backtool.web.page import render_error, render_page, shell
-from backtool.web.prepare_page import build_preparation, render_preparation
+from backtool.web.prepare_page import (
+    build_preparation,
+    comparable_releases,
+    prepare_chart_script,
+    render_preparation,
+)
 from backtool.web.research_page import (
     RESEARCH_SCRIPT,
     render_clarification,
@@ -257,11 +263,21 @@ async def event_prepare(event_id: str, symbol: str = "BTCUSDT") -> HTMLResponse:
     )
 
     body = render_preparation(prep, SYMBOLS)
+    # The page draws a chart only when there are comparable releases to draw,
+    # and the library is 200 kB: asked for by the same list the markup is built
+    # from, so the two cannot disagree about whether there is a chart.
+    charted = bool(comparable_releases(prep))
     return HTMLResponse(
         shell(
             f"backtool - {event.event_id} preparation",
             body,
             active="calendar",
+            script=(
+                CANDLE_CHART_JS + CHART_BLOCK_JS + prepare_chart_script(chosen)
+                if charted
+                else ""
+            ),
+            head_scripts=(LIGHTWEIGHT_CHARTS_CDN,) if charted else (),
         )
     )
 
@@ -548,7 +564,7 @@ async def research(q: str = "") -> HTMLResponse:
             active="research",
             # The chart body first, then the page script that mounts it on
             # whatever answers the thread gains.
-            script=CANDLE_CHART_JS + RESEARCH_SCRIPT,
+            script=CANDLE_CHART_JS + CHART_BLOCK_JS + RESEARCH_SCRIPT,
             head_scripts=(LIGHTWEIGHT_CHARTS_CDN,),
         )
     )

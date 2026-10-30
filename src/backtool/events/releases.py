@@ -159,6 +159,29 @@ def release_figures(
     )
 
 
+def shown_figures(
+    values: ReleaseValues | None, *, released: bool
+) -> tuple[PublishedValue, ...]:
+    """The figures that earn a cell on a page, which is not all of them.
+
+    Before the release the Actual is not a gap in this product's data -- the
+    number does not exist anywhere yet. A cell saying so is the page repeating
+    what its own header already states twice, as a state badge and a countdown
+    in days, and a permanently empty box reads as something broken rather than
+    as something scheduled.
+
+    :func:`release_figures` keeps all three, because the model of a release has
+    three figures whether or not a page draws them, and the status is what
+    callers reason about. This is only the display rule laid over it, defined
+    once so two pages cannot disagree about when the cell goes away.
+    """
+    return tuple(
+        figure
+        for figure in release_figures(values, released=released)
+        if figure.status is not ValueStatus.AWAITING_RELEASE
+    )
+
+
 def _figure(label: str, value: float | None, source: str) -> PublishedValue:
     if value is None:
         return PublishedValue(
@@ -614,6 +637,7 @@ __all__ = [
     "PublishedValue",
     "ValueStatus",
     "release_figures",
+    "shown_figures",
     "SCENARIO_ORDER",
     "SCENARIO_RULES",
     "CPIScenario",
